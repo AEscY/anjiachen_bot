@@ -7,3 +7,5 @@
 请妥善保管您的令牌，并安全地存储它，否则任何人都可以用它来控制您的机器人。
 
 有关 Bot API 的详细说明，请参阅此页面：https://core.telegram.org/bots/api
+
+postgresql+asyncpg://postgres:kH7QKfX3GcKOHG2F@db.gyifzxykzdrrydkbtofu.supabase.co:5432/postgres
