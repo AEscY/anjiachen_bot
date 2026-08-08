@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化交互层（真实宏观 + 真实清算，零占位符）
+bot.py - 完全体量化交互层（集成手续费保本约束）
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -12,24 +12,21 @@ from storage import load_config, save_config
 CST = timezone(timedelta(hours=8))
 
 # =================================================================
-# 真实数据引擎：恐惧贪婪指数 + 多空比
+# 真实数据引擎（恐惧贪婪 + 多空比）
 # =================================================================
 class RealDataEngine:
     def __init__(self, exchange):
         self.exchange = exchange
         self._fear_greed_cache = {"value": 50, "classification": "Neutral", "timestamp": 0}
-        self._cache_ttl = 300  # 5分钟缓存
+        self._cache_ttl = 300
 
     async def get_fear_greed_index(self):
-        """获取真实恐惧与贪婪指数（Alternative.me）"""
         now = asyncio.get_event_loop().time()
         if now - self._fear_greed_cache["timestamp"] < self._cache_ttl:
             return self._fear_greed_cache
-
         try:
             async with aiohttp.ClientSession() as session:
-                url = "https://api.alternative.me/fng/?limit=1"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with session.get("https://api.alternative.me/fng/?limit=1", timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     data = await resp.json()
                     if data.get("data"):
                         item = data["data"][0]
@@ -38,13 +35,11 @@ class RealDataEngine:
                             "classification": item["value_classification"],
                             "timestamp": now
                         }
-                        return self._fear_greed_cache
         except Exception as e:
             logger.warning(f"获取恐惧贪婪指数失败: {e}")
         return self._fear_greed_cache
 
     async def check_macro_risk(self):
-        """基于真实恐惧贪婪指数评估宏观风险"""
         fg = await self.get_fear_greed_index()
         value = fg["value"]
         if value < 25:
@@ -56,75 +51,41 @@ class RealDataEngine:
         else:
             is_safe = True
             status = f"🟢 {fg['classification']} ({value})"
-        return {
-            'is_safe': is_safe,
-            'score': value / 100.0,
-            'status': status,
-            'classification': fg['classification']
-        }
+        return {'is_safe': is_safe, 'score': value / 100.0, 'status': status}
 
     async def get_liquidation_risk(self, symbol):
-        """基于真实多空比 + 资金费率评估清算风险"""
         funding_rate = 0
         long_short_ratio = 1.0
-        liq_price_estimate = None
-
-        # 1. 真实资金费率
-        try:
-            funding_rate = await self.exchange.fetch_funding_rate(symbol)
-        except Exception:
-            pass
-
-        # 2. 真实多空持仓比（如果交易所支持）
+        try: funding_rate = await self.exchange.fetch_funding_rate(symbol)
+        except: pass
         try:
             ratio_data = await self.exchange.fetch_long_short_ratio(symbol)
-            if isinstance(ratio_data, dict):
-                long_short_ratio = float(ratio_data.get('longShortRatio', 1.0))
-            elif isinstance(ratio_data, (int, float)):
-                long_short_ratio = float(ratio_data)
-        except Exception:
-            pass
-
-        # 3. 清算价格估算（基于当前价格 + 多空偏向 + 资金费率）
+            if isinstance(ratio_data, dict): long_short_ratio = float(ratio_data.get('longShortRatio', 1.0))
+            elif isinstance(ratio_data, (int, float)): long_short_ratio = float(ratio_data)
+        except: pass
         ticker = await self.exchange.fetch_ticker(symbol)
-        current_price = ticker['last']
-
+        p = ticker['last']
         if long_short_ratio > 2.5:
-            bias = "HEAVY_LONG"
-            liq_price_estimate = current_price * 0.92  # 多头拥挤，下方清算密集
+            bias = "HEAVY_LONG"; liq_est = p * 0.92
         elif long_short_ratio < 0.4:
-            bias = "HEAVY_SHORT"
-            liq_price_estimate = current_price * 1.08  # 空头拥挤，上方清算密集
+            bias = "HEAVY_SHORT"; liq_est = p * 1.08
         elif long_short_ratio > 1.5:
-            bias = "LONG_PREFERRED"
-            liq_price_estimate = current_price * 0.96
+            bias = "LONG_PREFERRED"; liq_est = p * 0.96
         elif long_short_ratio < 0.65:
-            bias = "SHORT_PREFERRED"
-            liq_price_estimate = current_price * 1.04
+            bias = "SHORT_PREFERRED"; liq_est = p * 1.04
         else:
-            bias = "NEUTRAL"
-            liq_price_estimate = current_price
+            bias = "NEUTRAL"; liq_est = p
+        return {'funding_rate': funding_rate, 'long_short_ratio': long_short_ratio,
+                'bias': bias, 'liq_target_below': liq_est if bias != "HEAVY_SHORT" else p * 0.97,
+                'liq_target_above': liq_est if bias != "HEAVY_LONG" else p * 1.03}
 
-        return {
-            'funding_rate': funding_rate,
-            'long_short_ratio': long_short_ratio,
-            'bias': bias,
-            'liq_target_below': liq_price_estimate if bias != "HEAVY_SHORT" else current_price * 0.97,
-            'liq_target_above': liq_price_estimate if bias != "HEAVY_LONG" else current_price * 1.03
-        }
-
-# =================================================================
-# 盘口引擎（不变）
-# =================================================================
 class OrderbookEngine:
     async def validate(self, orderbook):
         bids = orderbook.get('bids', [])
         asks = orderbook.get('asks', [])
-        if not bids or not asks:
-            return False, "盘口数据缺失"
+        if not bids or not asks: return False, "盘口数据缺失"
         spread = ((asks[0][0] - bids[0][0]) / bids[0][0]) * 100
-        if spread > 0.2:
-            return False, f"价差过大 ({spread:.3f}%)"
+        if spread > 0.2: return False, f"价差过大 ({spread:.3f}%)"
         return True, f"盘口健康 (价差: {spread:.3f}%)"
 
 # =================================================================
@@ -134,7 +95,7 @@ class QuantBot:
     def __init__(self, exchange):
         self.exchange = exchange
         self.tech = TechnicalEngine()
-        self.real_data = RealDataEngine(exchange)  # 新真实数据引擎
+        self.real_data = RealDataEngine(exchange)
         self.orderbook_engine = OrderbookEngine()
         self.lock = asyncio.Lock()
 
@@ -149,6 +110,12 @@ class QuantBot:
         self.single_order_usdt = cfg.get('single_order_usdt', 100)
         self.timeframe = cfg.get('timeframe', '15m')
         self.reserve_bottom = cfg.get('reserve_bottom', 50)
+
+        # ---- 手续费保本参数 ----
+        self.taker_fee = settings.TAKER_FEE
+        self.maker_fee = settings.MAKER_FEE
+        self.min_profit_margin = settings.MIN_PROFIT_MARGIN
+        self.breakeven_pct = (self.taker_fee * 2) + self.min_profit_margin   # 最低止盈率
 
         raw = settings.ALLOWED_USERS
         self.allowed = {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()} if raw else set()
@@ -194,8 +161,7 @@ class QuantBot:
         return val / 100 if val >= 1 else val
 
     async def register_bot_commands(self):
-        if not self.tg_app:
-            return
+        if not self.tg_app: return
         commands = [
             BotCommand("menu", "📱 量化控制台"),
             BotCommand("status", "📊 多币种持仓面板"),
@@ -328,10 +294,12 @@ class QuantBot:
             coin = sym.split('/')[0]
             holding = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
             hold_info = f"持仓 {holding:.4f}" if holding > 0 else "空仓"
+            breakeven_price = p * (1 + self.breakeven_pct)
             lines.append(
                 f"🔹 **{sym}**: {p:.2f}  |  {hold_info}\n"
                 f"   布林下轨: {tech['bb_lower']:.2f}  |  RSI: {tech['rsi']:.1f}  |  ATR: {tech['atr']:.2f}\n"
-                f"   距买点: {gap:+.2f}%  {signal}"
+                f"   距买点: {gap:+.2f}%  {signal}\n"
+                f"   保本卖出价: {breakeven_price:.2f} (>{self.breakeven_pct*100:.2f}%)"
             )
         lines.append("💡 *基于真实K线计算*")
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -356,20 +324,29 @@ class QuantBot:
 
     async def cmd_help(self, update, context):
         msg = ("💡 **命令清单**\n━━━━━━━━━━━━━━━━━━\n"
-               "/menu - 主控制台\n/status - 持仓面板\n/check - 实时指标\n"
+               "/menu - 主控制台\n/status - 持仓面板\n/check - 实时指标（含保本价）\n"
                "/symbols - 币种列表\n/brain - 大脑诊断\n/analysis - 差距分析\n"
-               "/settp 5 - 止盈率\n/setsl 2 - 硬止损\n/setamount 100 - 单笔额度\n"
+               "/settp 5 - 止盈率（低于保本线会被拒绝）\n/setsl 2 - 硬止损\n/setamount 100 - 单笔额度\n"
                "/settf 15m - K线周期\n/setreserve 50 - 安全底线\n"
                "/addsymbol SOL/USDT - 添加币种\n/delsymbol SOL/USDT - 删除币种\n"
-               "/panic - 紧急全平")
+               "/panic - 紧急全平\n\n"
+               f"当前保本止盈底线: >{self.breakeven_pct*100:.2f}%")
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
+    # ============ 止盈设置（带保本校验） ============
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
-            self.tp_pct = self._parse_pct(float(context.args[0]))
+            val = self._parse_pct(float(context.args[0]))
+            if val < self.breakeven_pct:
+                await update.effective_message.reply_text(
+                    f"❌ 止盈率 **{val*100:.2f}%** 低于保本底线 **{self.breakeven_pct*100:.2f}%**\n"
+                    f"(含吃单手续费 {self.taker_fee*100:.1f}%×2 + 安全垫 {self.min_profit_margin*100:.1f}%)\n"
+                    f"请重新设置！", parse_mode="Markdown")
+                return
+            self.tp_pct = val
             async with self.lock: self._save()
-            await update.effective_message.reply_text(f"✅ 止盈率: {self.tp_pct*100:.1f}%", parse_mode="Markdown")
+            await update.effective_message.reply_text(f"✅ 止盈率: {self.tp_pct*100:.2f}%", parse_mode="Markdown")
         except: await update.effective_message.reply_text("❌ 格式错误！例如：`/settp 5`")
 
     async def cmd_set_sl(self, update, context):
@@ -435,24 +412,17 @@ class QuantBot:
         except: await update.effective_message.reply_text("❌ 格式错误！例如：`/delsymbol SOL/USDT`")
 
     # =================================================================
-    # 大脑诊断（现在全部真实数据）
+    # 诊断渲染（全部真实数据）
     # =================================================================
     async def render_brain_status(self, msg_obj):
         try:
-            # 1. 真实宏观风险（恐惧贪婪指数）
             macro = await self.real_data.check_macro_risk()
             sym = self.symbols[0]
             ticker = await self.exchange.fetch_ticker(sym)
             price = ticker['last']
-
-            # 2. 真实链上/费率/清算风险（多空比 + 资金费率）
             liq = await self.real_data.get_liquidation_risk(sym)
-
-            # 3. 真实盘口
             ob = await self.exchange.fetch_orderbook(sym)
             ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
-
-            # 4. 真实布林/RSI/ATR
             ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
             tech = self.tech.calc(ohlcv, price)
 
@@ -512,8 +482,14 @@ class QuantBot:
         msg = ""
         try:
             if pending == "settp":
-                self.tp_pct = self._parse_pct(float(user_text))
-                msg = f"✅ 止盈率: {self.tp_pct*100:.1f}%"
+                val = self._parse_pct(float(user_text))
+                if val < self.breakeven_pct:
+                    await update.message.reply_text(
+                        f"❌ 止盈率 **{val*100:.2f}%** 低于保本底线 **{self.breakeven_pct*100:.2f}%** 请重试。")
+                    context.user_data['pending_setting'] = None
+                    return
+                self.tp_pct = val
+                msg = f"✅ 止盈率: {self.tp_pct*100:.2f}%"
             elif pending == "setsl":
                 self.sl_pct = self._parse_pct(float(user_text))
                 msg = f"✅ 硬止损: {self.sl_pct*100:.1f}%"
@@ -603,10 +579,11 @@ class QuantBot:
                        f"🔹 监控币种: {', '.join(self.symbols)}\n"
                        f"🔹 盘口防护: {'已开启' if self.orderbook_filter else '已关闭'}\n"
                        f"🔹 瀑布熔断: {'已开启' if self.waterfall_breaker else '已关闭'}\n"
-                       f"🔹 止盈/止损: +{self.tp_pct*100:.1f}% / -{self.sl_pct*100:.1f}%\n"
-                       f"🔹 移动止损: -{self.trailing_sl_pct*100:.1f}%\n"
+                       f"🔹 止盈/止损: +{self.tp_pct*100:.2f}% / -{self.sl_pct*100:.2f}%\n"
+                       f"🔹 移动止损: -{self.trailing_sl_pct*100:.2f}%\n"
                        f"🔹 单笔挂单: {self.single_order_usdt} USDT | 周期: {self.timeframe}\n"
-                       f"🔹 保留底线: {self.reserve_bottom} USDT")
+                       f"🔹 保留底线: {self.reserve_bottom} USDT\n"
+                       f"🔹 **手续费吃单: {self.taker_fee*100:.2f}% | 保本止盈: >{self.breakeven_pct*100:.2f}%**")
                 await query.message.reply_text(msg, parse_mode="Markdown")
 
             elif data == "balance":
@@ -629,9 +606,10 @@ class QuantBot:
                 await query.answer("🚨 请发送 /panic 确认", show_alert=True)
                 await query.message.reply_text("🚨 **确认紧急全平？**\n请发送 `/panic` 确认！", parse_mode="Markdown")
 
+            # 二层菜单（不变，略，已在下文）
             elif data == "menu_set_tp":
                 opts = [("🎯 3%", "0.03"), ("🎯 5%", "0.05"), ("🎯 8%", "0.08"), ("🎯 10%", "0.10")]
-                await query.edit_message_text(f"🎯 选择止盈率 (当前 {self.tp_pct*100:.1f}%)",
+                await query.edit_message_text(f"🎯 选择止盈率 (当前 {self.tp_pct*100:.2f}%，保本>{self.breakeven_pct*100:.2f}%)",
                     reply_markup=self._build_option_keyboard(opts, "cfg_tp", "settp"), parse_mode="Markdown")
             elif data == "menu_set_sl":
                 opts = [("🛡️ 1%", "0.01"), ("🛡️ 2%", "0.02"), ("🛡️ 3%", "0.03"), ("🛡️ 5%", "0.05")]
@@ -662,23 +640,33 @@ class QuantBot:
                 await query.edit_message_text("➖ 选择要移除的币种",
                     reply_markup=self._build_option_keyboard(opts, "cfg_del", "delsymbol"), parse_mode="Markdown")
 
+            # ---- 快捷应用（添加保本校验） ----
             elif data.startswith("cfg_tp:"):
-                self.tp_pct = float(data.split(":")[1]); await query.answer(f"止盈改为 {self.tp_pct*100:.1f}%", show_alert=True)
+                val = float(data.split(":")[1])
+                if val < self.breakeven_pct:
+                    await query.answer(f"❌ {val*100:.2f}% 低于保本线 {self.breakeven_pct*100:.2f}%", show_alert=True)
+                    return
+                self.tp_pct = val; await query.answer(f"止盈改为 {val*100:.2f}%", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_sl:"):
-                self.sl_pct = float(data.split(":")[1]); await query.answer(f"止损改为 {self.sl_pct*100:.1f}%", show_alert=True)
+                val = float(data.split(":")[1]); self.sl_pct = val
+                await query.answer(f"止损改为 {val*100:.1f}%", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_tsl:"):
-                self.trailing_sl_pct = float(data.split(":")[1]); await query.answer(f"移动止损改为 {self.trailing_sl_pct*100:.1f}%", show_alert=True)
+                val = float(data.split(":")[1]); self.trailing_sl_pct = val
+                await query.answer(f"移动止损改为 {val*100:.1f}%", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_amt:"):
-                self.single_order_usdt = float(data.split(":")[1]); await query.answer(f"单笔改为 {self.single_order_usdt}U", show_alert=True)
+                val = float(data.split(":")[1]); self.single_order_usdt = val
+                await query.answer(f"单笔改为 {val}U", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_tf:"):
-                self.timeframe = data.split(":")[1]; await query.answer(f"周期改为 {self.timeframe}", show_alert=True)
+                self.timeframe = data.split(":")[1]
+                await query.answer(f"周期改为 {self.timeframe}", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_res:"):
-                self.reserve_bottom = float(data.split(":")[1]); await query.answer(f"底线改为 {self.reserve_bottom}U", show_alert=True)
+                val = float(data.split(":")[1]); self.reserve_bottom = val
+                await query.answer(f"底线改为 {val}U", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_add:"):
                 sym = data.split(":")[1]
@@ -695,11 +683,12 @@ class QuantBot:
                 else: await query.answer(f"{sym} 不存在", show_alert=True)
                 await self._refresh_panel(query)
 
+            # 自填模式
             elif data.startswith("prompt_manual:"):
                 key = data.split(":")[1]
                 context.user_data['pending_setting'] = key
                 prompts = {
-                    "settp": "✍️ **自填模式 (止盈率)**\n\n输入数字（例：6.5 = 6.5%）：",
+                    "settp": "✍️ **自填模式 (止盈率)**\n\n输入数字（例：6.5 = 6.5%），须大于保本底线：",
                     "setsl": "✍️ **自填模式 (硬止损)**\n\n输入数字（例：2.5 = 2.5%）：",
                     "settsl": "✍️ **自填模式 (移动止损回调)**\n\n输入数字（例：1.5 = 1.5%）：",
                     "setamount": "✍️ **自填模式 (单笔 USDT)**\n\n输入金额（例：150）：",
@@ -737,6 +726,6 @@ class QuantBot:
             await self.tg_app.start()
             await self.register_bot_commands()
             await self.tg_app.updater.start_polling(drop_pending_updates=True)
-            logger.info("✅ Bot 完全体启动（全部真实数据引擎就绪）")
+            logger.info("✅ Bot 完全体启动（全部真实数据 + 手续费保本）")
             while True:
                 await asyncio.sleep(30)
