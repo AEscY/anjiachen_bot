@@ -75,6 +75,19 @@ class ExchangeManager:
             except: pass
         return []
 
+    async def fetch_orderbook(self, symbol, limit=5):
+        """获取真实盘口数据，失败时降级为模拟数据"""
+        if self.exchange:
+            try: return await self.exchange.fetch_order_book(symbol, limit)
+            except: pass
+        # 降级模拟数据
+        ticker = await self.fetch_ticker(symbol)
+        p = ticker['last']
+        return {
+            'bids': [[p * 0.9998, 12.5], [p * 0.9995, 25.0]],
+            'asks': [[p * 1.0002, 10.2], [p * 1.0005, 30.1]]
+        }
+
     async def fetch_funding_rate(self, symbol):
         if self.exchange:
             try:
