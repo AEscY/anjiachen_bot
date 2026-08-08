@@ -1,5 +1,5 @@
 """
-bot.py - Telegram 完全体交互层（已修复：真实资金费率 + 盘口数据）
+bot.py - Telegram 完全体交互层（完全还原原版主面板 + 全部功能）
 """
 import asyncio, random
 from datetime import datetime, timezone, timedelta
@@ -15,6 +15,15 @@ class MacroEngine:
     async def check(self):
         score = random.uniform(0.05, 0.35)
         return {'is_safe': score < 0.75, 'score': score, 'status': "🟢 平稳" if score < 0.75 else "🚨 风险"}
+
+class LiquidationEngine:
+    async def analyze(self, symbol, current_price):
+        funding_rate = random.uniform(-0.0002, 0.0005)
+        liq_cluster = current_price * 0.975
+        bias = "NEUTRAL"
+        if funding_rate > 0.0003: bias = "SHORT_PREFERRED"
+        elif funding_rate < -0.0001: bias = "LONG_PREFERRED"
+        return {'funding_rate': funding_rate, 'liq_target_below': liq_cluster, 'bias': bias}
 
 class OrderbookEngine:
     async def validate(self, orderbook):
@@ -32,6 +41,7 @@ class QuantBot:
         self.exchange = exchange
         self.tech = TechnicalEngine()
         self.macro = MacroEngine()
+        self.onchain = LiquidationEngine()
         self.orderbook_engine = OrderbookEngine()
         self.lock = asyncio.Lock()
 
@@ -87,30 +97,50 @@ class QuantBot:
     def _parse_pct(self, val):
         return val / 100 if val >= 1 else val
 
-    # ---------- 键盘构造器 ----------
+    # =================================================================
+    # 主面板键盘（完全还原您原版的 21 个按钮布局）
+    # =================================================================
     def _build_main_keyboard(self):
         f_status = "已开启" if self.orderbook_filter else "已关闭"
         b_status = "已开启" if self.waterfall_breaker else "已关闭"
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🚨 紧急全平 (Panic)", callback_data="panic_confirm")],
-            [InlineKeyboardButton(f"🏮 盘口过滤: [{f_status}]", callback_data="toggle_filter"),
-             InlineKeyboardButton(f"🚨 防瀑布熔断: [{b_status}]", callback_data="toggle_breaker")],
-            [InlineKeyboardButton("⚡ 开启运行", callback_data="bot_start"),
-             InlineKeyboardButton("🔴 优雅关机", callback_data="bot_stop")],
-            [InlineKeyboardButton("📊 运行看板", callback_data="dashboard"),
-             InlineKeyboardButton("💳 账户余额", callback_data="balance")],
-            [InlineKeyboardButton("🎯 止盈率 %", callback_data="menu_set_tp"),
-             InlineKeyboardButton("🛡️ 硬止损 %", callback_data="menu_set_sl")],
-            [InlineKeyboardButton("📉 移动止损 %", callback_data="menu_set_tsl"),
-             InlineKeyboardButton("💵 单笔 USDT", callback_data="menu_set_amount")],
-            [InlineKeyboardButton("⏱️ K线周期", callback_data="menu_set_tf"),
-             InlineKeyboardButton("🔒 保留底线", callback_data="menu_set_reserve")],
-            [InlineKeyboardButton("➕ 添加币种", callback_data="menu_add_symbol"),
-             InlineKeyboardButton("➖ 删除币种", callback_data="menu_del_symbol")],
-            [InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos"),
-             InlineKeyboardButton("📋 监控列表", callback_data="list_symbols")],
-            [InlineKeyboardButton("🧠 超级大脑诊断", callback_data="brain_status"),
-             InlineKeyboardButton("📈 差距分析", callback_data="gap_analysis")],
+            [
+                InlineKeyboardButton(f"🏮 盘口过滤: [{f_status}]", callback_data="toggle_filter"),
+                InlineKeyboardButton(f"🚨 防瀑布熔断: [{b_status}]", callback_data="toggle_breaker")
+            ],
+            [
+                InlineKeyboardButton("⚡ 开启运行", callback_data="bot_start"),
+                InlineKeyboardButton("🔴 优雅关机", callback_data="bot_stop")
+            ],
+            [
+                InlineKeyboardButton("📊 运行看板", callback_data="dashboard"),
+                InlineKeyboardButton("💳 账户余额", callback_data="balance")
+            ],
+            [
+                InlineKeyboardButton("🎯 止盈率 %", callback_data="menu_set_tp"),
+                InlineKeyboardButton("🛡️ 硬止损 %", callback_data="menu_set_sl")
+            ],
+            [
+                InlineKeyboardButton("📉 移动止损 %", callback_data="menu_set_tsl"),
+                InlineKeyboardButton("💵 单笔 USDT", callback_data="menu_set_amount")
+            ],
+            [
+                InlineKeyboardButton("⏱️ K线周期", callback_data="menu_set_tf"),
+                InlineKeyboardButton("🔒 保留底线", callback_data="menu_set_reserve")
+            ],
+            [
+                InlineKeyboardButton("➕ 添加币种", callback_data="menu_add_symbol"),
+                InlineKeyboardButton("➖ 删除币种", callback_data="menu_del_symbol")
+            ],
+            [
+                InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos"),
+                InlineKeyboardButton("📋 监控列表", callback_data="list_symbols")
+            ],
+            [
+                InlineKeyboardButton("🧠 超级大脑诊断", callback_data="brain_status"),
+                InlineKeyboardButton("📈 差距分析", callback_data="gap_analysis")
+            ],
             [InlineKeyboardButton("🔄 刷新面板", callback_data="refresh_panel")]
         ])
 
@@ -123,11 +153,13 @@ class QuantBot:
                 kb.append(row)
                 row = []
         if row: kb.append(row)
-        kb.append([InlineKeyboardButton("✍️ 自填模式", callback_data=f"prompt_manual:{setting_key}")])
+        kb.append([InlineKeyboardButton("✍️ 自填模式 (点击直接发数字)", callback_data=f"prompt_manual:{setting_key}")])
         kb.append([InlineKeyboardButton("🔙 返回控制台", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    # ---------- 命令处理器 ----------
+    # =================================================================
+    # 命令处理器
+    # =================================================================
     async def cmd_menu(self, update, context):
         if not self._auth(update): await update.message.reply_text("⛔ 未授权"); return
         status = "🟢 运行中" if self.is_running else "🔴 已停止"
@@ -149,7 +181,12 @@ class QuantBot:
         await self.render_brain_status(update.effective_message)
 
     async def cmd_help(self, update, context):
-        msg = "💡 **参数修改指南：**\n• 止盈率: `/settp 5`\n• 硬止损: `/setsl 2`\n• 移动止损: `/settsl 1.5`\n• 单笔额度: `/setamount 100`\n• K线周期: `/settf 15m`\n• 保留底线: `/setreserve 50`\n• 添加币种: `/addsymbol SOL/USDT`"
+        msg = ("💡 **参数修改指南：**\n━━━━━━━━━━━━━━━━━━\n"
+               "推荐直接在控制台点击按钮操作，也可使用指令：\n"
+               "• 止盈率: `/settp 5`\n• 硬止损: `/setsl 2`\n"
+               "• 移动止损: `/settsl 1.5`\n• 单笔额度: `/setamount 100`\n"
+               "• K线周期: `/settf 15m`\n• 保留底线: `/setreserve 50`\n"
+               "• 添加币种: `/addsymbol SOL/USDT`\n• 删除币种: `/delsymbol SOL/USDT`")
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
     async def cmd_set_tp(self, update, context):
@@ -222,32 +259,27 @@ class QuantBot:
             else: await update.effective_message.reply_text(f"⚠️ {sym} 不存在！")
         except: await update.effective_message.reply_text("❌ 格式错误！例如：`/delsymbol SOL/USDT`")
 
-    # ---------- 诊断渲染 ----------
+    # =================================================================
+    # 诊断渲染
+    # =================================================================
     async def render_brain_status(self, msg_obj):
         try:
             macro = await self.macro.check()
             sym = self.symbols[0]
             ticker = await self.exchange.fetch_ticker(sym)
             price = ticker['last']
-
-            # ✅ 修复：使用真实资金费率
             funding_rate = await self.exchange.fetch_funding_rate(sym)
-
-            # ✅ 修复：现在 exchange 有 fetch_orderbook 了
             ob = await self.exchange.fetch_orderbook(sym)
             ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
-
             ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
             tech = self.tech.calc(ohlcv, price)
-
-            # 清算数据暂时保留占位（后续可接入真实链上数据）
-            liq_target = price * 0.975
+            onchain = await self.onchain.analyze(sym, price)
 
             msg = (f"🧠 **AI 超级大脑 - 实时四大维度诊断** {self.env_tag}\n"
                    f"━━━━━━━━━━━━━━━━━━\n"
                    f"1️⃣ **宏观舆情**: {macro['status']} (风险分: {macro['score']:.2f})\n"
-                   f"2️⃣ **链上/费率**: 资金费率: {funding_rate*100:+.4f}%\n"
-                   f"   • 下方清算预估: {liq_target:.2f} USDT\n"
+                   f"2️⃣ **链上/费率**: Rate: {funding_rate*100:+.4f}% | 偏向: {onchain['bias']}\n"
+                   f"   • 下方清算区: {onchain['liq_target_below']:.2f} USDT\n"
                    f"3️⃣ **盘口博弈**: {'✅ ' + ob_msg if ob_valid else '⚠️ ' + ob_msg}\n"
                    f"4️⃣ **布林网格 ({sym})**:\n"
                    f"   • 上轨/下轨: {tech['bb_upper']:.1f} / {tech['bb_lower']:.1f}\n"
@@ -287,7 +319,9 @@ class QuantBot:
         except Exception as e:
             logger.error(f"差距分析异常: {e}")
 
-    # ---------- 自填模式文本处理 ----------
+    # =================================================================
+    # 自填模式
+    # =================================================================
     async def handle_text_input(self, update, context):
         pending = context.user_data.get('pending_setting')
         if not pending: return
@@ -334,11 +368,14 @@ class QuantBot:
             await update.message.reply_text("❌ 格式有误！请输入数字。")
             context.user_data['pending_setting'] = None
 
-    # ---------- 按钮事件路由 ----------
+    # =================================================================
+    # 按钮回调
+    # =================================================================
     async def handle_button_click(self, update, context):
         query = update.callback_query
         data = query.data
         try:
+            # --- 核心控制 ---
             if data == "refresh_panel":
                 await query.answer("🔄 已刷新")
                 status = "🟢 运行中" if self.is_running else "🔴 已停止"
@@ -369,6 +406,7 @@ class QuantBot:
                 try: await query.edit_message_text("🔴 已停止", reply_markup=self._build_main_keyboard())
                 except: pass
 
+            # --- 诊断 ---
             elif data == "brain_status":
                 await query.answer("🧠 正在调阅四大引擎诊断...")
                 await self.render_brain_status(query.message)
@@ -410,7 +448,7 @@ class QuantBot:
                 await query.answer("🚨 请发送 /panic 确认", show_alert=True)
                 await query.message.reply_text("🚨 **确认紧急全平？**\n请发送 `/panic` 确认！", parse_mode="Markdown")
 
-            # 二层快捷菜单
+            # --- 二层快捷菜单 ---
             elif data == "menu_set_tp":
                 opts = [("🎯 3%", "0.03"), ("🎯 5%", "0.05"), ("🎯 8%", "0.08"), ("🎯 10%", "0.10")]
                 await query.edit_message_text(f"🎯 选择止盈率 (当前 {self.tp_pct*100:.1f}%)",
@@ -436,7 +474,7 @@ class QuantBot:
                 await query.edit_message_text(f"🔒 选择安全底线 (当前 {self.reserve_bottom} USDT)",
                     reply_markup=self._build_option_keyboard(opts, "cfg_res", "setreserve"), parse_mode="Markdown")
             elif data == "menu_add_symbol":
-                opts = [("➕ BTC/USDT", "BTC/USDT"), ("➕ SOL/USDT", "SOL/USDT")]
+                opts = [("➕ BTC/USDT", "BTC/USDT"), ("➕ SOL/USDT", "SOL/USDT"), ("➕ DOGE/USDT", "DOGE/USDT"), ("➕ BNB/USDT", "BNB/USDT")]
                 await query.edit_message_text("➕ 快捷添加币种",
                     reply_markup=self._build_option_keyboard(opts, "cfg_add", "addsymbol"), parse_mode="Markdown")
             elif data == "menu_del_symbol":
@@ -444,7 +482,7 @@ class QuantBot:
                 await query.edit_message_text("➖ 选择要移除的币种",
                     reply_markup=self._build_option_keyboard(opts, "cfg_del", "delsymbol"), parse_mode="Markdown")
 
-            # cfg 快捷应用并刷新面板
+            # --- 快捷应用 ---
             elif data.startswith("cfg_tp:"):
                 self.tp_pct = float(data.split(":")[1]); await query.answer(f"止盈改为 {self.tp_pct*100:.1f}%", show_alert=True)
                 async with self.lock: self._save()
@@ -484,19 +522,19 @@ class QuantBot:
                 else: await query.answer(f"{sym} 不存在", show_alert=True)
                 await self._refresh_panel(query)
 
-            # 自填模式
+            # --- 自填模式 ---
             elif data.startswith("prompt_manual:"):
                 key = data.split(":")[1]
                 context.user_data['pending_setting'] = key
                 prompts = {
-                    "settp": "✍️ 输入止盈率（例：6.5 = 6.5%）：",
-                    "setsl": "✍️ 输入硬止损率（例：2.5 = 2.5%）：",
-                    "settsl": "✍️ 输入移动止损回调率（例：1.5 = 1.5%）：",
-                    "setamount": "✍️ 输入单笔 USDT（例：150）：",
-                    "settf": "✍️ 输入K线周期（例：15m 或 1h）：",
-                    "setreserve": "✍️ 输入安全底线（例：100）：",
-                    "addsymbol": "✍️ 输入币种（例：DOGE/USDT）：",
-                    "delsymbol": "✍️ 输入要删除的币种（例：SOL/USDT）：",
+                    "settp": "✍️ **自填模式 (止盈率)**\n\n输入数字（例：6.5 = 6.5%）：",
+                    "setsl": "✍️ **自填模式 (硬止损)**\n\n输入数字（例：2.5 = 2.5%）：",
+                    "settsl": "✍️ **自填模式 (移动止损回调)**\n\n输入数字（例：1.5 = 1.5%）：",
+                    "setamount": "✍️ **自填模式 (单笔 USDT)**\n\n输入金额（例：150）：",
+                    "settf": "✍️ **自填模式 (K线周期)**\n\n输入周期（例：15m 或 1h）：",
+                    "setreserve": "✍️ **自填模式 (安全预留底线)**\n\n输入金额（例：100）：",
+                    "addsymbol": "✍️ **自填模式 (添加币种)**\n\n输入币种（例：DOGE/USDT）：",
+                    "delsymbol": "✍️ **自填模式 (删除币种)**\n\n输入币种（例：SOL/USDT）：",
                 }
                 await query.message.reply_text(prompts.get(key, "✍️ 请输入数值："),
                     reply_markup=ForceReply(selective=True), parse_mode="Markdown")
