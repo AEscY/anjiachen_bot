@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化交互层（已修复止盈百分比解析 + 手续费保本约束）
+bot.py - 完全体量化交互层（含移动止盈 + 移动止损 + 硬止损）
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -107,19 +107,23 @@ class QuantBot:
         self.tp_pct = cfg.get('tp_pct', 0.08)
         self.sl_pct = cfg.get('sl_pct', 0.05)
         self.trailing_sl_pct = cfg.get('trailing_sl_pct', 0.02)
+        self.trailing_tp_pct = cfg.get('trailing_tp_pct', 0.01)   # 新增移动止盈
         self.single_order_usdt = cfg.get('single_order_usdt', 100)
         self.timeframe = cfg.get('timeframe', '15m')
         self.reserve_bottom = cfg.get('reserve_bottom', 50)
 
-        # ---- 手续费保本参数 ----
         self.taker_fee = settings.TAKER_FEE
         self.maker_fee = settings.MAKER_FEE
         self.min_profit_margin = settings.MIN_PROFIT_MARGIN
-        self.breakeven_pct = (self.taker_fee * 2) + self.min_profit_margin   # 最低止盈率
+        self.breakeven_pct = (self.taker_fee * 2) + self.min_profit_margin
 
         raw = settings.ALLOWED_USERS
         self.allowed = {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()} if raw else set()
         self.env_tag = "🧪 (模拟盘)" if settings.IS_SANDBOX else "🔴 (实盘)"
+
+        # 移动止盈状态追踪
+        self._trailing_active = {}    # symbol -> bool
+        self._trailing_high = {}      # symbol -> float 最高价
 
         self.tg_app = None
         if settings.TG_BOT_TOKEN:
@@ -135,6 +139,7 @@ class QuantBot:
             self.tg_app.add_handler(CommandHandler("settp", self.cmd_set_tp))
             self.tg_app.add_handler(CommandHandler("setsl", self.cmd_set_sl))
             self.tg_app.add_handler(CommandHandler("settsl", self.cmd_set_tsl))
+            self.tg_app.add_handler(CommandHandler("settmpt", self.cmd_set_trailing_tp))   # 新命令
             self.tg_app.add_handler(CommandHandler("setamount", self.cmd_set_amount))
             self.tg_app.add_handler(CommandHandler("settf", self.cmd_set_tf))
             self.tg_app.add_handler(CommandHandler("setreserve", self.cmd_set_reserve))
@@ -147,7 +152,9 @@ class QuantBot:
     def _save(self):
         save_config({
             'tp_pct': self.tp_pct, 'sl_pct': self.sl_pct,
-            'trailing_sl_pct': self.trailing_sl_pct, 'single_order_usdt': self.single_order_usdt,
+            'trailing_sl_pct': self.trailing_sl_pct,
+            'trailing_tp_pct': self.trailing_tp_pct,
+            'single_order_usdt': self.single_order_usdt,
             'timeframe': self.timeframe, 'reserve_bottom': self.reserve_bottom,
             'symbols': self.symbols, 'orderbook_filter': self.orderbook_filter,
             'waterfall_breaker': self.waterfall_breaker
@@ -157,9 +164,7 @@ class QuantBot:
         if not self.allowed: return True
         return update.effective_user.id in self.allowed
 
-    # ===== 修复后的百分比解析（统一除以100） =====
     def _parse_pct(self, val):
-        # 输入数字始终视为百分比，例如 5 -> 0.05, 0.2 -> 0.002
         return val / 100.0
 
     async def register_bot_commands(self):
@@ -174,6 +179,7 @@ class QuantBot:
             BotCommand("settp", "🎯 设置止盈率"),
             BotCommand("setsl", "🛡️ 设置硬止损"),
             BotCommand("settsl", "📉 设置移动止损"),
+            BotCommand("settmpt", "🏹 设置移动止盈回调"),  # 新增
             BotCommand("setamount", "💵 设置单笔额度"),
             BotCommand("settf", "⏱️ 设置K线周期"),
             BotCommand("setreserve", "🔒 设置安全底线"),
@@ -211,25 +217,28 @@ class QuantBot:
             ],
             [
                 InlineKeyboardButton("📉 移动止损 %", callback_data="menu_set_tsl"),
-                InlineKeyboardButton("💵 单笔 USDT", callback_data="menu_set_amount")
+                InlineKeyboardButton("🏹 移动止盈 %", callback_data="menu_set_tmpt")
             ],
             [
-                InlineKeyboardButton("⏱️ K线周期", callback_data="menu_set_tf"),
-                InlineKeyboardButton("🔒 保留底线", callback_data="menu_set_reserve")
+                InlineKeyboardButton("💵 单笔 USDT", callback_data="menu_set_amount"),
+                InlineKeyboardButton("⏱️ K线周期", callback_data="menu_set_tf")
             ],
             [
-                InlineKeyboardButton("➕ 添加币种", callback_data="menu_add_symbol"),
-                InlineKeyboardButton("➖ 删除币种", callback_data="menu_del_symbol")
+                InlineKeyboardButton("🔒 保留底线", callback_data="menu_set_reserve"),
+                InlineKeyboardButton("➕ 添加币种", callback_data="menu_add_symbol")
             ],
             [
-                InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos"),
-                InlineKeyboardButton("📋 监控列表", callback_data="list_symbols")
+                InlineKeyboardButton("➖ 删除币种", callback_data="menu_del_symbol"),
+                InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos")
             ],
             [
-                InlineKeyboardButton("🧠 超级大脑诊断", callback_data="brain_status"),
-                InlineKeyboardButton("📈 差距分析", callback_data="gap_analysis")
+                InlineKeyboardButton("📋 监控列表", callback_data="list_symbols"),
+                InlineKeyboardButton("🧠 超级大脑诊断", callback_data="brain_status")
             ],
-            [InlineKeyboardButton("🔄 刷新面板", callback_data="refresh_panel")]
+            [
+                InlineKeyboardButton("📈 差距分析", callback_data="gap_analysis"),
+                InlineKeyboardButton("🔄 刷新面板", callback_data="refresh_panel")
+            ]
         ])
 
     def _build_option_keyboard(self, options, prefix, setting_key):
@@ -241,7 +250,7 @@ class QuantBot:
                 kb.append(row)
                 row = []
         if row: kb.append(row)
-        kb.append([InlineKeyboardButton("✍️ 自填模式 (点击直接发数字)", callback_data=f"prompt_manual:{setting_key}")])
+        kb.append([InlineKeyboardButton("✍️ 自填模式", callback_data=f"prompt_manual:{setting_key}")])
         kb.append([InlineKeyboardButton("🔙 返回控制台", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
@@ -329,13 +338,14 @@ class QuantBot:
                "/menu - 主控制台\n/status - 持仓面板\n/check - 实时指标（含保本价）\n"
                "/symbols - 币种列表\n/brain - 大脑诊断\n/analysis - 差距分析\n"
                "/settp 5 - 止盈率（低于保本线会被拒绝）\n/setsl 2 - 硬止损\n/setamount 100 - 单笔额度\n"
+               "/settsl 0.5 - 移动止损回调\n/settmpt 1 - 移动止盈回调\n"
                "/settf 15m - K线周期\n/setreserve 50 - 安全底线\n"
                "/addsymbol SOL/USDT - 添加币种\n/delsymbol SOL/USDT - 删除币种\n"
                "/panic - 紧急全平\n\n"
                f"当前保本止盈底线: >{self.breakeven_pct*100:.2f}%")
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
-    # ============ 止盈设置（带保本校验，统一百分比解析） ============
+    # ---------- 参数设置 ----------
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
@@ -365,7 +375,20 @@ class QuantBot:
             self.trailing_sl_pct = self._parse_pct(float(context.args[0]))
             async with self.lock: self._save()
             await update.effective_message.reply_text(f"✅ 移动止损回调: {self.trailing_sl_pct*100:.1f}%", parse_mode="Markdown")
-        except: await update.effective_message.reply_text("❌ 格式错误！输入百分比数字，例如 `/settsl 1.5` 代表 1.5%")
+        except: await update.effective_message.reply_text("❌ 格式错误！输入百分比数字，例如 `/settsl 0.5` 代表 0.5%")
+
+    async def cmd_set_trailing_tp(self, update, context):
+        """移动止盈回调率"""
+        if not self._auth(update): return
+        try:
+            val = self._parse_pct(float(context.args[0]))
+            if val <= 0:
+                await update.effective_message.reply_text("❌ 移动止盈回调率必须大于 0%")
+                return
+            self.trailing_tp_pct = val
+            async with self.lock: self._save()
+            await update.effective_message.reply_text(f"✅ 移动止盈回调: {self.trailing_tp_pct*100:.2f}%", parse_mode="Markdown")
+        except: await update.effective_message.reply_text("❌ 格式错误！例如 `/settmpt 1` 代表回落 1% 止盈")
 
     async def cmd_set_amount(self, update, context):
         if not self._auth(update): return
@@ -414,7 +437,7 @@ class QuantBot:
         except: await update.effective_message.reply_text("❌ 格式错误！例如：`/delsymbol SOL/USDT`")
 
     # =================================================================
-    # 诊断渲染（全部真实数据）
+    # 诊断渲染
     # =================================================================
     async def render_brain_status(self, msg_obj):
         try:
@@ -498,6 +521,14 @@ class QuantBot:
             elif pending == "settsl":
                 self.trailing_sl_pct = self._parse_pct(float(user_text))
                 msg = f"✅ 移动止损: {self.trailing_sl_pct*100:.1f}%"
+            elif pending == "settmpt":
+                val = self._parse_pct(float(user_text))
+                if val <= 0:
+                    await update.message.reply_text("❌ 移动止盈回调率必须 > 0%")
+                    context.user_data['pending_setting'] = None
+                    return
+                self.trailing_tp_pct = val
+                msg = f"✅ 移动止盈: {self.trailing_tp_pct*100:.2f}%"
             elif pending == "setamount":
                 self.single_order_usdt = float(user_text)
                 msg = f"✅ 单笔额度: {self.single_order_usdt} USDT"
@@ -581,8 +612,8 @@ class QuantBot:
                        f"🔹 监控币种: {', '.join(self.symbols)}\n"
                        f"🔹 盘口防护: {'已开启' if self.orderbook_filter else '已关闭'}\n"
                        f"🔹 瀑布熔断: {'已开启' if self.waterfall_breaker else '已关闭'}\n"
-                       f"🔹 止盈/止损: +{self.tp_pct*100:.2f}% / -{self.sl_pct*100:.2f}%\n"
-                       f"🔹 移动止损: -{self.trailing_sl_pct*100:.2f}%\n"
+                       f"🔹 止盈/硬止损: +{self.tp_pct*100:.2f}% / -{self.sl_pct*100:.2f}%\n"
+                       f"🔹 移动止损: {self.trailing_sl_pct*100:.2f}% | 移动止盈: {self.trailing_tp_pct*100:.2f}%\n"
                        f"🔹 单笔挂单: {self.single_order_usdt} USDT | 周期: {self.timeframe}\n"
                        f"🔹 保留底线: {self.reserve_bottom} USDT\n"
                        f"🔹 **手续费吃单: {self.taker_fee*100:.2f}% | 保本止盈: >{self.breakeven_pct*100:.2f}%**")
@@ -621,6 +652,10 @@ class QuantBot:
                 opts = [("📉 0.5%", "0.005"), ("📉 1.0%", "0.01"), ("📉 1.5%", "0.015"), ("📉 2.0%", "0.02")]
                 await query.edit_message_text(f"📉 选择移动止损回调 (当前 {self.trailing_sl_pct*100:.1f}%)",
                     reply_markup=self._build_option_keyboard(opts, "cfg_tsl", "settsl"), parse_mode="Markdown")
+            elif data == "menu_set_tmpt":
+                opts = [("🏹 0.5%", "0.005"), ("🏹 1.0%", "0.01"), ("🏹 1.5%", "0.015"), ("🏹 2.0%", "0.02")]
+                await query.edit_message_text(f"🏹 选择移动止盈回调 (当前 {self.trailing_tp_pct*100:.2f}%)",
+                    reply_markup=self._build_option_keyboard(opts, "cfg_tmpt", "settmpt"), parse_mode="Markdown")
             elif data == "menu_set_amount":
                 opts = [("💵 50 U", "50"), ("💵 100 U", "100"), ("💵 200 U", "200"), ("💵 500 U", "500")]
                 await query.edit_message_text(f"💵 选择单笔额度 (当前 {self.single_order_usdt} USDT)",
@@ -642,7 +677,7 @@ class QuantBot:
                 await query.edit_message_text("➖ 选择要移除的币种",
                     reply_markup=self._build_option_keyboard(opts, "cfg_del", "delsymbol"), parse_mode="Markdown")
 
-            # ---- 快捷应用（含保本校验） ----
+            # 快捷应用
             elif data.startswith("cfg_tp:"):
                 val = float(data.split(":")[1])
                 if val < self.breakeven_pct:
@@ -657,6 +692,13 @@ class QuantBot:
             elif data.startswith("cfg_tsl:"):
                 val = float(data.split(":")[1]); self.trailing_sl_pct = val
                 await query.answer(f"移动止损改为 {val*100:.1f}%", show_alert=True)
+                async with self.lock: self._save(); await self._refresh_panel(query)
+            elif data.startswith("cfg_tmpt:"):
+                val = float(data.split(":")[1])
+                if val <= 0:
+                    await query.answer("❌ 必须大于 0%", show_alert=True); return
+                self.trailing_tp_pct = val
+                await query.answer(f"移动止盈改为 {val*100:.2f}%", show_alert=True)
                 async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_amt:"):
                 val = float(data.split(":")[1]); self.single_order_usdt = val
@@ -690,9 +732,10 @@ class QuantBot:
                 key = data.split(":")[1]
                 context.user_data['pending_setting'] = key
                 prompts = {
-                    "settp": "✍️ **自填模式 (止盈率)**\n\n输入数字（例：6.5 = 6.5%），须大于保本底线：",
+                    "settp": "✍️ **自填模式 (止盈率)**\n\n输入数字（例：6.5 = 6.5%）：",
                     "setsl": "✍️ **自填模式 (硬止损)**\n\n输入数字（例：2.5 = 2.5%）：",
-                    "settsl": "✍️ **自填模式 (移动止损回调)**\n\n输入数字（例：1.5 = 1.5%）：",
+                    "settsl": "✍️ **自填模式 (移动止损)**\n\n输入数字（例：1.5 = 1.5%）：",
+                    "settmpt": "✍️ **自填模式 (移动止盈)**\n\n输入数字（例：1 = 回落1%止盈）：",
                     "setamount": "✍️ **自填模式 (单笔 USDT)**\n\n输入金额（例：150）：",
                     "settf": "✍️ **自填模式 (K线周期)**\n\n输入周期（例：15m 或 1h）：",
                     "setreserve": "✍️ **自填模式 (安全预留底线)**\n\n输入金额（例：100）：",
@@ -722,12 +765,62 @@ class QuantBot:
             if isinstance(amount, (int, float)) and amount > 0:
                 await self.exchange.create_market_sell_order(sym, amount)
 
+    # =================================================================
+    # 移动止盈后台监控
+    # =================================================================
+    async def _trailing_monitor(self):
+        """每秒检查持仓币种，触发移动止盈"""
+        await asyncio.sleep(5)  # 等 Bot 完全启动
+        while True:
+            try:
+                if self.is_running and self.trailing_tp_pct > 0:
+                    for sym in self.symbols:
+                        # 获取持仓
+                        bal = await self.exchange.fetch_balance()
+                        coin = sym.split('/')[0]
+                        amount = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+                        if amount <= 0:
+                            self._trailing_active[sym] = False
+                            continue
+
+                        ticker = await self.exchange.fetch_ticker(sym)
+                        current_price = ticker['last']
+
+                        # 如果还没激活，检查是否达到初始止盈位
+                        if not self._trailing_active.get(sym, False):
+                            # 用当前价估算成本（简化：取启动后第一次价格作为参考）
+                            if sym not in self._trailing_high:
+                                self._trailing_high[sym] = current_price
+                                continue
+                            entry_est = self._trailing_high[sym]
+                            if current_price >= entry_est * (1 + self.tp_pct):
+                                self._trailing_active[sym] = True
+                                self._trailing_high[sym] = current_price
+                                logger.info(f"🏹 [{sym}] 移动止盈已激活，当前价 {current_price:.2f}")
+                        else:
+                            # 已激活，更新最高价
+                            if current_price > self._trailing_high.get(sym, 0):
+                                self._trailing_high[sym] = current_price
+                            # 检查回落
+                            high = self._trailing_high[sym]
+                            if current_price <= high * (1 - self.trailing_tp_pct):
+                                logger.info(f"🏹 [{sym}] 移动止盈触发！从高点 {high:.2f} 回落至 {current_price:.2f}")
+                                await self.exchange.create_market_sell_order(sym, amount)
+                                self._trailing_active[sym] = False
+                                self._trailing_high[sym] = 0
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"移动止盈监控异常: {e}")
+                await asyncio.sleep(5)
+
     async def start(self):
         if self.tg_app:
             await self.tg_app.initialize()
             await self.tg_app.start()
             await self.register_bot_commands()
             await self.tg_app.updater.start_polling(drop_pending_updates=True)
-            logger.info("✅ Bot 完全体启动（全部真实数据 + 手续费保本）")
+            logger.info("✅ Bot 完全体启动（移动止盈已启用）")
+            # 启动后台监控
+            asyncio.create_task(self._trailing_monitor())
             while True:
                 await asyncio.sleep(30)
