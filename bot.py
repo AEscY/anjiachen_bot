@@ -1,5 +1,5 @@
 """
-bot.py - 全自动量化交易版（信号触发自动开仓 + 移动止盈/止损）
+bot.py - 全自动量化交易版（修复单日上限按钮 + 小本金保留底线）
 """
 import asyncio, random, aiohttp, json, os
 from datetime import datetime, timezone, timedelta
@@ -158,7 +158,6 @@ class QuantBot:
         self.trades = load_trades()
         self._trailing_active = {}
         self._trailing_high = {}
-        self._has_position = {}  # 是否已持仓该币种（由自动交易管理）
 
         self.tg_app = None
         if settings.TG_BOT_TOKEN:
@@ -358,10 +357,11 @@ class QuantBot:
         if not self._auth(update): return
         try:
             mode = context.args[0].lower()
+            # 预设方案现在包含保留底线
             presets = {
-                "conservative": {"tp": 3, "sl": 2, "tsl": 1, "tmpt": 1, "tf": "1h", "amt": 1},
-                "balanced": {"tp": 1.5, "sl": 1, "tsl": 0.5, "tmpt": 0.5, "tf": "15m", "amt": 1},
-                "aggressive": {"tp": 0.8, "sl": 0.5, "tsl": 0.3, "tmpt": 0.3, "tf": "5m", "amt": 1},
+                "conservative": {"tp": 3, "sl": 2, "tsl": 1, "tmpt": 1, "tf": "1h", "amt": 1, "reserve": 2},
+                "balanced": {"tp": 1.5, "sl": 1, "tsl": 0.5, "tmpt": 0.5, "tf": "15m", "amt": 1, "reserve": 1},
+                "aggressive": {"tp": 0.8, "sl": 0.5, "tsl": 0.3, "tmpt": 0.3, "tf": "5m", "amt": 1, "reserve": 0.5},
             }
             if mode not in presets:
                 await update.effective_message.reply_text("可选: conservative / balanced / aggressive")
@@ -370,10 +370,15 @@ class QuantBot:
             self.tp_pct = p["tp"]/100; self.sl_pct = p["sl"]/100
             self.trailing_sl_pct = p["tsl"]/100; self.trailing_tp_pct = p["tmpt"]/100
             self.timeframe = p["tf"]; self.single_order_usdt = p["amt"]
+            self.reserve_bottom = p["reserve"]  # 修复：预设方案包含保留底线
             async with self.lock: self._save()
             names = {"conservative": "保守", "balanced": "平衡", "aggressive": "激进"}
             await update.effective_message.reply_text(
-                f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct*100:.1f}% 止损{self.sl_pct*100:.1f}%", parse_mode="Markdown")
+                f"⚡ {names[mode]}方案已生效\n"
+                f"止盈{self.tp_pct*100:.1f}% 止损{self.sl_pct*100:.1f}%\n"
+                f"移损{self.trailing_sl_pct*100:.1f}% 移盈{self.trailing_tp_pct*100:.1f}%\n"
+                f"单笔{self.single_order_usdt}U 周期{self.timeframe} 底线{self.reserve_bottom}U",
+                parse_mode="Markdown")
         except: await update.effective_message.reply_text("❌ `/preset balanced`")
 
     async def cmd_history(self, update, context):
@@ -436,11 +441,10 @@ class QuantBot:
 
     async def cmd_help(self, update, context):
         await update.effective_message.reply_text(
-            f"🤖 自动交易流程:\n"
-            f"1. /preset balanced → 加载参数\n"
-            f"2. /autoscore 75 → 信号阈值\n"
-            f"3. /autotrade on → 开启自动\n"
-            f"系统将在信号≥{self.auto_min_score}分时自动买入\n"
+            f"🤖 全自动流程:\n"
+            f"1. /preset balanced (含1U底线)\n"
+            f"2. /autoscore 75\n"
+            f"3. /autotrade on\n"
             f"保本线: >{self.breakeven_pct*100:.2f}%")
 
     # ---------- 参数设置 ----------
@@ -502,7 +506,7 @@ class QuantBot:
         try:
             self.reserve_bottom = float(context.args[0])
             async with self.lock: self._save()
-            await update.effective_message.reply_text("✅")
+            await update.effective_message.reply_text(f"✅ 保留底线: {self.reserve_bottom}U")
         except: pass
 
     async def cmd_add_symbol(self, update, context):
@@ -613,7 +617,7 @@ class QuantBot:
                 msg = (f"📊 看板\n"
                        f"止盈{self.tp_pct*100:.2f}% 止损{self.sl_pct*100:.2f}%\n"
                        f"移损{self.trailing_sl_pct*100:.2f}% 移盈{self.trailing_tp_pct*100:.2f}%\n"
-                       f"额度{self.single_order_usdt}U 周期{self.timeframe}\n"
+                       f"额度{self.single_order_usdt}U 周期{self.timeframe} 底线{self.reserve_bottom}U\n"
                        f"自动交易: {auto_state} 阈值: {self.auto_min_score}分\n"
                        f"今日交易: {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}")
                 await query.message.reply_text(msg)
@@ -632,12 +636,13 @@ class QuantBot:
                 await query.edit_message_text("⚡ 选择方案:", reply_markup=InlineKeyboardMarkup(kb))
             elif data.startswith("preset:"):
                 mode = data.split(":")[1]
-                p = {"conservative":{"tp":3,"sl":2,"tsl":1,"tmpt":1,"tf":"1h","amt":1},
-                     "balanced":{"tp":1.5,"sl":1,"tsl":0.5,"tmpt":0.5,"tf":"15m","amt":1},
-                     "aggressive":{"tp":0.8,"sl":0.5,"tsl":0.3,"tmpt":0.3,"tf":"5m","amt":1}}[mode]
+                p = {"conservative":{"tp":3,"sl":2,"tsl":1,"tmpt":1,"tf":"1h","amt":1,"reserve":2},
+                     "balanced":{"tp":1.5,"sl":1,"tsl":0.5,"tmpt":0.5,"tf":"15m","amt":1,"reserve":1},
+                     "aggressive":{"tp":0.8,"sl":0.5,"tsl":0.3,"tmpt":0.3,"tf":"5m","amt":1,"reserve":0.5}}[mode]
                 self.tp_pct=p["tp"]/100; self.sl_pct=p["sl"]/100
                 self.trailing_sl_pct=p["tsl"]/100; self.trailing_tp_pct=p["tmpt"]/100
                 self.timeframe=p["tf"]; self.single_order_usdt=p["amt"]
+                self.reserve_bottom = p["reserve"]
                 async with self.lock: self._save()
                 await query.answer("✅ 已生效", show_alert=True)
                 await self._refresh_panel(query)
@@ -645,6 +650,9 @@ class QuantBot:
             elif data == "menu_set_autoscore":
                 opts = [("70分","70"),("75分","75"),("80分","80"),("85分","85")]
                 await query.edit_message_text("🎯 信号阈值", reply_markup=self._build_option_keyboard(opts,"cfg_autoscore","autoscore"))
+            elif data == "menu_set_trades":
+                opts = [("3次","3"),("5次","5"),("10次","10"),("无限","0")]
+                await query.edit_message_text("🔢 单日交易上限", reply_markup=self._build_option_keyboard(opts,"cfg_trades","settrades"))
             elif data == "menu_set_tp":
                 opts = [("3%","0.03"),("5%","0.05"),("8%","0.08")]
                 await query.edit_message_text("🎯", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp"))
@@ -664,7 +672,7 @@ class QuantBot:
                 opts = [("1m","1m"),("5m","5m"),("15m","15m"),("1h","1h")]
                 await query.edit_message_text("⏱", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf"))
             elif data == "menu_set_reserve":
-                opts = [("20U","20"),("50U","50"),("100U","100"),("200U","200")]
+                opts = [("0.5U","0.5"),("1U","1"),("2U","2"),("5U","5")]
                 await query.edit_message_text("🔒", reply_markup=self._build_option_keyboard(opts,"cfg_res","setreserve"))
             elif data == "menu_add_symbol":
                 opts = [("BTC/USDT","BTC/USDT"),("SOL/USDT","SOL/USDT"),("DOGE/USDT","DOGE/USDT")]
@@ -687,6 +695,7 @@ class QuantBot:
                 elif prefix == "cfg_tf": self.timeframe = val_str
                 elif prefix == "cfg_res": self.reserve_bottom = float(val_str)
                 elif prefix == "cfg_autoscore": self.auto_min_score = int(val_str)
+                elif prefix == "cfg_trades": self.max_daily_trades = int(val_str)
                 elif prefix == "cfg_add":
                     if val_str not in self.symbols: self.symbols.append(val_str)
                     else: await query.answer("已存在", show_alert=True); return
@@ -710,6 +719,7 @@ class QuantBot:
                     "addsymbol": "✍️ 输入币种（例：DOGE/USDT）：",
                     "delsymbol": "✍️ 输入要删除的币种（例：SOL/USDT）：",
                     "autoscore": "✍️ 输入信号阈值（50-95，建议75）：",
+                    "settrades": "✍️ 输入单日最大交易次数（0=无限）：",
                 }
                 await query.message.reply_text(prompts.get(key, "✍️ 请输入数值："),
                     reply_markup=ForceReply(selective=True), parse_mode="Markdown")
@@ -722,48 +732,40 @@ class QuantBot:
         except: pass
 
     # =================================================================
-    # 核心：自动交易监控循环
+    # 自动交易主循环
     # =================================================================
     async def _auto_trade_monitor(self):
-        """30秒检查一次，满足条件自动开仓"""
-        await asyncio.sleep(10)  # 等 Bot 完全启动
+        await asyncio.sleep(10)
         while True:
             try:
                 if not self.is_running or not self.auto_trade_enabled:
                     await asyncio.sleep(30)
                     continue
 
-                # 重置每日计数
                 today = datetime.now(CST).day
                 if today != self.last_reset_day:
                     self.daily_trades = 0
                     self.last_reset_day = today
 
-                # 检查每日限额
                 if self.max_daily_trades > 0 and self.daily_trades >= self.max_daily_trades:
                     await asyncio.sleep(30)
                     continue
 
-                # 获取恐惧贪婪指数
                 fg = (await self.real_data.get_fear_greed_index())["value"]
                 bal = await self.exchange.fetch_balance()
                 usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
 
-                # 检查可用余额
                 if usdt_free < self.single_order_usdt + self.reserve_bottom:
                     await asyncio.sleep(30)
                     continue
 
-                # 遍历币种
                 for sym in self.symbols:
                     try:
-                        # 已经持仓则跳过
                         coin = sym.split('/')[0]
                         free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
                         if free > 0.0001:
                             continue
 
-                        # 获取指标
                         ticker = await self.exchange.fetch_ticker(sym)
                         p = ticker['last']
                         ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
@@ -771,22 +773,18 @@ class QuantBot:
                         funding = await self.exchange.fetch_funding_rate(sym)
                         sc = self.signal_engine.score(tech, funding, fg)
 
-                        # 条件判断
                         if sc < self.auto_min_score:
                             continue
 
-                        # 价格必须在布林下轨附近（不超过2%）
                         if p > tech['bb_lower'] * 1.02:
                             continue
 
-                        # 盘口过滤
                         if self.orderbook_filter:
                             ob = await self.exchange.fetch_orderbook(sym)
                             ob_valid, _ = await self.orderbook_engine.validate(ob)
                             if not ob_valid:
                                 continue
 
-                        # 全部条件满足，执行开仓
                         logger.info(f"🤖 自动开仓 {sym} 信号{sc}分 价格{p:.2f}")
                         order = await self.exchange.create_market_buy_order(sym, self.single_order_usdt / p)
                         if order:
@@ -795,7 +793,6 @@ class QuantBot:
                             self._trailing_high[sym] = p
                             self._trailing_active[sym] = False
 
-                            # 发通知
                             if settings.TG_CHAT_ID and self.tg_app and self.tg_app.bot:
                                 try:
                                     await self.tg_app.bot.send_message(
@@ -805,7 +802,6 @@ class QuantBot:
                                     )
                                 except: pass
 
-                            # 开仓后等一会再检查下一个
                             await asyncio.sleep(5)
                     except Exception as e:
                         logger.error(f"自动交易异常 {sym}: {e}")
@@ -817,7 +813,6 @@ class QuantBot:
                 await asyncio.sleep(30)
 
     async def _trailing_monitor(self):
-        """移动止盈追踪"""
         await asyncio.sleep(5)
         while True:
             try:
@@ -845,7 +840,6 @@ class QuantBot:
                                 })
                                 save_trades(self.trades)
                                 self._trailing_active[sym] = False; self._trailing_high[sym] = 0
-                                # 通知平仓
                                 if settings.TG_CHAT_ID and self.tg_app and self.tg_app.bot:
                                     try:
                                         await self.tg_app.bot.send_message(
@@ -876,6 +870,6 @@ class QuantBot:
             await self.tg_app.updater.start_polling(drop_pending_updates=True)
             logger.info("✅ Bot 全自动交易版启动")
             asyncio.create_task(self._trailing_monitor())
-            asyncio.create_task(self._auto_trade_monitor())  # 自动开仓
+            asyncio.create_task(self._auto_trade_monitor())
             while True:
                 await asyncio.sleep(30)
