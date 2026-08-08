@@ -1,5 +1,5 @@
 """
-bot.py - Telegram 完全体交互层（完全还原原版主面板 + 全部功能）
+bot.py - Telegram 完全体交互层（已补全 /status /check /symbols 命令）
 """
 import asyncio, random
 from datetime import datetime, timezone, timedelta
@@ -70,6 +70,11 @@ class QuantBot:
             self.tg_app.add_handler(CommandHandler("analysis", self.cmd_analysis))
             self.tg_app.add_handler(CommandHandler("brain", self.cmd_brain))
             self.tg_app.add_handler(CommandHandler("help", self.cmd_help))
+            # 新增三条命令
+            self.tg_app.add_handler(CommandHandler("status", self.cmd_status))
+            self.tg_app.add_handler(CommandHandler("check", self.cmd_check))
+            self.tg_app.add_handler(CommandHandler("symbols", self.cmd_symbols))
+            # 参数设置命令
             self.tg_app.add_handler(CommandHandler("settp", self.cmd_set_tp))
             self.tg_app.add_handler(CommandHandler("setsl", self.cmd_set_sl))
             self.tg_app.add_handler(CommandHandler("settsl", self.cmd_set_tsl))
@@ -98,7 +103,7 @@ class QuantBot:
         return val / 100 if val >= 1 else val
 
     # =================================================================
-    # 主面板键盘（完全还原您原版的 21 个按钮布局）
+    # 主面板键盘（完全还原原版）
     # =================================================================
     def _build_main_keyboard(self):
         f_status = "已开启" if self.orderbook_filter else "已关闭"
@@ -186,9 +191,75 @@ class QuantBot:
                "• 止盈率: `/settp 5`\n• 硬止损: `/setsl 2`\n"
                "• 移动止损: `/settsl 1.5`\n• 单笔额度: `/setamount 100`\n"
                "• K线周期: `/settf 15m`\n• 保留底线: `/setreserve 50`\n"
-               "• 添加币种: `/addsymbol SOL/USDT`\n• 删除币种: `/delsymbol SOL/USDT`")
+               "• 添加币种: `/addsymbol SOL/USDT`\n• 删除币种: `/delsymbol SOL/USDT`\n\n"
+               "📋 查询命令：\n"
+               "/status - 多币种面板与持仓明细\n"
+               "/check  - 多币种实时指标与买入差距\n"
+               "/symbols - 监控币种列表")
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
+    # ---------- 新增命令 ----------
+    async def cmd_status(self, update, context):
+        """多币种面板与持仓明细"""
+        if not self._auth(update): return
+        msg_obj = update.effective_message
+        await msg_obj.reply_chat_action("typing")
+        lines = [f"📊 **多币种持仓面板** {self.env_tag}\n━━━━━━━━━━━━━━━━━━"]
+        bal = await self.exchange.fetch_balance()
+        total_usdt_value = 0.0
+        for sym in self.symbols:
+            ticker = await self.exchange.fetch_ticker(sym)
+            price = ticker.get('last', 0)
+            coin = sym.split('/')[0]
+            free = 0
+            if isinstance(bal.get(coin), dict):
+                free = float(bal[coin].get('free', 0))
+            elif coin in bal and isinstance(bal[coin], (int, float)):
+                free = float(bal[coin])
+            value = free * price
+            total_usdt_value += value
+            lines.append(f"🔹 {sym}: 持仓 {free:.4f}  |  现价 {price:.2f}  |  价值 ≈ {value:.2f} USDT")
+        usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
+        total_usdt_value += usdt_free
+        lines.append(f"━━━━━━━━━━━━━━━━━━\n💵 USDT 余额: {usdt_free:.2f} USDT")
+        lines.append(f"💰 总资产估值: ≈ {total_usdt_value:.2f} USDT")
+        lines.append(f"🔒 安全底线: {self.reserve_bottom} USDT")
+        await msg_obj.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def cmd_check(self, update, context):
+        """多币种实时指标与买入差距（带持仓信号）"""
+        if not self._auth(update): return
+        msg_obj = update.effective_message
+        await msg_obj.reply_chat_action("typing")
+        lines = [f"📈 **多币种实时指标与买入差距检查** {self.env_tag}\n━━━━━━━━━━━━━━━━━━"]
+        for sym in self.symbols:
+            ticker = await self.exchange.fetch_ticker(sym)
+            p = ticker['last']
+            ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
+            tech = self.tech.calc(ohlcv, p)
+            target = min(tech['bb_lower'], p * 0.99)
+            gap = ((p - target) / p) * 100
+            signal = "🔥 接近买点" if gap < 0.5 else "📉 等待"
+            # 检查持仓
+            bal = await self.exchange.fetch_balance()
+            coin = sym.split('/')[0]
+            holding = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+            hold_info = f"持仓 {holding:.4f}" if holding > 0 else "空仓"
+            lines.append(
+                f"🔹 **{sym}**: {p:.2f}  |  {hold_info}\n"
+                f"   布林下轨: {tech['bb_lower']:.2f}  |  RSI: {tech['rsi']:.1f}  |  ATR: {tech['atr']:.2f}\n"
+                f"   距买点: {gap:+.2f}%  {signal}"
+            )
+        lines.append("💡 *基于真实K线计算，非随机模拟*")
+        await msg_obj.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def cmd_symbols(self, update, context):
+        """列出当前监控币种"""
+        if not self._auth(update): return
+        s_list = "\n".join([f"• `{s}`" for s in self.symbols])
+        await update.effective_message.reply_text(f"📋 **监控币种列表**:\n{s_list}", parse_mode="Markdown")
+
+    # 原有的参数修改命令（不变）
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
@@ -260,7 +331,7 @@ class QuantBot:
         except: await update.effective_message.reply_text("❌ 格式错误！例如：`/delsymbol SOL/USDT`")
 
     # =================================================================
-    # 诊断渲染
+    # 诊断渲染（不变）
     # =================================================================
     async def render_brain_status(self, msg_obj):
         try:
@@ -369,13 +440,12 @@ class QuantBot:
             context.user_data['pending_setting'] = None
 
     # =================================================================
-    # 按钮回调
+    # 按钮回调（完整保留）
     # =================================================================
     async def handle_button_click(self, update, context):
         query = update.callback_query
         data = query.data
         try:
-            # --- 核心控制 ---
             if data == "refresh_panel":
                 await query.answer("🔄 已刷新")
                 status = "🟢 运行中" if self.is_running else "🔴 已停止"
@@ -406,7 +476,6 @@ class QuantBot:
                 try: await query.edit_message_text("🔴 已停止", reply_markup=self._build_main_keyboard())
                 except: pass
 
-            # --- 诊断 ---
             elif data == "brain_status":
                 await query.answer("🧠 正在调阅四大引擎诊断...")
                 await self.render_brain_status(query.message)
@@ -448,7 +517,7 @@ class QuantBot:
                 await query.answer("🚨 请发送 /panic 确认", show_alert=True)
                 await query.message.reply_text("🚨 **确认紧急全平？**\n请发送 `/panic` 确认！", parse_mode="Markdown")
 
-            # --- 二层快捷菜单 ---
+            # 二层菜单
             elif data == "menu_set_tp":
                 opts = [("🎯 3%", "0.03"), ("🎯 5%", "0.05"), ("🎯 8%", "0.08"), ("🎯 10%", "0.10")]
                 await query.edit_message_text(f"🎯 选择止盈率 (当前 {self.tp_pct*100:.1f}%)",
@@ -482,31 +551,25 @@ class QuantBot:
                 await query.edit_message_text("➖ 选择要移除的币种",
                     reply_markup=self._build_option_keyboard(opts, "cfg_del", "delsymbol"), parse_mode="Markdown")
 
-            # --- 快捷应用 ---
+            # 快捷应用
             elif data.startswith("cfg_tp:"):
                 self.tp_pct = float(data.split(":")[1]); await query.answer(f"止盈改为 {self.tp_pct*100:.1f}%", show_alert=True)
-                async with self.lock: self._save()
-                await self._refresh_panel(query)
+                async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_sl:"):
                 self.sl_pct = float(data.split(":")[1]); await query.answer(f"止损改为 {self.sl_pct*100:.1f}%", show_alert=True)
-                async with self.lock: self._save()
-                await self._refresh_panel(query)
+                async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_tsl:"):
                 self.trailing_sl_pct = float(data.split(":")[1]); await query.answer(f"移动止损改为 {self.trailing_sl_pct*100:.1f}%", show_alert=True)
-                async with self.lock: self._save()
-                await self._refresh_panel(query)
+                async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_amt:"):
                 self.single_order_usdt = float(data.split(":")[1]); await query.answer(f"单笔改为 {self.single_order_usdt}U", show_alert=True)
-                async with self.lock: self._save()
-                await self._refresh_panel(query)
+                async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_tf:"):
                 self.timeframe = data.split(":")[1]; await query.answer(f"周期改为 {self.timeframe}", show_alert=True)
-                async with self.lock: self._save()
-                await self._refresh_panel(query)
+                async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_res:"):
                 self.reserve_bottom = float(data.split(":")[1]); await query.answer(f"底线改为 {self.reserve_bottom}U", show_alert=True)
-                async with self.lock: self._save()
-                await self._refresh_panel(query)
+                async with self.lock: self._save(); await self._refresh_panel(query)
             elif data.startswith("cfg_add:"):
                 sym = data.split(":")[1]
                 if sym not in self.symbols:
@@ -522,7 +585,7 @@ class QuantBot:
                 else: await query.answer(f"{sym} 不存在", show_alert=True)
                 await self._refresh_panel(query)
 
-            # --- 自填模式 ---
+            # 自填模式
             elif data.startswith("prompt_manual:"):
                 key = data.split(":")[1]
                 context.user_data['pending_setting'] = key
