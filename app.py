@@ -10,7 +10,6 @@ async def main():
     exchange = ExchangeManager()
     bot = QuantBot(exchange)
 
-    # HTTP 健康检查（防止 Render 休眠）
     async def health(reader, writer):
         writer.write(b"HTTP/1.1 200 OK\r\n\r\nOK")
         await writer.drain()
