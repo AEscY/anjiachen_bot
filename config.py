@@ -1,5 +1,5 @@
 """
-config.py - 全局配置中心（多交易所 + 手续费保本）
+config.py - 全局配置中心（多交易所 + 手续费保本参数）
 """
 import os, logging
 from pydantic_settings import BaseSettings
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", "10000"))
     ALLOWED_USERS: str = os.getenv("ALLOWED_USERS", "")
 
-    # 交易所选择
+    # 交易所选择 (okx, binance, bybit 等)
     EXCHANGE_NAME: str = os.getenv("EXCHANGE_NAME", "okx").lower()
 
     # OKX 凭证
@@ -37,14 +37,14 @@ class Settings(BaseSettings):
     OKX_SECRET_KEY: str = os.getenv("OKX_SECRET_KEY", "")
     OKX_PASSPHRASE: str = os.getenv("OKX_PASSPHRASE", "")
 
-    # 通用凭证
+    # 通用凭证（可选）
     API_KEY: str = os.getenv("API_KEY", "")
     SECRET_KEY: str = os.getenv("SECRET_KEY", "")
     PASSWORD: str = os.getenv("PASSWORD", "")
 
-    # 手续费与保本设置（可环境变量覆盖）
-    TAKER_FEE: float = float(os.getenv("TAKER_FEE", "0.001"))       # 默认现货吃单 0.1%
-    MAKER_FEE: float = float(os.getenv("MAKER_FEE", "0.0008"))      # 默认现货挂单 0.08%
-    MIN_PROFIT_MARGIN: float = float(os.getenv("MIN_PROFIT_MARGIN", "0.001"))  # 最小净利润率 0.1%
+    # ---- 手续费与保本参数 ----
+    TAKER_FEE: float = float(os.getenv("TAKER_FEE", "0.001"))       # 吃单费率 0.1%
+    MAKER_FEE: float = float(os.getenv("MAKER_FEE", "0.0008"))      # 挂单费率 0.08%
+    MIN_PROFIT_MARGIN: float = float(os.getenv("MIN_PROFIT_MARGIN", "0.001"))  # 安全垫 0.1%
 
 settings = Settings()
