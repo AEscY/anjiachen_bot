@@ -1,5 +1,5 @@
 """
-bot.py - Telegram 完全体交互层（已补全 /status /check /symbols 命令）
+bot.py - Telegram 完全体交互层（已添加输入框菜单按钮：/status /check /symbols 等）
 """
 import asyncio, random
 from datetime import datetime, timezone, timedelta
@@ -64,17 +64,16 @@ class QuantBot:
         self.tg_app = None
         if settings.TG_BOT_TOKEN:
             self.tg_app = ApplicationBuilder().token(settings.TG_BOT_TOKEN).build()
+            # 基础查询与面板
             self.tg_app.add_handler(CommandHandler("start", self.cmd_menu))
             self.tg_app.add_handler(CommandHandler("menu", self.cmd_menu))
-            self.tg_app.add_handler(CommandHandler("panic", self.cmd_panic))
-            self.tg_app.add_handler(CommandHandler("analysis", self.cmd_analysis))
-            self.tg_app.add_handler(CommandHandler("brain", self.cmd_brain))
-            self.tg_app.add_handler(CommandHandler("help", self.cmd_help))
-            # 新增三条命令
             self.tg_app.add_handler(CommandHandler("status", self.cmd_status))
             self.tg_app.add_handler(CommandHandler("check", self.cmd_check))
             self.tg_app.add_handler(CommandHandler("symbols", self.cmd_symbols))
-            # 参数设置命令
+            self.tg_app.add_handler(CommandHandler("analysis", self.cmd_analysis))
+            self.tg_app.add_handler(CommandHandler("brain", self.cmd_brain))
+            self.tg_app.add_handler(CommandHandler("help", self.cmd_help))
+            # 参数修改
             self.tg_app.add_handler(CommandHandler("settp", self.cmd_set_tp))
             self.tg_app.add_handler(CommandHandler("setsl", self.cmd_set_sl))
             self.tg_app.add_handler(CommandHandler("settsl", self.cmd_set_tsl))
@@ -83,6 +82,9 @@ class QuantBot:
             self.tg_app.add_handler(CommandHandler("setreserve", self.cmd_set_reserve))
             self.tg_app.add_handler(CommandHandler("addsymbol", self.cmd_add_symbol))
             self.tg_app.add_handler(CommandHandler("delsymbol", self.cmd_del_symbol))
+            # 紧急操作
+            self.tg_app.add_handler(CommandHandler("panic", self.cmd_panic))
+            # 按钮回调与自填模式
             self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
             self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
 
@@ -103,7 +105,37 @@ class QuantBot:
         return val / 100 if val >= 1 else val
 
     # =================================================================
-    # 主面板键盘（完全还原原版）
+    # 注册菜单按钮（输入框旁边的斜杠菜单）
+    # =================================================================
+    async def register_bot_commands(self):
+        if not self.tg_app:
+            return
+        commands = [
+            BotCommand("menu", "📱 量化控制台"),
+            BotCommand("status", "📊 多币种持仓面板"),
+            BotCommand("check", "📈 实时指标与买入差距"),
+            BotCommand("symbols", "📋 监控币种列表"),
+            BotCommand("brain", "🧠 超级大脑诊断"),
+            BotCommand("analysis", "🔍 网格低买差距分析"),
+            BotCommand("settp", "🎯 设置止盈率 (例: /settp 5)"),
+            BotCommand("setsl", "🛡️ 设置硬止损 (例: /setsl 2)"),
+            BotCommand("settsl", "📉 设置移动止损 (例: /settsl 1.5)"),
+            BotCommand("setamount", "💵 设置单笔额度 (例: /setamount 100)"),
+            BotCommand("settf", "⏱️ 设置K线周期 (例: /settf 15m)"),
+            BotCommand("setreserve", "🔒 设置安全底线 (例: /setreserve 50)"),
+            BotCommand("addsymbol", "➕ 添加监控币种 (例: /addsymbol SOL/USDT)"),
+            BotCommand("delsymbol", "➖ 删除监控币种 (例: /delsymbol SOL/USDT)"),
+            BotCommand("panic", "🚨 紧急全平"),
+            BotCommand("help", "❓ 全部命令帮助"),
+        ]
+        try:
+            await self.tg_app.bot.set_my_commands(commands)
+            logger.info("✅ 菜单按钮已注册")
+        except Exception as e:
+            logger.error(f"注册菜单按钮失败: {e}")
+
+    # =================================================================
+    # 主面板键盘（完整按钮）
     # =================================================================
     def _build_main_keyboard(self):
         f_status = "已开启" if self.orderbook_filter else "已关闭"
@@ -172,38 +204,10 @@ class QuantBot:
         msg = f"⚙️ **量化机器人控制台 (超级大脑融合版) {self.env_tag}**\n当前状态: {status}\n⏱ {now}"
         await update.effective_message.reply_text(msg, reply_markup=self._build_main_keyboard(), parse_mode="Markdown")
 
-    async def cmd_panic(self, update, context):
-        if not self._auth(update): await update.message.reply_text("⛔ 未授权"); return
-        await self.panic_sell_all()
-        await update.effective_message.reply_text("🚨 全平指令已执行", parse_mode="Markdown")
-
-    async def cmd_analysis(self, update, context):
-        if not self._auth(update): return
-        await self.render_gap_analysis(update.effective_message)
-
-    async def cmd_brain(self, update, context):
-        if not self._auth(update): return
-        await self.render_brain_status(update.effective_message)
-
-    async def cmd_help(self, update, context):
-        msg = ("💡 **参数修改指南：**\n━━━━━━━━━━━━━━━━━━\n"
-               "推荐直接在控制台点击按钮操作，也可使用指令：\n"
-               "• 止盈率: `/settp 5`\n• 硬止损: `/setsl 2`\n"
-               "• 移动止损: `/settsl 1.5`\n• 单笔额度: `/setamount 100`\n"
-               "• K线周期: `/settf 15m`\n• 保留底线: `/setreserve 50`\n"
-               "• 添加币种: `/addsymbol SOL/USDT`\n• 删除币种: `/delsymbol SOL/USDT`\n\n"
-               "📋 查询命令：\n"
-               "/status - 多币种面板与持仓明细\n"
-               "/check  - 多币种实时指标与买入差距\n"
-               "/symbols - 监控币种列表")
-        await update.effective_message.reply_text(msg, parse_mode="Markdown")
-
-    # ---------- 新增命令 ----------
     async def cmd_status(self, update, context):
         """多币种面板与持仓明细"""
         if not self._auth(update): return
-        msg_obj = update.effective_message
-        await msg_obj.reply_chat_action("typing")
+        await update.effective_message.reply_chat_action("typing")
         lines = [f"📊 **多币种持仓面板** {self.env_tag}\n━━━━━━━━━━━━━━━━━━"]
         bal = await self.exchange.fetch_balance()
         total_usdt_value = 0.0
@@ -224,13 +228,12 @@ class QuantBot:
         lines.append(f"━━━━━━━━━━━━━━━━━━\n💵 USDT 余额: {usdt_free:.2f} USDT")
         lines.append(f"💰 总资产估值: ≈ {total_usdt_value:.2f} USDT")
         lines.append(f"🔒 安全底线: {self.reserve_bottom} USDT")
-        await msg_obj.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_check(self, update, context):
         """多币种实时指标与买入差距（带持仓信号）"""
         if not self._auth(update): return
-        msg_obj = update.effective_message
-        await msg_obj.reply_chat_action("typing")
+        await update.effective_message.reply_chat_action("typing")
         lines = [f"📈 **多币种实时指标与买入差距检查** {self.env_tag}\n━━━━━━━━━━━━━━━━━━"]
         for sym in self.symbols:
             ticker = await self.exchange.fetch_ticker(sym)
@@ -240,7 +243,6 @@ class QuantBot:
             target = min(tech['bb_lower'], p * 0.99)
             gap = ((p - target) / p) * 100
             signal = "🔥 接近买点" if gap < 0.5 else "📉 等待"
-            # 检查持仓
             bal = await self.exchange.fetch_balance()
             coin = sym.split('/')[0]
             holding = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
@@ -250,8 +252,8 @@ class QuantBot:
                 f"   布林下轨: {tech['bb_lower']:.2f}  |  RSI: {tech['rsi']:.1f}  |  ATR: {tech['atr']:.2f}\n"
                 f"   距买点: {gap:+.2f}%  {signal}"
             )
-        lines.append("💡 *基于真实K线计算，非随机模拟*")
-        await msg_obj.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append("💡 *基于真实K线计算*")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_symbols(self, update, context):
         """列出当前监控币种"""
@@ -259,7 +261,30 @@ class QuantBot:
         s_list = "\n".join([f"• `{s}`" for s in self.symbols])
         await update.effective_message.reply_text(f"📋 **监控币种列表**:\n{s_list}", parse_mode="Markdown")
 
-    # 原有的参数修改命令（不变）
+    async def cmd_panic(self, update, context):
+        if not self._auth(update): await update.message.reply_text("⛔ 未授权"); return
+        await self.panic_sell_all()
+        await update.effective_message.reply_text("🚨 全平指令已执行", parse_mode="Markdown")
+
+    async def cmd_analysis(self, update, context):
+        if not self._auth(update): return
+        await self.render_gap_analysis(update.effective_message)
+
+    async def cmd_brain(self, update, context):
+        if not self._auth(update): return
+        await self.render_brain_status(update.effective_message)
+
+    async def cmd_help(self, update, context):
+        msg = ("💡 **命令清单**\n━━━━━━━━━━━━━━━━━━\n"
+               "/menu - 主控制台\n/status - 持仓面板\n/check - 实时指标\n"
+               "/symbols - 币种列表\n/brain - 大脑诊断\n/analysis - 差距分析\n"
+               "/settp 5 - 止盈率\n/setsl 2 - 硬止损\n/setamount 100 - 单笔额度\n"
+               "/settf 15m - K线周期\n/setreserve 50 - 安全底线\n"
+               "/addsymbol SOL/USDT - 添加币种\n/delsymbol SOL/USDT - 删除币种\n"
+               "/panic - 紧急全平")
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+    # 参数修改命令（不变）
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
@@ -331,7 +356,7 @@ class QuantBot:
         except: await update.effective_message.reply_text("❌ 格式错误！例如：`/delsymbol SOL/USDT`")
 
     # =================================================================
-    # 诊断渲染（不变）
+    # 诊断渲染
     # =================================================================
     async def render_brain_status(self, msg_obj):
         try:
@@ -440,7 +465,7 @@ class QuantBot:
             context.user_data['pending_setting'] = None
 
     # =================================================================
-    # 按钮回调（完整保留）
+    # 按钮回调
     # =================================================================
     async def handle_button_click(self, update, context):
         query = update.callback_query
@@ -622,11 +647,15 @@ class QuantBot:
             if isinstance(amount, (int, float)) and amount > 0:
                 await self.exchange.create_market_sell_order(sym, amount)
 
+    # =================================================================
+    # 启动入口（已包含菜单注册）
+    # =================================================================
     async def start(self):
         if self.tg_app:
             await self.tg_app.initialize()
             await self.tg_app.start()
+            await self.register_bot_commands()  # ← 这里注册输入框旁边的菜单按钮
             await self.tg_app.updater.start_polling(drop_pending_updates=True)
-            logger.info("✅ Bot 完全体启动")
+            logger.info("✅ Bot 完全体启动（菜单按钮已部署）")
             while True:
                 await asyncio.sleep(30)
