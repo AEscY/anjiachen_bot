@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化交互层（原版功能全恢复 + 移动止盈/预设/历史/信号评分）
+bot.py - 完全体量化交互层（语法修复版）
 """
 import asyncio, random, aiohttp, json, os
 from datetime import datetime, timezone, timedelta
@@ -230,9 +230,6 @@ class QuantBot:
         try: await self.tg_app.bot.set_my_commands(commands)
         except Exception as e: logger.error(f"注册菜单失败: {e}")
 
-    # =================================================================
-    # 主面板（原版全部按钮 + 新功能整合）
-    # =================================================================
     def _build_main_keyboard(self):
         f_status = "已开启" if self.orderbook_filter else "已关闭"
         b_status = "已开启" if self.waterfall_breaker else "已关闭"
@@ -295,9 +292,7 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回控制台", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    # =================================================================
-    # 命令实现
-    # =================================================================
+    # ---------- 新命令 ----------
     async def cmd_entry(self, update, context):
         if not self._auth(update): return
         try:
@@ -310,7 +305,8 @@ class QuantBot:
         if not self._auth(update): return
         try:
             self.max_daily_trades = int(context.args[0])
-            async with self.lock: self._save()
+            async with self.lock:
+                self._save()
             await update.effective_message.reply_text(f"✅ 单日最大交易: {self.max_daily_trades}")
         except: await update.effective_message.reply_text("❌ `/settrades 5`")
 
@@ -332,10 +328,14 @@ class QuantBot:
                 await update.effective_message.reply_text("可选: conservative / balanced / aggressive")
                 return
             p = presets[mode]
-            self.tp_pct = p["tp"]/100; self.sl_pct = p["sl"]/100
-            self.trailing_sl_pct = p["tsl"]/100; self.trailing_tp_pct = p["tmpt"]/100
-            self.timeframe = p["tf"]; self.single_order_usdt = p["amt"]
-            async with self.lock: self._save()
+            self.tp_pct = p["tp"]/100
+            self.sl_pct = p["sl"]/100
+            self.trailing_sl_pct = p["tsl"]/100
+            self.trailing_tp_pct = p["tmpt"]/100
+            self.timeframe = p["tf"]
+            self.single_order_usdt = p["amt"]
+            async with self.lock:
+                self._save()
             names = {"conservative": "保守", "balanced": "平衡", "aggressive": "激进"}
             await update.effective_message.reply_text(
                 f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct*100:.1f}% 止损{self.sl_pct*100:.1f}%", parse_mode="Markdown")
@@ -402,25 +402,36 @@ class QuantBot:
     async def cmd_help(self, update, context):
         await update.effective_message.reply_text(f"命令: /menu /status /check /symbols /preset balanced /settp 5 /history\n保本线: >{self.breakeven_pct*100:.2f}%")
 
+    # ---------- 参数设置命令（语法已修正）----------
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
             val = self._parse_pct(float(context.args[0]))
             if val < self.breakeven_pct:
-                await update.effective_message.reply_text(f"❌ 低于保本线 {self.breakeven_pct*100:.2f}%"); return
+                await update.effective_message.reply_text(f"❌ 低于保本线 {self.breakeven_pct*100:.2f}%")
+                return
             self.tp_pct = val
-            async with self.lock: self._save()
+            async with self.lock:
+                self._save()
             await update.effective_message.reply_text(f"✅ 止盈: {self.tp_pct*100:.2f}%")
         except: pass
 
     async def cmd_set_sl(self, update, context):
         if not self._auth(update): return
-        try: self.sl_pct = self._parse_pct(float(context.args[0])); async with self.lock: self._save(); await update.effective_message.reply_text("✅")
+        try:
+            self.sl_pct = self._parse_pct(float(context.args[0]))
+            async with self.lock:
+                self._save()
+            await update.effective_message.reply_text("✅")
         except: pass
 
     async def cmd_set_tsl(self, update, context):
         if not self._auth(update): return
-        try: self.trailing_sl_pct = self._parse_pct(float(context.args[0])); async with self.lock: self._save(); await update.effective_message.reply_text("✅")
+        try:
+            self.trailing_sl_pct = self._parse_pct(float(context.args[0]))
+            async with self.lock:
+                self._save()
+            await update.effective_message.reply_text("✅")
         except: pass
 
     async def cmd_set_trailing_tp(self, update, context):
@@ -429,23 +440,36 @@ class QuantBot:
             val = self._parse_pct(float(context.args[0]))
             if val <= 0: return
             self.trailing_tp_pct = val
-            async with self.lock: self._save()
+            async with self.lock:
+                self._save()
             await update.effective_message.reply_text(f"✅ 移动止盈: {self.trailing_tp_pct*100:.2f}%")
         except: pass
 
     async def cmd_set_amount(self, update, context):
         if not self._auth(update): return
-        try: self.single_order_usdt = float(context.args[0]); async with self.lock: self._save(); await update.effective_message.reply_text("✅")
+        try:
+            self.single_order_usdt = float(context.args[0])
+            async with self.lock:
+                self._save()
+            await update.effective_message.reply_text("✅")
         except: pass
 
     async def cmd_set_tf(self, update, context):
         if not self._auth(update): return
-        try: self.timeframe = context.args[0].lower(); async with self.lock: self._save(); await update.effective_message.reply_text("✅")
+        try:
+            self.timeframe = context.args[0].lower()
+            async with self.lock:
+                self._save()
+            await update.effective_message.reply_text("✅")
         except: pass
 
     async def cmd_set_reserve(self, update, context):
         if not self._auth(update): return
-        try: self.reserve_bottom = float(context.args[0]); async with self.lock: self._save(); await update.effective_message.reply_text("✅")
+        try:
+            self.reserve_bottom = float(context.args[0])
+            async with self.lock:
+                self._save()
+            await update.effective_message.reply_text("✅")
         except: pass
 
     async def cmd_add_symbol(self, update, context):
@@ -454,7 +478,8 @@ class QuantBot:
             sym = context.args[0].upper()
             if sym not in self.symbols:
                 self.symbols.append(sym)
-                async with self.lock: self._save()
+                async with self.lock:
+                    self._save()
                 await update.effective_message.reply_text("✅")
         except: pass
 
@@ -464,7 +489,8 @@ class QuantBot:
             sym = context.args[0].upper()
             if sym in self.symbols:
                 self.symbols.remove(sym)
-                async with self.lock: self._save()
+                async with self.lock:
+                    self._save()
                 await update.effective_message.reply_text("✅")
         except: pass
 
@@ -518,7 +544,8 @@ class QuantBot:
                 elif pending == "setamount": self.single_order_usdt = val
                 elif pending == "setreserve": self.reserve_bottom = val
                 elif pending == "settrades": self.max_daily_trades = int(val)
-            async with self.lock: self._save()
+            async with self.lock:
+                self._save()
             context.user_data['pending_setting'] = None
             await update.message.reply_text("✅")
         except ValueError:
@@ -567,11 +594,11 @@ class QuantBot:
                 self.tp_pct=p["tp"]/100; self.sl_pct=p["sl"]/100
                 self.trailing_sl_pct=p["tsl"]/100; self.trailing_tp_pct=p["tmpt"]/100
                 self.timeframe=p["tf"]; self.single_order_usdt=p["amt"]
-                async with self.lock: self._save()
+                async with self.lock:
+                    self._save()
                 await query.answer("✅ 已生效", show_alert=True)
                 await self._refresh_panel(query)
             elif data == "panic_confirm": await query.answer("🚨 请发送 /panic 确认", show_alert=True)
-            # 二层菜单弹出
             elif data == "menu_set_tp":
                 opts = [("3%","0.03"),("5%","0.05"),("8%","0.08")]
                 await query.edit_message_text("🎯", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp"))
@@ -599,7 +626,6 @@ class QuantBot:
             elif data == "menu_del_symbol":
                 opts = [(s, s) for s in self.symbols]
                 await query.edit_message_text("➖", reply_markup=self._build_option_keyboard(opts,"cfg_del","delsymbol"))
-            # 快捷应用
             elif data.startswith("cfg_"):
                 prefix = data.split(":")[0] if ":" in data else ""
                 val_str = data.split(":")[1] if ":" in data else ""
@@ -620,10 +646,10 @@ class QuantBot:
                 elif prefix == "cfg_del":
                     if val_str in self.symbols: self.symbols.remove(val_str)
                     else: await query.answer("不存在", show_alert=True); return
-                async with self.lock: self._save()
+                async with self.lock:
+                    self._save()
                 await query.answer("✅", show_alert=True)
                 await self._refresh_panel(query)
-            # 自填模式触发
             elif data.startswith("prompt_manual:"):
                 key = data.split(":")[1]
                 context.user_data['pending_setting'] = key
@@ -697,7 +723,7 @@ class QuantBot:
             await self.tg_app.start()
             await self.register_bot_commands()
             await self.tg_app.updater.start_polling(drop_pending_updates=True)
-            logger.info("✅ Bot 完全体启动（原版功能全恢复 + 新功能）")
+            logger.info("✅ Bot 完全体启动（语法修复）")
             asyncio.create_task(self._trailing_monitor())
             while True:
                 await asyncio.sleep(30)
