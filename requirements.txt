@@ -3,3 +3,4 @@ ccxt>=4.0
 pydantic-settings
 pandas
 aiohttp
+aiosqlite
