@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化交互层（集成手续费保本约束）
+bot.py - 完全体量化交互层（已修复止盈百分比解析 + 手续费保本约束）
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -157,8 +157,10 @@ class QuantBot:
         if not self.allowed: return True
         return update.effective_user.id in self.allowed
 
+    # ===== 修复后的百分比解析（统一除以100） =====
     def _parse_pct(self, val):
-        return val / 100 if val >= 1 else val
+        # 输入数字始终视为百分比，例如 5 -> 0.05, 0.2 -> 0.002
+        return val / 100.0
 
     async def register_bot_commands(self):
         if not self.tg_app: return
@@ -333,7 +335,7 @@ class QuantBot:
                f"当前保本止盈底线: >{self.breakeven_pct*100:.2f}%")
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
-    # ============ 止盈设置（带保本校验） ============
+    # ============ 止盈设置（带保本校验，统一百分比解析） ============
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
@@ -347,7 +349,7 @@ class QuantBot:
             self.tp_pct = val
             async with self.lock: self._save()
             await update.effective_message.reply_text(f"✅ 止盈率: {self.tp_pct*100:.2f}%", parse_mode="Markdown")
-        except: await update.effective_message.reply_text("❌ 格式错误！例如：`/settp 5`")
+        except: await update.effective_message.reply_text("❌ 格式错误！输入百分比数字，例如 `/settp 5` 代表 5%")
 
     async def cmd_set_sl(self, update, context):
         if not self._auth(update): return
@@ -355,7 +357,7 @@ class QuantBot:
             self.sl_pct = self._parse_pct(float(context.args[0]))
             async with self.lock: self._save()
             await update.effective_message.reply_text(f"✅ 硬止损: {self.sl_pct*100:.1f}%", parse_mode="Markdown")
-        except: await update.effective_message.reply_text("❌ 格式错误！例如：`/setsl 2`")
+        except: await update.effective_message.reply_text("❌ 格式错误！输入百分比数字，例如 `/setsl 2` 代表 2%")
 
     async def cmd_set_tsl(self, update, context):
         if not self._auth(update): return
@@ -363,7 +365,7 @@ class QuantBot:
             self.trailing_sl_pct = self._parse_pct(float(context.args[0]))
             async with self.lock: self._save()
             await update.effective_message.reply_text(f"✅ 移动止损回调: {self.trailing_sl_pct*100:.1f}%", parse_mode="Markdown")
-        except: await update.effective_message.reply_text("❌ 格式错误！例如：`/settsl 1.5`")
+        except: await update.effective_message.reply_text("❌ 格式错误！输入百分比数字，例如 `/settsl 1.5` 代表 1.5%")
 
     async def cmd_set_amount(self, update, context):
         if not self._auth(update): return
@@ -606,7 +608,7 @@ class QuantBot:
                 await query.answer("🚨 请发送 /panic 确认", show_alert=True)
                 await query.message.reply_text("🚨 **确认紧急全平？**\n请发送 `/panic` 确认！", parse_mode="Markdown")
 
-            # 二层菜单（不变，略，已在下文）
+            # 二层菜单
             elif data == "menu_set_tp":
                 opts = [("🎯 3%", "0.03"), ("🎯 5%", "0.05"), ("🎯 8%", "0.08"), ("🎯 10%", "0.10")]
                 await query.edit_message_text(f"🎯 选择止盈率 (当前 {self.tp_pct*100:.2f}%，保本>{self.breakeven_pct*100:.2f}%)",
@@ -640,7 +642,7 @@ class QuantBot:
                 await query.edit_message_text("➖ 选择要移除的币种",
                     reply_markup=self._build_option_keyboard(opts, "cfg_del", "delsymbol"), parse_mode="Markdown")
 
-            # ---- 快捷应用（添加保本校验） ----
+            # ---- 快捷应用（含保本校验） ----
             elif data.startswith("cfg_tp:"):
                 val = float(data.split(":")[1])
                 if val < self.breakeven_pct:
