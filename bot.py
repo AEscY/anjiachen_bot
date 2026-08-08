@@ -1,5 +1,5 @@
 """
-bot.py - 超前思维优化版（修复 async with 语法错误）
+bot.py - 超前思维优化版（补全 cmd_symbols，修复启动崩溃）
 """
 import asyncio, random, aiohttp, json, os
 from datetime import datetime, timezone, timedelta
@@ -262,7 +262,7 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    # ---- 新命令 ----
+    # ---- 命令实现 ----
     async def cmd_entry(self, update, context):
         if not self._auth(update): return
         try:
@@ -325,12 +325,11 @@ class QuantBot:
         if not self._auth(update): return
         lines = ["📊 **持仓**\n"]
         bal = await self.exchange.fetch_balance()
-        total = 0
         for sym in self.symbols:
             ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
             coin = sym.split('/')[0]
             free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
-            val = free * p; total += val
+            val = free * p
             pnl = ""
             if sym in self.entries and self.entries[sym] > 0 and free > 0:
                 pnl_pct = ((p - self.entries[sym]) / self.entries[sym]) * 100
@@ -353,6 +352,12 @@ class QuantBot:
             lines.append(f"{sym}: {p:.2f} | 信号: {txt} ({sc})")
         await update.effective_message.reply_text("\n".join(lines))
 
+    async def cmd_symbols(self, update, context):
+        """列出当前监控的币种"""
+        if not self._auth(update): return
+        s_list = "\n".join([f"• `{s}`" for s in self.symbols])
+        await update.effective_message.reply_text(f"📋 **监控列表**:\n{s_list}", parse_mode="Markdown")
+
     async def cmd_menu(self, update, context):
         if not self._auth(update): await update.message.reply_text("⛔"); return
         await update.effective_message.reply_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
@@ -366,7 +371,7 @@ class QuantBot:
     async def cmd_brain(self, update, context): await self.render_brain_status(update.effective_message)
 
     async def cmd_help(self, update, context):
-        await update.effective_message.reply_text(f"命令: /menu /status /check /preset balanced /settp 5 /history\n保本线: >{self.breakeven_pct*100:.2f}%")
+        await update.effective_message.reply_text(f"命令: /menu /status /check /symbols /preset balanced /settp 5 /history\n保本线: >{self.breakeven_pct*100:.2f}%")
 
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
@@ -486,22 +491,40 @@ class QuantBot:
         pending = context.user_data.get('pending_setting')
         if not pending: return
         try:
-            val = float(update.message.text.strip())
-            if pending == "settp":
-                pct = self._parse_pct(val)
-                if pct < self.breakeven_pct:
-                    await update.message.reply_text(f"❌ 低于保本线"); return
-                self.tp_pct = pct
-            elif pending == "setsl": self.sl_pct = self._parse_pct(val)
-            elif pending == "settsl": self.trailing_sl_pct = self._parse_pct(val)
-            elif pending == "settmpt": self.trailing_tp_pct = self._parse_pct(val)
-            elif pending == "setamount": self.single_order_usdt = val
-            elif pending == "settf": self.timeframe = update.message.text.strip().lower()
+            user_text = update.message.text.strip()
+            if pending in ("settf",):
+                self.timeframe = user_text.lower()
+            else:
+                val = float(user_text)
+                if pending == "settp":
+                    pct = self._parse_pct(val)
+                    if pct < self.breakeven_pct:
+                        await update.message.reply_text("❌ 低于保本线"); return
+                    self.tp_pct = pct
+                elif pending == "setsl": self.sl_pct = self._parse_pct(val)
+                elif pending == "settsl": self.trailing_sl_pct = self._parse_pct(val)
+                elif pending == "settmpt": self.trailing_tp_pct = self._parse_pct(val)
+                elif pending == "setamount": self.single_order_usdt = val
+                elif pending == "setreserve": self.reserve_bottom = val
+                elif pending == "addsymbol":
+                    sym = user_text.upper()
+                    if sym not in self.symbols:
+                        self.symbols.append(sym)
+                    else:
+                        await update.message.reply_text("⚠️ 已存在"); return
+                elif pending == "delsymbol":
+                    sym = user_text.upper()
+                    if sym in self.symbols:
+                        self.symbols.remove(sym)
+                    else:
+                        await update.message.reply_text("⚠️ 不存在"); return
             async with self.lock:
                 self._save()
             context.user_data['pending_setting'] = None
             await update.message.reply_text("✅")
-        except: pass
+        except ValueError:
+            await update.message.reply_text("❌ 格式有误")
+            context.user_data['pending_setting'] = None
 
     async def handle_button_click(self, update, context):
         query = update.callback_query; data = query.data
@@ -565,23 +588,28 @@ class QuantBot:
                 opts = [("1m","1m"),("5m","5m"),("15m","15m"),("1h","1h")]
                 await query.edit_message_text("⏱", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf"))
             elif data.startswith("cfg_"):
-                prefix = "_".join(data.split("_")[:2]) + "_"
-                attr_map = {"cfg_tp:":"tp_pct","cfg_sl:":"sl_pct","cfg_tsl:":"trailing_sl_pct",
-                           "cfg_tmpt:":"trailing_tp_pct","cfg_amt:":"single_order_usdt","cfg_tf:":"timeframe"}
-                for k,v in attr_map.items():
-                    if data.startswith(k):
-                        val = data.split(":")[1]
-                        if v == "timeframe": setattr(self, v, val)
-                        else:
-                            val_f = float(val)
-                            if v == "tp_pct" and val_f < self.breakeven_pct:
-                                await query.answer(f"❌ 低于保本线", show_alert=True); return
-                            setattr(self, v, val_f)
-                        async with self.lock:
-                            self._save()
-                        await query.answer("✅", show_alert=True)
-                        await self._refresh_panel(query)
-                        break
+                prefix = data.split(":")[0] if ":" in data else ""
+                val_str = data.split(":")[1] if ":" in data else ""
+                if prefix == "cfg_tp":
+                    val_f = float(val_str)
+                    if val_f < self.breakeven_pct:
+                        await query.answer(f"❌ 低于保本线", show_alert=True); return
+                    self.tp_pct = val_f
+                elif prefix == "cfg_sl": self.sl_pct = float(val_str)
+                elif prefix == "cfg_tsl": self.trailing_sl_pct = float(val_str)
+                elif prefix == "cfg_tmpt": self.trailing_tp_pct = float(val_str)
+                elif prefix == "cfg_amt": self.single_order_usdt = float(val_str)
+                elif prefix == "cfg_tf": self.timeframe = val_str
+                elif prefix == "cfg_add":
+                    if val_str not in self.symbols: self.symbols.append(val_str)
+                    else: await query.answer("已存在"); return
+                elif prefix == "cfg_del":
+                    if val_str in self.symbols: self.symbols.remove(val_str)
+                    else: await query.answer("不存在"); return
+                async with self.lock:
+                    self._save()
+                await query.answer("✅", show_alert=True)
+                await self._refresh_panel(query)
             await query.answer()
         except Exception as e:
             logger.error(f"按钮异常: {e}")
