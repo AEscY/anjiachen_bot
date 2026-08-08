@@ -1,5 +1,5 @@
 """
-bot.py - Telegram 完全体交互层（还原原版全部功能）
+bot.py - Telegram 完全体交互层（已修复：真实资金费率 + 盘口数据）
 """
 import asyncio, random
 from datetime import datetime, timezone, timedelta
@@ -15,15 +15,6 @@ class MacroEngine:
     async def check(self):
         score = random.uniform(0.05, 0.35)
         return {'is_safe': score < 0.75, 'score': score, 'status': "🟢 平稳" if score < 0.75 else "🚨 风险"}
-
-class LiquidationEngine:
-    async def analyze(self, symbol, current_price):
-        funding_rate = random.uniform(-0.0002, 0.0005)
-        liq_cluster = current_price * 0.975
-        bias = "NEUTRAL"
-        if funding_rate > 0.0003: bias = "SHORT_PREFERRED"
-        elif funding_rate < -0.0001: bias = "LONG_PREFERRED"
-        return {'funding_rate': funding_rate, 'liq_target_below': liq_cluster, 'bias': bias}
 
 class OrderbookEngine:
     async def validate(self, orderbook):
@@ -41,7 +32,6 @@ class QuantBot:
         self.exchange = exchange
         self.tech = TechnicalEngine()
         self.macro = MacroEngine()
-        self.onchain = LiquidationEngine()
         self.orderbook_engine = OrderbookEngine()
         self.lock = asyncio.Lock()
 
@@ -239,17 +229,25 @@ class QuantBot:
             sym = self.symbols[0]
             ticker = await self.exchange.fetch_ticker(sym)
             price = ticker['last']
-            onchain = await self.onchain.analyze(sym, price)
+
+            # ✅ 修复：使用真实资金费率
+            funding_rate = await self.exchange.fetch_funding_rate(sym)
+
+            # ✅ 修复：现在 exchange 有 fetch_orderbook 了
             ob = await self.exchange.fetch_orderbook(sym)
             ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
+
             ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
             tech = self.tech.calc(ohlcv, price)
+
+            # 清算数据暂时保留占位（后续可接入真实链上数据）
+            liq_target = price * 0.975
 
             msg = (f"🧠 **AI 超级大脑 - 实时四大维度诊断** {self.env_tag}\n"
                    f"━━━━━━━━━━━━━━━━━━\n"
                    f"1️⃣ **宏观舆情**: {macro['status']} (风险分: {macro['score']:.2f})\n"
-                   f"2️⃣ **链上/费率**: Rate: {onchain['funding_rate']*100:+.3f}% | 偏向: {onchain['bias']}\n"
-                   f"   • 下方清算区: {onchain['liq_target_below']:.2f} USDT\n"
+                   f"2️⃣ **链上/费率**: 资金费率: {funding_rate*100:+.4f}%\n"
+                   f"   • 下方清算预估: {liq_target:.2f} USDT\n"
                    f"3️⃣ **盘口博弈**: {'✅ ' + ob_msg if ob_valid else '⚠️ ' + ob_msg}\n"
                    f"4️⃣ **布林网格 ({sym})**:\n"
                    f"   • 上轨/下轨: {tech['bb_upper']:.1f} / {tech['bb_lower']:.1f}\n"
@@ -341,7 +339,6 @@ class QuantBot:
         query = update.callback_query
         data = query.data
         try:
-            # 刷新面板
             if data == "refresh_panel":
                 await query.answer("🔄 已刷新")
                 status = "🟢 运行中" if self.is_running else "🔴 已停止"
