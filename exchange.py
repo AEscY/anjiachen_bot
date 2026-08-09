@@ -1,8 +1,7 @@
 """
-exchange.py - 多交易所管理器（余额和持仓数据修复版）
+exchange.py - 多交易所管理器（完全移除模拟降级，假数据返回 None）
 """
 import os
-import random
 import asyncio
 import ccxt.async_support as ccxt
 from config import settings, logger
@@ -33,7 +32,7 @@ class ExchangeManager:
         name = settings.EXCHANGE_NAME
         key, secret, password = self._get_credentials()
         if not key:
-            logger.warning(f"⚠️ 未配置 {name} API 密钥，将使用模拟数据")
+            logger.warning(f"⚠️ 未配置 {name} API 密钥，所有数据将不可用")
             return
         try:
             exchange_class = getattr(ccxt, name, None)
@@ -56,18 +55,18 @@ class ExchangeManager:
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
 
-    # ---------- 行情 ----------
+    # ---------- 行情（失败返回 None，绝不造数据） ----------
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try:
                 return await self.exchange.fetch_ticker(symbol)
-            except Exception:
-                pass
-        return {'last': random.uniform(3000, 3200)}
+            except Exception as e:
+                logger.warning(f"获取现价失败 {symbol}: {e}")
+        return None
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
         if not self.exchange:
-            return []
+            return None
         for attempt in range(3):
             try:
                 data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -76,17 +75,16 @@ class ExchangeManager:
             except Exception as e:
                 logger.warning(f"K线获取失败 (第{attempt+1}次): {e}")
             await asyncio.sleep(2)
-        return []
+        logger.error(f"K线获取彻底失败 {symbol}")
+        return None
 
     async def fetch_orderbook(self, symbol, limit=5):
         if self.exchange:
             try:
                 return await self.exchange.fetch_order_book(symbol, limit)
-            except Exception:
-                pass
-        ticker = await self.fetch_ticker(symbol)
-        p = ticker['last']
-        return {'bids': [[p * 0.9998, 12.5]], 'asks': [[p * 1.0002, 10.2]]}
+            except Exception as e:
+                logger.warning(f"获取盘口失败 {symbol}: {e}")
+        return None
 
     async def fetch_funding_rate(self, symbol):
         if self.exchange:
@@ -105,15 +103,12 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（返回完整标准数据） ----------
+    # ---------- 余额 ----------
     async def fetch_balance(self):
-        """获取余额，兼容 OKX 模拟盘，返回完整持仓字典"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
-
         try:
             raw = await self.exchange.fetch_balance()
-            # 如果 raw 本身就是标准格式，直接返回
             if isinstance(raw, dict) and 'USDT' in raw and isinstance(raw['USDT'], (dict, int, float)):
                 result = {}
                 for key, val in raw.items():
@@ -122,8 +117,6 @@ class ExchangeManager:
                     elif isinstance(val, (int, float)):
                         result[key] = {'free': float(val), 'used': 0, 'total': float(val)}
                 return result
-
-            # 尝试从 info.data 中提取
             info = raw.get('info') if isinstance(raw, dict) else None
             if isinstance(info, dict):
                 data_list = info.get('data')
@@ -137,10 +130,8 @@ class ExchangeManager:
                             result[ccy] = {'free': avail, 'used': frozen, 'total': avail + frozen}
                     if result:
                         return result
-
         except Exception as e:
-            logger.error(f"fetch_balance 失败: {e}", exc_info=True)
-
+            logger.error(f"获取余额失败: {e}")
         return {'USDT': {'free': 0}}
 
     # ---------- 交易 ----------
