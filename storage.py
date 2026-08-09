@@ -1,10 +1,13 @@
 """
-storage.py - SQLite 数据库管理（含交易详情 + 学习统计）
+storage.py - SQLite 数据库管理（含日统计、备份导出）
 """
 import aiosqlite
+import json
+from datetime import datetime, timezone, timedelta
 from config import logger
 
 DB_FILE = "bot.db"
+CST = timezone(timedelta(hours=8))
 
 DEFAULT_CONFIG = {
     "tp_pct": 0.08, "sl_pct": 0.05, "trailing_sl_pct": 0.02,
@@ -12,7 +15,8 @@ DEFAULT_CONFIG = {
     "reserve_bottom": 50, "symbols": "", "orderbook_filter": True,
     "waterfall_breaker": True, "max_daily_trades": 0,
     "auto_trade_enabled": False, "auto_min_score": 75,
-    "max_per_coin_usdt": 0, "max_daily_loss_pct": 0.05
+    "max_per_coin_usdt": 0, "max_daily_loss_pct": 0.05,
+    "max_total_allocated_pct": 0.8  # 总仓位上限80%
 }
 
 async def init_db():
@@ -133,4 +137,53 @@ async def get_recent_performance(num=10):
             }
     except Exception as e:
         logger.error(f"获取近期表现失败: {e}")
+        return None
+
+# ---------- 新增：当日交易统计 ----------
+async def get_today_trades():
+    """获取今日所有平仓交易的盈亏统计"""
+    today_str = datetime.now(CST).strftime("%m-%d")
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT pnl_pct FROM trade_details WHERE side='sell' AND time LIKE ? ORDER BY id DESC",
+                (today_str + '%',)
+            ) as cursor:
+                rows = await cursor.fetchall()
+            if not rows:
+                return None
+            pnls = [row[0] for row in rows]
+            wins = sum(1 for p in pnls if p > 0)
+            total = len(pnls)
+            total_pnl = sum(pnls)
+            avg_win = sum(p for p in pnls if p > 0) / wins if wins > 0 else 0
+            avg_loss = sum(p for p in pnls if p < 0) / (total - wins) if total - wins > 0 else 0
+            return {
+                "total": total,
+                "wins": wins,
+                "losses": total - wins,
+                "win_rate": wins / total if total > 0 else 0,
+                "avg_win_pct": avg_win,
+                "avg_loss_pct": avg_loss,
+                "total_pnl_sum": total_pnl,
+                "pnls": pnls
+            }
+    except Exception as e:
+        logger.error(f"获取今日交易失败: {e}")
+        return None
+
+async def export_db_to_json():
+    """将数据库关键表导出为 JSON 字符串"""
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM config") as cursor:
+                configs = [dict(row) async for row in cursor]
+            async with db.execute("SELECT * FROM trades") as cursor:
+                trades = [dict(row) async for row in cursor]
+            async with db.execute("SELECT * FROM trade_details") as cursor:
+                details = [dict(row) async for row in cursor]
+        return json.dumps({"config": configs, "trades": trades, "details": details}, indent=2)
+    except Exception as e:
+        logger.error(f"导出数据库失败: {e}")
         return None
