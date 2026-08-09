@@ -1,6 +1,5 @@
 """
 storage.py - SQLite 数据库管理
-存储系统配置和交易历史记录，重启不丢失。
 """
 import aiosqlite
 from config import logger
@@ -8,45 +7,23 @@ from config import logger
 DB_FILE = "bot.db"
 
 DEFAULT_CONFIG = {
-    "tp_pct": 0.08,
-    "sl_pct": 0.05,
-    "trailing_sl_pct": 0.02,
-    "trailing_tp_pct": 0.01,
-    "single_order_usdt": 100,
-    "timeframe": "15m",
-    "reserve_bottom": 50,
-    "symbols": "",                     # 逗号分隔的币种列表
-    "orderbook_filter": True,
-    "waterfall_breaker": True,
-    "max_daily_trades": 0,
-    "auto_trade_enabled": False,
-    "auto_min_score": 75
-    "max_per_coin_usdt": 0,
+    "tp_pct": 0.08, "sl_pct": 0.05, "trailing_sl_pct": 0.02,
+    "trailing_tp_pct": 0.01, "single_order_usdt": 100, "timeframe": "15m",
+    "reserve_bottom": 50, "symbols": "", "orderbook_filter": True,
+    "waterfall_breaker": True, "max_daily_trades": 0,
+    "auto_trade_enabled": False, "auto_min_score": 75,
+    "max_per_coin_usdt": 0
 }
 
 async def init_db():
-    """初始化数据库表"""
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                time TEXT,
-                symbol TEXT,
-                entry REAL,
-                exit REAL,
-                pnl_pct REAL
-            )
-        ''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT, symbol TEXT, entry REAL, exit REAL, pnl_pct REAL)''')
         await db.commit()
 
 async def load_config():
-    """加载配置，缺失键自动填充默认值"""
     config = dict(DEFAULT_CONFIG)
     try:
         async with aiosqlite.connect(DB_FILE) as db:
@@ -64,13 +41,11 @@ async def load_config():
                             config[key] = value
     except Exception as e:
         logger.error(f"加载配置失败: {e}")
-    # 将 symbols 字符串转为列表
     if isinstance(config.get("symbols"), str):
         config["symbols"] = [s.strip() for s in config["symbols"].split(",") if s.strip()]
     return config
 
 async def save_config(cfg: dict):
-    """保存配置到数据库"""
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             for key, value in cfg.items():
@@ -87,7 +62,6 @@ async def save_config(cfg: dict):
         logger.error(f"保存配置失败: {e}")
 
 async def load_trades(limit=50):
-    """加载最近的交易记录"""
     trades = []
     try:
         async with aiosqlite.connect(DB_FILE) as db:
@@ -97,18 +71,14 @@ async def load_trades(limit=50):
             ) as cursor:
                 async for row in cursor:
                     trades.append({
-                        "time": row[0],
-                        "symbol": row[1],
-                        "entry": row[2],
-                        "exit": row[3],
-                        "pnl_pct": row[4]
+                        "time": row[0], "symbol": row[1],
+                        "entry": row[2], "exit": row[3], "pnl_pct": row[4]
                     })
     except Exception as e:
         logger.error(f"加载交易记录失败: {e}")
-    return list(reversed(trades))   # 按时间正序
+    return list(reversed(trades))
 
 async def save_trade(trade: dict):
-    """保存一条交易记录"""
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(
