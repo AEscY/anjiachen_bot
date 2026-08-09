@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（修复持仓数据解析，返回完整标准化余额）
+exchange.py - 多交易所管理器（余额和持仓数据修复版）
 """
 import os
 import random
@@ -105,21 +105,16 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（返回完整标准化数据，持仓可用） ----------
+    # ---------- 余额（返回完整标准数据） ----------
     async def fetch_balance(self):
-        """
-        获取余额，返回 CCXT 标准格式的完整字典。
-        兼容 OKX 模拟盘的特殊数据结构。
-        """
+        """获取余额，兼容 OKX 模拟盘，返回完整持仓字典"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
 
         try:
             raw = await self.exchange.fetch_balance()
-
-            # 如果 raw 已经是标准格式，直接返回
+            # 如果 raw 本身就是标准格式，直接返回
             if isinstance(raw, dict) and 'USDT' in raw and isinstance(raw['USDT'], (dict, int, float)):
-                # 同时确保其他币种也是 dict 格式，如果不是则转换
                 result = {}
                 for key, val in raw.items():
                     if isinstance(val, dict):
@@ -128,7 +123,7 @@ class ExchangeManager:
                         result[key] = {'free': float(val), 'used': 0, 'total': float(val)}
                 return result
 
-            # 否则尝试从 info.data 中提取
+            # 尝试从 info.data 中提取
             info = raw.get('info') if isinstance(raw, dict) else None
             if isinstance(info, dict):
                 data_list = info.get('data')
@@ -139,11 +134,7 @@ class ExchangeManager:
                             ccy = item.get('ccy', '')
                             avail = float(item.get('availBal', 0))
                             frozen = float(item.get('frozenBal', 0))
-                            result[ccy] = {
-                                'free': avail,
-                                'used': frozen,
-                                'total': avail + frozen
-                            }
+                            result[ccy] = {'free': avail, 'used': frozen, 'total': avail + frozen}
                     if result:
                         return result
 
