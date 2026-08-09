@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（修复 OKX 模拟盘地址格式，余额永久可用）
+exchange.py - 多交易所管理器（恢复 CCXT 原生模拟盘设置，余额可用）
 """
 import os
 import random
@@ -45,11 +45,11 @@ class ExchangeManager:
                 config['password'] = password
             self.exchange = exchange_class(config)
 
+            # ---- 关键：只使用 CCXT 原生模拟盘设置，不手动改 URLs ----
             if settings.IS_SANDBOX:
                 if name == 'okx':
-                    # ---- 关键修复：按 CCXT 规范设置 REST API 地址 ----
-                    self.exchange.urls['api']['rest'] = 'https://demo.okx.com'
-                    logger.info("🧪 OKX 模拟盘模式已启用 (demo.okx.com)")
+                    self.exchange.set_sandbox_mode(True)
+                    logger.info("🧪 OKX 模拟盘模式已启用 (set_sandbox_mode)")
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
 
@@ -106,29 +106,29 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（现在 CCXT 的 fetch_balance 会正常工作） ----------
+    # ---------- 余额（标准解析，CCXT 原生地址后正常工作） ----------
     async def fetch_balance(self):
-        """获取余额，CCXT 的 fetch_balance 恢复正常后，用标准方式解析"""
+        """获取余额，使用标准解析方式"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
             raw = await self.exchange.fetch_balance()
             logger.info(f"余额原始数据: {raw}")
 
-            usdt = raw.get('USDT') if isinstance(raw, dict) else None
-            if isinstance(usdt, dict):
-                free = usdt.get('free', usdt.get('total', 0))
-                return {'USDT': {'free': float(free)}}
-            if isinstance(usdt, (int, float)):
-                return {'USDT': {'free': float(usdt)}}
-
+            # 标准 CCXT 格式：{'USDT': {'free': xxx, 'total': xxx}}
             if isinstance(raw, dict):
+                usdt = raw.get('USDT')
+                if isinstance(usdt, dict):
+                    free = usdt.get('free', usdt.get('total', 0))
+                    return {'USDT': {'free': float(free)}}
+                if isinstance(usdt, (int, float)):
+                    return {'USDT': {'free': float(usdt)}}
                 total = raw.get('total')
                 if isinstance(total, dict) and 'USDT' in total:
                     return {'USDT': {'free': float(total['USDT'])}}
-                free = raw.get('free')
-                if isinstance(free, dict) and 'USDT' in free:
-                    return {'USDT': {'free': float(free['USDT'])}}
+                free_field = raw.get('free')
+                if isinstance(free_field, dict) and 'USDT' in free_field:
+                    return {'USDT': {'free': float(free_field['USDT'])}}
 
         except Exception as e:
             logger.error(f"fetch_balance 失败: {e}", exc_info=True)
