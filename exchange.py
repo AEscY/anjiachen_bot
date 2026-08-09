@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（修复持仓数据解析）
+exchange.py - 多交易所管理器（修复持仓数据解析，返回完整标准化余额）
 """
 import os
 import random
@@ -105,7 +105,7 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（返回完整标准化数据） ----------
+    # ---------- 余额（返回完整标准化数据，持仓可用） ----------
     async def fetch_balance(self):
         """
         获取余额，返回 CCXT 标准格式的完整字典。
@@ -119,7 +119,14 @@ class ExchangeManager:
 
             # 如果 raw 已经是标准格式，直接返回
             if isinstance(raw, dict) and 'USDT' in raw and isinstance(raw['USDT'], (dict, int, float)):
-                return raw
+                # 同时确保其他币种也是 dict 格式，如果不是则转换
+                result = {}
+                for key, val in raw.items():
+                    if isinstance(val, dict):
+                        result[key] = val
+                    elif isinstance(val, (int, float)):
+                        result[key] = {'free': float(val), 'used': 0, 'total': float(val)}
+                return result
 
             # 否则尝试从 info.data 中提取
             info = raw.get('info') if isinstance(raw, dict) else None
