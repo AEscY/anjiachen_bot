@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化机器人 (长轮询 + 自动重连 + 全按钮响应)
+bot.py - 完全体量化机器人 (全真实数据引擎)
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -11,7 +11,6 @@ from storage import init_db, load_config, save_config, load_trades, save_trade
 
 CST = timezone(timedelta(hours=8))
 
-# ==================== 真实数据引擎 ====================
 class RealDataEngine:
     def __init__(self, exchange):
         self.exchange = exchange
@@ -64,7 +63,6 @@ class RealDataEngine:
                 'bias': bias, 'liq_target_below': liq if bias != "HEAVY_SHORT" else p*0.97,
                 'liq_target_above': liq if bias != "HEAVY_LONG" else p*1.03}
 
-# ==================== 盘口引擎 ====================
 class OrderbookEngine:
     async def validate(self, orderbook):
         bids = orderbook.get('bids', []); asks = orderbook.get('asks', [])
@@ -73,7 +71,6 @@ class OrderbookEngine:
         if spread > 0.2: return False, f"价差过大 ({spread:.3f}%)"
         return True, f"盘口健康 (价差: {spread:.3f}%)"
 
-# ==================== 信号评分引擎 ====================
 class SignalEngine:
     @staticmethod
     def score(tech, funding_rate, fear_greed):
@@ -105,11 +102,11 @@ class SignalEngine:
         elif score >= 20: return "📉📉 不建议买入"
         return "🚨 强烈回避"
 
-# ==================== 主机器人 ====================
 class QuantBot:
     def __init__(self, exchange):
         self.exchange = exchange
-        self.tech = TechnicalEngine()
+        # 技术引擎现在需要 exchange 参数
+        self.tech = TechnicalEngine(exchange)
         self.real_data = RealDataEngine(exchange)
         self.orderbook_engine = OrderbookEngine()
         self.signal_engine = SignalEngine()
@@ -169,7 +166,7 @@ class QuantBot:
             self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
             self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
 
-    # ============ 数据库 ============
+    # ========== 数据库 ==========
     async def load_and_init(self):
         await init_db()
         cfg = await load_config()
@@ -207,7 +204,7 @@ class QuantBot:
     def _parse_pct(self, val):
         return val / 100.0
 
-    # ============ 键盘 ============
+    # ========== 键盘 ==========
     def _build_main_keyboard(self):
         f_status = "已开启" if self.orderbook_filter else "已关闭"
         b_status = "已开启" if self.waterfall_breaker else "已关闭"
@@ -251,9 +248,8 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    # ==================== 新增：持币查询 ====================
+    # ========== 持币查询 ==========
     async def cmd_holdings(self, update, context):
-        """只显示当前持有的币种（数量 > 0）"""
         if not self._auth(update): return
         bal = await self.exchange.fetch_balance()
         lines = ["📋 **当前持币**\n"]
@@ -275,7 +271,7 @@ class QuantBot:
             lines.append("暂无持仓")
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # ==================== 命令实现 ====================
+    # ========== 命令实现 ==========
     async def cmd_autotrade(self, update, context):
         if not self._auth(update): return
         try:
@@ -371,8 +367,8 @@ class QuantBot:
         fg = (await self.real_data.get_fear_greed_index())["value"]
         for sym in self.symbols:
             ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
-            ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
-            tech = self.tech.calc(ohlcv, p)
+            # 异步获取技术指标
+            tech = await self.tech.calc(sym, self.timeframe, 50)
             funding = await self.exchange.fetch_funding_rate(sym)
             sc = self.signal_engine.score(tech, funding, fg)
             txt = self.signal_engine.interpret(sc)
@@ -480,13 +476,15 @@ class QuantBot:
                 await update.effective_message.reply_text("✅")
         except: pass
 
+    # ========== 诊断渲染（使用异步技术指标） ==========
     async def render_brain_status(self, msg_obj):
         try:
             macro = await self.real_data.check_macro_risk()
-            sym = self.symbols[0]; ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
+            sym = self.symbols[0]
+            ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
             liq = await self.real_data.get_liquidation_risk(sym)
             ob = await self.exchange.fetch_orderbook(sym); ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
-            ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50); tech = self.tech.calc(ohlcv, p)
+            tech = await self.tech.calc(sym, self.timeframe, 50)
             msg = f"🧠 {sym}\n宏观: {macro['status']}\n费率: {liq['funding_rate']*100:+.4f}%\n盘口: {ob_msg}\n布林: {tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}"
             await msg_obj.reply_text(msg)
         except Exception as e: logger.error(f"brain err: {e}")
@@ -496,14 +494,14 @@ class QuantBot:
             lines = ["📈 **差距分析**\n"]
             for sym in self.symbols:
                 ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
-                ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
-                tech = self.tech.calc(ohlcv, p)
-                target = min(tech['bb_lower'], p*0.99); gap = ((p-target)/p)*100
+                tech = await self.tech.calc(sym, self.timeframe, 50)
+                target = min(tech['bb_lower'], p*0.99)
+                gap = ((p-target)/p)*100
                 lines.append(f"{sym}: {p:.2f} → {target:.2f} ({gap:+.2f}%)")
             await msg_obj.reply_text("\n".join(lines))
         except Exception as e: logger.error(f"analysis err: {e}")
 
-    # ============ 自填模式 ============
+    # ========== 自填模式 ==========
     async def handle_text_input(self, update, context):
         pending = context.user_data.get('pending_setting')
         if not pending: return
@@ -538,7 +536,7 @@ class QuantBot:
         except ValueError:
             await update.message.reply_text("❌ 格式有误"); context.user_data['pending_setting'] = None
 
-    # ============ 按钮回调（所有按钮都有明确响应） ============
+    # ========== 按钮回调 ==========
     async def handle_button_click(self, update, context):
         query = update.callback_query; data = query.data
         try:
@@ -577,7 +575,10 @@ class QuantBot:
             elif data == "holdings": await self.cmd_holdings(update, context)
             elif data == "list_symbols": await self.cmd_symbols(update, context)
             elif data == "sync_pos":
-                await query.answer("🔄 已同步（占位功能）", show_alert=True)
+                # 真实同步持仓（刷新余额）
+                bal = await self.exchange.fetch_balance()
+                await query.message.reply_text(f"🔄 持仓已刷新\n💵 USDT: {bal.get('USDT',{}).get('free',0):.2f}")
+                await query.answer("已同步")
             elif data == "menu_preset":
                 opts = [("🛡️保守","conservative"),("⚖️平衡","balanced"),("⚡激进","aggressive")]
                 kb = [[InlineKeyboardButton(label, callback_data=f"preset:{val}") for label,val in opts]]
@@ -666,7 +667,6 @@ class QuantBot:
                     reply_markup=ForceReply(selective=True), parse_mode="Markdown")
                 await query.answer()
             else:
-                # 未知回调，记录日志并提示用户
                 logger.warning(f"未处理的按钮回调: {data}")
                 await query.answer("该功能暂未开放", show_alert=True)
         except Exception as e:
@@ -687,7 +687,7 @@ class QuantBot:
             if isinstance(amount, (int, float)) and amount > 0:
                 await self.exchange.create_market_sell_order(sym, amount)
 
-    # ==================== 后台任务 ====================
+    # ========== 后台任务（使用异步技术指标） ==========
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
         while True:
@@ -709,8 +709,7 @@ class QuantBot:
                     free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
                     if free > 0.0001: continue
                     ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
-                    ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 50)
-                    tech = self.tech.calc(ohlcv, p)
+                    tech = await self.tech.calc(sym, self.timeframe, 50)
                     funding = await self.exchange.fetch_funding_rate(sym)
                     sc = self.signal_engine.score(tech, funding, fg)
                     if sc < self.auto_min_score: continue
@@ -777,7 +776,7 @@ class QuantBot:
                 logger.error(f"追踪错误: {e}")
                 await asyncio.sleep(5)
 
-    # ==================== 启动 (长轮询 + 自动重连) ====================
+    # ========== 启动 ==========
     async def run(self):
         await self.load_and_init()
         if not self.tg_app:
@@ -785,19 +784,16 @@ class QuantBot:
             return
         await self.tg_app.bot.delete_webhook(drop_pending_updates=True)
 
-        # 启动后台任务（只需启动一次）
         asyncio.create_task(self._auto_trade_monitor())
         asyncio.create_task(self._trailing_monitor())
 
-        # 自动重连循环
         while True:
             try:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ Bot 长轮询模式启动")
+                logger.info("✅ Bot 长轮询模式启动 (全真实数据)")
 
-                # 发送启动通知
                 if settings.TG_CHAT_ID and self.tg_app.bot:
                     try:
                         await self.tg_app.bot.send_message(
@@ -805,7 +801,7 @@ class QuantBot:
                             text=(
                                 f"🤖 **量化机器人已上线**\n"
                                 f"━━━━━━━━━━━━━━\n"
-                                f"📌 版本: 完全体 v2.1\n"
+                                f"📌 版本: 完全体 v3.0 (全真实数据)\n"
                                 f"🔧 模式: 长轮询 (自动重连)\n"
                                 f"{self.env_tag}\n"
                                 f"🤖 自动交易: {'🟢 开启' if self.auto_trade_enabled else '🔴 关闭'}\n"
@@ -819,10 +815,8 @@ class QuantBot:
                         )
                     except: pass
 
-                # 保持运行直到断开
                 while True:
                     await asyncio.sleep(30)
-
             except Exception as e:
-                logger.error(f"Bot 连接断开，5 秒后自动重连: {e}")
+                logger.error(f"Bot 连接断开，5秒后重连: {e}")
                 await asyncio.sleep(5)
