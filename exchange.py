@@ -1,10 +1,9 @@
 """
-exchange.py - 多交易所管理器（绕过 CCXT 余额，直接请求 OKX 模拟盘）
+exchange.py - 多交易所管理器（修复模拟盘地址 + 安全余额提取）
 """
 import os
 import random
 import asyncio
-import aiohttp
 import ccxt.async_support as ccxt
 from config import settings, logger
 
@@ -48,8 +47,9 @@ class ExchangeManager:
 
             if settings.IS_SANDBOX:
                 if name == 'okx':
-                    self.exchange.urls['api'] = 'https://aws.okx.com'
-                    logger.info("🧪 OKX 模拟盘模式已启用")
+                    # ----- 修正：OKX 模拟盘的正确地址 -----
+                    self.exchange.urls['api'] = 'https://demo.okx.com'
+                    logger.info("🧪 OKX 模拟盘模式已启用 (demo.okx.com)")
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
 
@@ -57,7 +57,7 @@ class ExchangeManager:
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
 
-    # ---------- 行情（使用 CCXT，工作正常） ----------
+    # ---------- 行情 ----------
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try:
@@ -106,66 +106,56 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（完全绕过 CCXT，直接请求 OKX 模拟盘） ----------
+    # ---------- 余额（安全提取版） ----------
     async def fetch_balance(self):
-        """
-        获取 USDT 余额：不依赖 CCXT 的 fetch_balance，
-        直接使用 aiohttp 请求 OKX 模拟盘的 /api/v5/account/balance 接口。
-        """
+        """获取余额，使用最安全的方式从 CCXT 原始数据中提取 USDT"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
 
         try:
-            # 准备 OKX 签名所需的参数
-            timestamp = str(int(asyncio.get_event_loop().time() * 1000))
-            method = 'GET'
-            request_path = '/api/v5/account/balance'
-            body = ''
+            raw = await self.exchange.fetch_balance()
+            logger.info(f"CCXT 余额原始数据: {raw}")
 
-            # 签名字符串
-            sign_str = timestamp + method + request_path + body
-            import hmac
-            import hashlib
-            import base64
+            # 只处理 raw 是字典的情况
+            if isinstance(raw, dict):
+                # 方法1：直接取 USDT 键
+                usdt = raw.get('USDT')
+                if isinstance(usdt, dict):
+                    free = usdt.get('free', usdt.get('total', 0))
+                    return {'USDT': {'free': float(free)}}
+                if isinstance(usdt, (int, float)):
+                    return {'USDT': {'free': float(usdt)}}
 
-            signature = base64.b64encode(
-                hmac.new(
-                    settings.OKX_SECRET_KEY.encode('utf-8'),
-                    sign_str.encode('utf-8'),
-                    hashlib.sha256
-                ).digest()
-            ).decode('utf-8')
+                # 方法2：遍历所有顶层值，只在值是字典时深入查找
+                for key, val in raw.items():
+                    if not isinstance(val, dict):
+                        continue
+                    # 在子字典中查找 USDT
+                    if 'USDT' in val and isinstance(val['USDT'], (int, float)):
+                        return {'USDT': {'free': float(val['USDT'])}}
+                    # 查找 free 和 total
+                    for field in ('free', 'total'):
+                        sub = val.get(field)
+                        if isinstance(sub, dict) and 'USDT' in sub and isinstance(sub['USDT'], (int, float)):
+                            return {'USDT': {'free': float(sub['USDT'])}}
 
-            headers = {
-                'OK-ACCESS-KEY': settings.OKX_API_KEY,
-                'OK-ACCESS-SIGN': signature,
-                'OK-ACCESS-TIMESTAMP': timestamp,
-                'OK-ACCESS-PASSPHRASE': settings.OKX_PASSPHRASE,
-                'Content-Type': 'application/json',
-            }
+                # 方法3：查找 info 字段
+                info = raw.get('info')
+                if isinstance(info, dict):
+                    data_list = info.get('data')
+                    if isinstance(data_list, list):
+                        for item in data_list:
+                            if isinstance(item, dict) and item.get('ccy') == 'USDT':
+                                avail = item.get('availBal', item.get('cashBal', 0))
+                                return {'USDT': {'free': float(avail)}}
 
-            url = 'https://aws.okx.com' + request_path
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json()
-                    logger.info(f"OKX 余额接口返回: {str(data)[:2000]}")
-
-                    if isinstance(data, dict) and 'data' in data:
-                        items = data['data']
-                        if isinstance(items, list):
-                            for item in items:
-                                if isinstance(item, dict) and item.get('ccy') == 'USDT':
-                                    avail = item.get('availBal', item.get('cashBal', 0))
-                                    return {'USDT': {'free': float(avail)}}
-
+            logger.error("无法从 CCXT 余额数据中提取 USDT")
         except Exception as e:
-            logger.error(f"直接请求 OKX 余额接口失败: {e}", exc_info=True)
+            logger.error(f"fetch_balance 失败: {e}", exc_info=True)
 
-        logger.error("所有余额获取方法均失败")
         return {'USDT': {'free': 0}}
 
-    # ---------- 交易（使用 CCXT，工作正常） ----------
+    # ---------- 交易 ----------
     async def create_market_buy_order(self, symbol, amount):
         if self.exchange:
             try:
