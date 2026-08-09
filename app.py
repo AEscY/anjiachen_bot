@@ -6,11 +6,13 @@ import traceback
 from exchange import ExchangeManager
 from bot import QuantBot
 
+
 async def health_check(reader, writer):
     """极简 HTTP 响应，用于 Render 健康检查"""
     writer.write(b"HTTP/1.1 200 OK\r\n\r\nOK")
     await writer.drain()
     writer.close()
+
 
 async def main():
     # 启动健康检查 HTTP 服务（Render 需要）
@@ -27,6 +29,7 @@ async def main():
         bot.run(),
         health_server.serve_forever()
     )
+
 
 if __name__ == "__main__":
     try:
