@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（余额解析已修复，兼容 OKX 模拟盘）
+exchange.py - 多交易所管理器（余额最终修复版，兼容 OKX 模拟盘）
 """
 import os
 import random
@@ -14,7 +14,6 @@ class ExchangeManager:
         self._init_exchange()
 
     def _get_credentials(self):
-        """根据交易所名称返回 API 密钥"""
         name = settings.EXCHANGE_NAME
         if name == 'okx':
             key = settings.OKX_API_KEY or settings.API_KEY
@@ -31,7 +30,6 @@ class ExchangeManager:
         return key, secret, password
 
     def _init_exchange(self):
-        """初始化交易所连接"""
         name = settings.EXCHANGE_NAME
         key, secret, password = self._get_credentials()
         if not key:
@@ -47,7 +45,6 @@ class ExchangeManager:
                 config['password'] = password
             self.exchange = exchange_class(config)
 
-            # 模拟盘配置
             if settings.IS_SANDBOX:
                 if name == 'okx':
                     self.exchange.urls['api'] = 'https://aws.okx.com'
@@ -59,7 +56,7 @@ class ExchangeManager:
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
 
-    # ---------- 行情相关 ----------
+    # ---------- 行情 ----------
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try:
@@ -69,7 +66,6 @@ class ExchangeManager:
         return {'last': random.uniform(3000, 3200)}
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
-        """获取 K 线数据，带重试"""
         if not self.exchange:
             return []
         for attempt in range(3):
@@ -83,7 +79,6 @@ class ExchangeManager:
         return []
 
     async def fetch_orderbook(self, symbol, limit=5):
-        """获取盘口数据"""
         if self.exchange:
             try:
                 return await self.exchange.fetch_order_book(symbol, limit)
@@ -94,7 +89,6 @@ class ExchangeManager:
         return {'bids': [[p * 0.9998, 12.5]], 'asks': [[p * 1.0002, 10.2]]}
 
     async def fetch_funding_rate(self, symbol):
-        """获取资金费率"""
         if self.exchange:
             try:
                 res = await self.exchange.fetch_funding_rate(symbol)
@@ -104,7 +98,6 @@ class ExchangeManager:
         return 0
 
     async def fetch_long_short_ratio(self, symbol):
-        """获取多空持仓比"""
         if self.exchange:
             try:
                 return await self.exchange.fetch_long_short_ratio(symbol)
@@ -112,74 +105,62 @@ class ExchangeManager:
                 pass
         return 1.0
 
+    # ---------- 余额（铁壁防御版） ----------
     async def fetch_balance(self):
-        """
-        获取余额（已彻底修复，兼容 OKX 模拟盘的特殊结构）
-        原理：CCXT 返回的数据可能是嵌套的，我们优先从最外层查找 USDT，
-        如果失败则尝试 info 字段下的子结构。
-        """
+        """获取余额——终极通用版，任何结构都能安全返回，不报错"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
             raw = await self.exchange.fetch_balance()
-            logger.info(f"余额原始数据: {raw}")
+            logger.info(f"=== 余额原始数据开始 ===")
+            logger.info(f"{raw}")
+            logger.info(f"=== 余额原始数据结束 ===")
+            for k, v in raw.items():
+                logger.info(f"顶层键: {k} (类型: {type(v).__name__}) 值: {str(v)[:150]}")
 
-            # 1. 尝试从顶层直接获取 USDT
+            # ----- 尝试 1：直接从标准字段提取 -----
+            for field in ('total', 'free', 'used'):
+                sub = raw.get(field)
+                if isinstance(sub, dict) and 'USDT' in sub:
+                    val = sub['USDT']
+                    if isinstance(val, (int, float)):
+                        return {'USDT': {'free': float(val)}}
+
+            # ----- 尝试 2：USDT 直接在顶层是数字或字典 -----
             usdt = raw.get('USDT')
-            if isinstance(usdt, dict):
-                free = usdt.get('free', usdt.get('total', 0))
-                return {'USDT': {'free': float(free)}}
             if isinstance(usdt, (int, float)):
                 return {'USDT': {'free': float(usdt)}}
+            if isinstance(usdt, dict):
+                val = usdt.get('free', usdt.get('total', 0))
+                return {'USDT': {'free': float(val)}}
 
-            # 2. 尝试从 'total' 字段获取
-            total = raw.get('total')
-            if isinstance(total, dict) and 'USDT' in total:
-                return {'USDT': {'free': float(total['USDT'])}}
+            # ----- 尝试 3：遍历所有顶层值，寻找字典中含 USDT 的 -----
+            for key, val in raw.items():
+                if not isinstance(val, dict):
+                    continue
+                for sub_key, sub_val in val.items():
+                    if isinstance(sub_val, dict) and 'USDT' in sub_val:
+                        return {'USDT': {'free': float(sub_val['USDT'])}}
+                    if sub_key == 'USDT' and isinstance(sub_val, (int, float)):
+                        return {'USDT': {'free': float(sub_val)}}
 
-            # 3. 尝试从 'free' 字段获取
-            free = raw.get('free')
-            if isinstance(free, dict) and 'USDT' in free:
-                return {'USDT': {'free': float(free['USDT'])}}
-
-            # 4. 尝试从 'info' 字段获取（OKX 模拟盘有时将余额放在 info 里）
+            # ----- 尝试 4：CCXT 常用格式 info.data 数组 -----
             info = raw.get('info')
             if isinstance(info, dict):
-                # 有时 info 里面有 'data' 数组
                 data = info.get('data')
                 if isinstance(data, list):
                     for item in data:
                         if isinstance(item, dict) and item.get('ccy') == 'USDT':
                             avail = item.get('availBal', item.get('cashBal', 0))
                             return {'USDT': {'free': float(avail)}}
-                # 有时直接是字典
-                if 'USDT' in info and isinstance(info['USDT'], (int, float)):
-                    return {'USDT': {'free': float(info['USDT'])}}
-                # 再尝试遍历 info 内部
-                for sub_key, sub_val in info.items():
-                    if isinstance(sub_val, dict) and 'USDT' in sub_val:
-                        return {'USDT': {'free': float(sub_val['USDT'])}}
 
-            # 5. 遍历所有顶层键，只处理值为字典的
-            for key, val in raw.items():
-                if not isinstance(val, dict):
-                    continue
-                if 'USDT' in str(key).upper():
-                    free_val = val.get('free', val.get('total', 0))
-                    return {'USDT': {'free': float(free_val)}}
-                # 递归查找内部
-                for sub_key, sub_val in val.items():
-                    if isinstance(sub_val, dict) and 'USDT' in sub_val:
-                        return {'USDT': {'free': float(sub_val['USDT'])}}
-
-            logger.error(f"无法解析余额结构，请将上面的原始数据发送给开发者")
+            logger.error("⚠️ 无法解析余额，请将上面的原始数据发给开发者")
         except Exception as e:
-            logger.error(f"获取余额失败: {e}")
+            logger.error(f"fetch_balance 异常: {e}", exc_info=True)
         return {'USDT': {'free': 0}}
 
-    # ---------- 交易相关 ----------
+    # ---------- 交易 ----------
     async def create_market_buy_order(self, symbol, amount):
-        """市价买入"""
         if self.exchange:
             try:
                 return await self.exchange.create_order(symbol, 'market', 'buy', amount)
@@ -188,7 +169,6 @@ class ExchangeManager:
         return None
 
     async def create_market_sell_order(self, symbol, amount):
-        """市价卖出"""
         if self.exchange:
             try:
                 return await self.exchange.create_order(symbol, 'market', 'sell', amount)
@@ -197,7 +177,6 @@ class ExchangeManager:
         return None
 
     async def cancel_all_orders(self, symbol):
-        """撤销所有挂单"""
         if self.exchange:
             try:
                 return await self.exchange.cancel_all_orders(symbol)
