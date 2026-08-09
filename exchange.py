@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（修复模拟盘地址 + 安全余额提取）
+exchange.py - 多交易所管理器（修复 OKX 模拟盘地址格式，余额永久可用）
 """
 import os
 import random
@@ -47,8 +47,8 @@ class ExchangeManager:
 
             if settings.IS_SANDBOX:
                 if name == 'okx':
-                    # ----- 修正：OKX 模拟盘的正确地址 -----
-                    self.exchange.urls['api'] = 'https://demo.okx.com'
+                    # ---- 关键修复：按 CCXT 规范设置 REST API 地址 ----
+                    self.exchange.urls['api']['rest'] = 'https://demo.okx.com'
                     logger.info("🧪 OKX 模拟盘模式已启用 (demo.okx.com)")
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
@@ -106,50 +106,30 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（安全提取版） ----------
+    # ---------- 余额（现在 CCXT 的 fetch_balance 会正常工作） ----------
     async def fetch_balance(self):
-        """获取余额，使用最安全的方式从 CCXT 原始数据中提取 USDT"""
+        """获取余额，CCXT 的 fetch_balance 恢复正常后，用标准方式解析"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
-
         try:
             raw = await self.exchange.fetch_balance()
-            logger.info(f"CCXT 余额原始数据: {raw}")
+            logger.info(f"余额原始数据: {raw}")
 
-            # 只处理 raw 是字典的情况
+            usdt = raw.get('USDT') if isinstance(raw, dict) else None
+            if isinstance(usdt, dict):
+                free = usdt.get('free', usdt.get('total', 0))
+                return {'USDT': {'free': float(free)}}
+            if isinstance(usdt, (int, float)):
+                return {'USDT': {'free': float(usdt)}}
+
             if isinstance(raw, dict):
-                # 方法1：直接取 USDT 键
-                usdt = raw.get('USDT')
-                if isinstance(usdt, dict):
-                    free = usdt.get('free', usdt.get('total', 0))
-                    return {'USDT': {'free': float(free)}}
-                if isinstance(usdt, (int, float)):
-                    return {'USDT': {'free': float(usdt)}}
+                total = raw.get('total')
+                if isinstance(total, dict) and 'USDT' in total:
+                    return {'USDT': {'free': float(total['USDT'])}}
+                free = raw.get('free')
+                if isinstance(free, dict) and 'USDT' in free:
+                    return {'USDT': {'free': float(free['USDT'])}}
 
-                # 方法2：遍历所有顶层值，只在值是字典时深入查找
-                for key, val in raw.items():
-                    if not isinstance(val, dict):
-                        continue
-                    # 在子字典中查找 USDT
-                    if 'USDT' in val and isinstance(val['USDT'], (int, float)):
-                        return {'USDT': {'free': float(val['USDT'])}}
-                    # 查找 free 和 total
-                    for field in ('free', 'total'):
-                        sub = val.get(field)
-                        if isinstance(sub, dict) and 'USDT' in sub and isinstance(sub['USDT'], (int, float)):
-                            return {'USDT': {'free': float(sub['USDT'])}}
-
-                # 方法3：查找 info 字段
-                info = raw.get('info')
-                if isinstance(info, dict):
-                    data_list = info.get('data')
-                    if isinstance(data_list, list):
-                        for item in data_list:
-                            if isinstance(item, dict) and item.get('ccy') == 'USDT':
-                                avail = item.get('availBal', item.get('cashBal', 0))
-                                return {'USDT': {'free': float(avail)}}
-
-            logger.error("无法从 CCXT 余额数据中提取 USDT")
         except Exception as e:
             logger.error(f"fetch_balance 失败: {e}", exc_info=True)
 
