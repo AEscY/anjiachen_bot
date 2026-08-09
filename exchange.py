@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（增加K线重试和日志）
+exchange.py - 多交易所管理器（修复 OKX 模拟盘 K 线）
 """
 import os, random, asyncio
 import ccxt.async_support as ccxt
@@ -41,14 +41,17 @@ class ExchangeManager:
             if name in ('okx', 'bybit'):
                 config['password'] = password
             self.exchange = exchange_class(config)
+            
+            # --- 模拟盘配置修复 ---
             if settings.IS_SANDBOX:
                 if name == 'okx':
-                    # 强制切换到 OKX 模拟盘专用域名
+                    # 关键：使用 OKX 模拟盘专用 API 地址
                     self.exchange.urls['api'] = 'https://aws.okx.com'
-                    # 或者使用 demo 子域名
-                    # self.exchange.urls['api'] = 'https://demo.okx.com'
+                    logger.info("🧪 OKX 模拟盘模式已启用")
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
+            # --------------------
+            
             logger.info(f"✅ 交易所连接成功: {name}")
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
@@ -60,25 +63,18 @@ class ExchangeManager:
         return {'last': random.uniform(3000, 3200)}
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
-        """获取K线，失败时重试，并在日志中详细记录"""
+        """获取K线，失败时重试"""
         if not self.exchange:
             logger.warning("交易所未连接，无法获取K线")
             return []
-
         for attempt in range(3):
             try:
-                logger.info(f"📊 获取K线 {symbol} {timeframe} (第{attempt+1}次)")
                 data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
                 if data and len(data) > 0:
-                    logger.info(f"✅ K线获取成功 {symbol}: {len(data)}条, 最新时间 {data[-1][0]}")
                     return data
-                else:
-                    logger.warning(f"⚠️ K线为空 {symbol}")
             except Exception as e:
-                logger.warning(f"K线获取失败 {symbol} (第{attempt+1}次): {e}")
+                logger.warning(f"K线获取失败 (第{attempt+1}次): {e}")
             await asyncio.sleep(2)
-
-        logger.error(f"❌ K线获取彻底失败 {symbol}")
         return []
 
     async def fetch_orderbook(self, symbol, limit=5):
