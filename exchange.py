@@ -43,7 +43,10 @@ class ExchangeManager:
             self.exchange = exchange_class(config)
             if settings.IS_SANDBOX:
                 if name == 'okx':
-                    self.exchange.set_sandbox_mode(True)
+                    # 强制切换到 OKX 模拟盘专用域名
+                    self.exchange.urls['api'] = 'https://aws.okx.com'
+                    # 或者使用 demo 子域名
+                    # self.exchange.urls['api'] = 'https://demo.okx.com'
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
             logger.info(f"✅ 交易所连接成功: {name}")
