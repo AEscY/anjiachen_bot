@@ -1,9 +1,10 @@
 """
-exchange.py - 多交易所管理器（余额调试版，安全打印原始数据）
+exchange.py - 多交易所管理器（绕过 CCXT 余额，直接请求 OKX 模拟盘）
 """
 import os
 import random
 import asyncio
+import aiohttp
 import ccxt.async_support as ccxt
 from config import settings, logger
 
@@ -56,7 +57,7 @@ class ExchangeManager:
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
 
-    # ---------- 行情 ----------
+    # ---------- 行情（使用 CCXT，工作正常） ----------
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try:
@@ -105,64 +106,66 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（安全打印原始数据版） ----------
+    # ---------- 余额（完全绕过 CCXT，直接请求 OKX 模拟盘） ----------
     async def fetch_balance(self):
-        """获取余额，安全打印 CCXT 原始返回数据"""
+        """
+        获取 USDT 余额：不依赖 CCXT 的 fetch_balance，
+        直接使用 aiohttp 请求 OKX 模拟盘的 /api/v5/account/balance 接口。
+        """
         if not self.exchange:
             return {'USDT': {'free': 0}}
 
         try:
-            # 尝试 CCXT 标准方法
-            raw = await self.exchange.fetch_balance()
-            logger.info(f"CCXT fetch_balance 原始数据: {str(raw)[:2000]}")
+            # 准备 OKX 签名所需的参数
+            timestamp = str(int(asyncio.get_event_loop().time() * 1000))
+            method = 'GET'
+            request_path = '/api/v5/account/balance'
+            body = ''
 
-            # 打印顶层键和类型
-            if isinstance(raw, dict):
-                for k in list(raw.keys())[:10]:
-                    v = raw.get(k)
-                    if v is not None:
-                        logger.info(f"  键: {k}, 类型: {type(v).__name__}")
+            # 签名字符串
+            sign_str = timestamp + method + request_path + body
+            import hmac
+            import hashlib
+            import base64
 
-            # 尝试解析标准格式
-            if isinstance(raw, dict):
-                # 直接取 USDT
-                usdt = raw.get('USDT')
-                if isinstance(usdt, dict):
-                    free = usdt.get('free', usdt.get('total', 0))
-                    return {'USDT': {'free': float(free)}}
-                if isinstance(usdt, (int, float)):
-                    return {'USDT': {'free': float(usdt)}}
-                # 取 total
-                total = raw.get('total')
-                if isinstance(total, dict) and 'USDT' in total:
-                    return {'USDT': {'free': float(total['USDT'])}}
-                # 取 free
-                free = raw.get('free')
-                if isinstance(free, dict) and 'USDT' in free:
-                    return {'USDT': {'free': float(free['USDT'])}}
+            signature = base64.b64encode(
+                hmac.new(
+                    settings.OKX_SECRET_KEY.encode('utf-8'),
+                    sign_str.encode('utf-8'),
+                    hashlib.sha256
+                ).digest()
+            ).decode('utf-8')
+
+            headers = {
+                'OK-ACCESS-KEY': settings.OKX_API_KEY,
+                'OK-ACCESS-SIGN': signature,
+                'OK-ACCESS-TIMESTAMP': timestamp,
+                'OK-ACCESS-PASSPHRASE': settings.OKX_PASSPHRASE,
+                'Content-Type': 'application/json',
+            }
+
+            url = 'https://aws.okx.com' + request_path
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+                    logger.info(f"OKX 余额接口返回: {str(data)[:2000]}")
+
+                    if isinstance(data, dict) and 'data' in data:
+                        items = data['data']
+                        if isinstance(items, list):
+                            for item in items:
+                                if isinstance(item, dict) and item.get('ccy') == 'USDT':
+                                    avail = item.get('availBal', item.get('cashBal', 0))
+                                    return {'USDT': {'free': float(avail)}}
 
         except Exception as e:
-            logger.error(f"CCXT fetch_balance 失败: {e}")
+            logger.error(f"直接请求 OKX 余额接口失败: {e}", exc_info=True)
 
-        try:
-            # 直接请求 OKX 私有接口
-            logger.info("尝试直接请求 OKX 私有接口...")
-            response = await self.exchange.privateGetAccountBalance()
-            logger.info(f"OKX 私有接口返回: {str(response)[:2000]}")
-            if isinstance(response, dict) and 'data' in response:
-                data = response['data']
-                if isinstance(data, list) and len(data) > 0:
-                    for item in data:
-                        if isinstance(item, dict) and item.get('ccy') == 'USDT':
-                            avail = item.get('availBal', item.get('cashBal', 0))
-                            return {'USDT': {'free': float(avail)}}
-        except Exception as e:
-            logger.error(f"OKX 私有接口失败: {e}")
-
-        logger.error("所有余额获取方法均失败，请将上面的日志发给开发者")
+        logger.error("所有余额获取方法均失败")
         return {'USDT': {'free': 0}}
 
-    # ---------- 交易 ----------
+    # ---------- 交易（使用 CCXT，工作正常） ----------
     async def create_market_buy_order(self, symbol, amount):
         if self.exchange:
             try:
