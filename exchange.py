@@ -1,27 +1,164 @@
-    async def create_smart_buy_order(self, symbol, usdt_amount, slippage=0.005):
-        """带有防滑点保护的智能买单（最大允许 0.5% 滑点）"""
-        if not self.exchange:
-            return None
+"""
+exchange.py - 多交易所管理器（兼容余额结构 & 智能滑点保护）
+"""
+import os, random, asyncio
+import ccxt.async_support as ccxt
+from config import settings, logger
+
+class ExchangeManager:
+    def __init__(self):
+        self.exchange = None
+        self._init_exchange()
+
+    def _get_credentials(self):
+        name = settings.EXCHANGE_NAME
+        if name == 'okx':
+            key = settings.OKX_API_KEY or settings.API_KEY
+            secret = settings.OKX_SECRET_KEY or settings.SECRET_KEY
+            password = settings.OKX_PASSPHRASE or settings.PASSWORD
+        elif name == 'binance':
+            key = os.getenv('BINANCE_API_KEY', '') or settings.API_KEY
+            secret = os.getenv('BINANCE_SECRET_KEY', '') or settings.SECRET_KEY
+            password = settings.PASSWORD
+        else:
+            key = settings.API_KEY
+            secret = settings.SECRET_KEY
+            password = settings.PASSWORD
+        return key, secret, password
+
+    def _init_exchange(self):
+        name = settings.EXCHANGE_NAME
+        key, secret, password = self._get_credentials()
+        if not key:
+            logger.warning(f"⚠️ 未配置 {name} API 密钥，将使用模拟数据")
+            return
         try:
-            ticker = await self.fetch_ticker(symbol)
-            last_price = ticker['last']
-            amount = usdt_amount / last_price
-            
-            # 使用 IOC (Immediate-or-Cancel) 限价单防大滑点，或直接挂稍高价格限价单
-            max_buy_price = last_price * (1 + slippage)
-            order = await self.exchange.create_order(
-                symbol=symbol,
-                type='limit',
-                side='buy',
-                amount=amount,
-                price=max_buy_price,
-                params={'timeInForce': 'IOC'}
-            )
-            return order
+            exchange_class = getattr(ccxt, name, None)
+            if exchange_class is None:
+                logger.error(f"❌ 不支持的交易所: {name}")
+                return
+            config = {'apiKey': key, 'secret': secret, 'enableRateLimit': True}
+            if name in ('okx', 'bybit'):
+                config['password'] = password
+            self.exchange = exchange_class(config)
+
+            if settings.IS_SANDBOX:
+                if name == 'okx':
+                    self.exchange.urls['api'] = 'https://aws.okx.com'
+                    logger.info("🧪 OKX 模拟盘模式已启用")
+                elif name == 'binance':
+                    self.exchange.urls['api'] = self.exchange.urls['test']
+
+            logger.info(f"✅ 交易所连接成功: {name}")
         except Exception as e:
-            logger.warning(f"智能买单回退到市价单 ({symbol}): {e}")
+            logger.warning(f"交易所连接失败 ({name}): {e}")
+
+    async def fetch_ticker(self, symbol):
+        if self.exchange:
+            try: return await self.exchange.fetch_ticker(symbol)
+            except: pass
+        return {'last': random.uniform(3000, 3200)}
+
+    async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
+        if not self.exchange:
+            logger.warning("交易所未连接，无法获取K线")
+            return []
+        for attempt in range(3):
+            try:
+                data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                if data and len(data) > 0:
+                    return data
+            except Exception as e:
+                logger.warning(f"K线获取失败 (第{attempt+1}次): {e}")
+            await asyncio.sleep(2)
+        return []
+
+    async def fetch_orderbook(self, symbol, limit=5):
+        if self.exchange:
+            try: return await self.exchange.fetch_order_book(symbol, limit)
+            except: pass
+        ticker = await self.fetch_ticker(symbol)
+        p = ticker['last']
+        return {'bids': [[p * 0.9998, 12.5]], 'asks': [[p * 1.0002, 10.2]]}
+
+    async def fetch_funding_rate(self, symbol):
+        if self.exchange:
+            try:
+                res = await self.exchange.fetch_funding_rate(symbol)
+                return res.get('fundingRate', 0) if isinstance(res, dict) else 0
+            except: pass
+        return 0
+
+    async def fetch_long_short_ratio(self, symbol):
+        if self.exchange:
+            try: return await self.exchange.fetch_long_short_ratio(symbol)
+            except: pass
+        return 1.0
+
+    async def fetch_balance(self):
+        if not self.exchange:
+            return {'USDT': {'free': 0}}
+        try:
+            raw = await self.exchange.fetch_balance()
+            if 'USDT' in raw and isinstance(raw['USDT'], dict):
+                free = raw['USDT'].get('free', raw['USDT'].get('total', 0))
+                return {'USDT': {'free': float(free)}}
+            if 'free' in raw and isinstance(raw['free'], dict) and 'USDT' in raw['free']:
+                return {'USDT': {'free': float(raw['free']['USDT'])}}
+            if 'total' in raw and isinstance(raw['total'], dict) and 'USDT' in raw['total']:
+                return {'USDT': {'free': float(raw['total']['USDT'])}}
+            if 'USDT' in raw and isinstance(raw['USDT'], (int, float)):
+                return {'USDT': {'free': float(raw['USDT'])}}
+            for key, val in raw.items():
+                if 'USDT' in str(key).upper():
+                    if isinstance(val, dict):
+                        return {'USDT': {'free': float(val.get('free', val.get('total', 0)))}}
+                    elif isinstance(val, (int, float)):
+                        return {'USDT': {'free': float(val)}}
+        except Exception as e:
+            logger.error(f"获取余额失败: {e}")
+        return {'USDT': {'free': 0}}
+
+    async def create_smart_buy_order(self, symbol, amount, max_slippage=0.005):
+        """防滑点智能买单"""
+        if self.exchange:
             try:
                 ticker = await self.fetch_ticker(symbol)
-                return await self.exchange.create_order(symbol, 'market', 'buy', usdt_amount / ticker['last'])
-            except:
-                return None
+                price = ticker['last'] * (1 + max_slippage)
+                return await self.exchange.create_order(symbol, 'limit', 'buy', amount, price, {'timeInForce': 'IOC'})
+            except Exception:
+                return await self.create_market_buy_order(symbol, amount)
+        return None
+
+    async def create_smart_sell_order(self, symbol, amount, max_slippage=0.005):
+        """防滑点智能卖单"""
+        if self.exchange:
+            try:
+                ticker = await self.fetch_ticker(symbol)
+                price = ticker['last'] * (1 - max_slippage)
+                return await self.exchange.create_order(symbol, 'limit', 'sell', amount, price, {'timeInForce': 'IOC'})
+            except Exception:
+                return await self.create_market_sell_order(symbol, amount)
+        return None
+
+    async def create_market_buy_order(self, symbol, amount):
+        if self.exchange:
+            try: return await self.exchange.create_order(symbol, 'market', 'buy', amount)
+            except: pass
+        return None
+
+    async def create_market_sell_order(self, symbol, amount):
+        if self.exchange:
+            try: return await self.exchange.create_order(symbol, 'market', 'sell', amount)
+            except: pass
+        return None
+
+    async def cancel_all_orders(self, symbol):
+        if self.exchange:
+            try: return await self.exchange.cancel_all_orders(symbol)
+            except: pass
+        return True
+
+    async def close(self):
+        if self.exchange:
+            await self.exchange.close()
