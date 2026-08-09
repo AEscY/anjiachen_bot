@@ -96,30 +96,43 @@ class ExchangeManager:
         return 1.0
 
     async def fetch_balance(self):
-        """兼容多种余额返回结构"""
-        if self.exchange:
-            try:
-                raw = await self.exchange.fetch_balance()
-                logger.info(f"余额原始数据: {raw}")
-                if 'USDT' in raw:
-                    if isinstance(raw['USDT'], dict):
-                        return {'USDT': {'free': float(raw['USDT'].get('free', 0))}}
-                    elif isinstance(raw['USDT'], (int, float)):
-                        return {'USDT': {'free': float(raw['USDT'])}}
-                if 'total' in raw and 'USDT' in raw['total']:
-                    return {'USDT': {'free': float(raw['total']['USDT'])}}
-                if 'free' in raw and 'USDT' in raw['free']:
-                    return {'USDT': {'free': float(raw['free']['USDT'])}}
-                for key in raw:
-                    if 'USDT' in str(key).upper():
-                        val = raw[key]
-                        if isinstance(val, dict) and 'free' in val:
-                            return {'USDT': {'free': float(val['free'])}}
-                        elif isinstance(val, (int, float)):
-                            return {'USDT': {'free': float(val)}}
-                logger.warning(f"无法解析余额: {raw}")
-            except Exception as e:
-                logger.error(f"获取余额失败: {e}")
+        """获取余额，兼容多种数据结构，修复字符串索引错误"""
+        if not self.exchange:
+            return {'USDT': {'free': 0}}
+        try:
+            raw = await self.exchange.fetch_balance()
+            logger.info(f"余额原始数据: {raw}")
+
+            # 1. 标准 CCXT 格式：{'USDT': {'free': xxx, 'used': xxx, 'total': xxx}}
+            if 'USDT' in raw and isinstance(raw['USDT'], dict):
+                usdt_data = raw['USDT']
+                free = usdt_data.get('free', usdt_data.get('total', 0))
+                return {'USDT': {'free': float(free)}}
+
+            # 2. 自由格式：{'free': {'USDT': xxx}}
+            if 'free' in raw and isinstance(raw['free'], dict) and 'USDT' in raw['free']:
+                return {'USDT': {'free': float(raw['free']['USDT'])}}
+
+            # 3. 总量格式：{'total': {'USDT': xxx}}
+            if 'total' in raw and isinstance(raw['total'], dict) and 'USDT' in raw['total']:
+                return {'USDT': {'free': float(raw['total']['USDT'])}}
+
+            # 4. 直接数值：{'USDT': 5000}
+            if 'USDT' in raw and isinstance(raw['USDT'], (int, float)):
+                return {'USDT': {'free': float(raw['USDT'])}}
+
+            # 5. 遍历查找（仅当值为字典或数值时处理）
+            for key, val in raw.items():
+                if 'USDT' in str(key).upper():
+                    if isinstance(val, dict):
+                        free_val = val.get('free', val.get('total', 0))
+                        return {'USDT': {'free': float(free_val)}}
+                    elif isinstance(val, (int, float)):
+                        return {'USDT': {'free': float(val)}}
+
+            logger.warning(f"无法解析余额结构: {raw}")
+        except Exception as e:
+            logger.error(f"获取余额失败: {e}")
         return {'USDT': {'free': 0}}
 
     async def create_market_buy_order(self, symbol, amount):
