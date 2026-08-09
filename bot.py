@@ -471,6 +471,63 @@ class QuantBot:
         except: pass
 
     async def render_brain_status(self, msg_obj):
+        """超级大脑诊断 - 自动遍历所有监控币种"""
+        try:
+            macro = await self.real_data.check_macro_risk()
+            lines = [
+                f"🧠 **AI 超级大脑 - 多币种诊断** {self.env_tag}",
+                f"━━━━━━━━━━━━━━━━━━",
+                f"1️⃣ **宏观舆情**: {macro['status']}",
+                f"━━━━━━━━━━━━━━━━━━"
+            ]
+
+            for idx, sym in enumerate(self.symbols):
+                try:
+                    ticker = await self.exchange.fetch_ticker(sym)
+                    p = ticker['last']
+
+                    # 获取清算风险（含资金费率、多空比）
+                    liq = await self.real_data.get_liquidation_risk(sym)
+
+                    # 获取盘口
+                    ob = await self.exchange.fetch_orderbook(sym)
+                    ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
+
+                    # 获取技术指标
+                    tech = await self.tech.calc(sym, self.timeframe, 50)
+
+                    lines.append(
+                        f"{idx+2}️⃣ **{sym}**\n"
+                        f"   • 现价: {p:.2f} USDT\n"
+                        f"   • 费率: {liq['funding_rate']*100:+.4f}% | 多空比: {liq['long_short_ratio']:.2f}\n"
+                        f"   • 盘口: {'✅ ' + ob_msg if ob_valid else '⚠️ ' + ob_msg}\n"
+                        f"   • 布林: {tech['bb_upper']:.1f} / {tech['bb_lower']:.1f}\n"
+                        f"   • RSI(14): {tech['rsi']:.1f} | ATR: {tech['atr']:.2f}"
+                    )
+                except Exception as e:
+                    lines.append(f"{idx+2}️⃣ **{sym}**: ⚠️ 获取数据失败")
+                    logger.error(f"诊断 {sym} 异常: {e}")
+
+            lines.append("━━━━━━━━━━━━━━━━━━")
+            lines.append("🤖 *全部基于真实交易所数据*")
+
+            msg = "\n".join(lines)
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 刷新大脑诊断", callback_data="brain_status")],
+                [InlineKeyboardButton("🔙 返回控制台", callback_data="refresh_panel")]
+            ])
+
+            if hasattr(msg_obj, 'edit_text'):
+                try:
+                    await msg_obj.edit_text(msg, reply_markup=kb, parse_mode="Markdown")
+                except Exception:
+                    await msg_obj.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await msg_obj.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"大脑诊断异常: {e}")
         try:
             macro = await self.real_data.check_macro_risk()
             sym = self.symbols[0]; ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
