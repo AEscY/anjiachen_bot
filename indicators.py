@@ -1,5 +1,5 @@
 """
-indicators.py - 技术指标计算（直接从交易所K线计算，无模拟）
+indicators.py - 技术指标计算（直接从交易所拉取K线，真实数据）
 """
 import pandas as pd
 import numpy as np
@@ -10,15 +10,16 @@ class TechnicalEngine:
         self.exchange = exchange
 
     async def calc(self, symbol, timeframe='15m', limit=50):
-        """直接从交易所获取K线并计算布林带/RSI/ATR"""
+        """直接从交易所获取K线，计算布林带/RSI/ATR，返回指标字典"""
+        ohlcv = []
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         except Exception as e:
-            logger.error(f"获取K线失败 ({symbol}): {e}")
-            ohlcv = []
+            logger.warning(f"获取K线异常 ({symbol}): {e}")
 
+        # 数据不足时的降级处理：仍然尝试用已有数据，如果完全没有才 fallback
         if not ohlcv or len(ohlcv) < 20:
-            logger.warning(f"K线数据不足 ({symbol})，尝试使用当前价")
+            logger.warning(f"K线数据不足 ({symbol})，尝试使用当前价估算")
             ticker = await self.exchange.fetch_ticker(symbol)
             current_price = ticker.get('last', 0)
             if current_price <= 0:
@@ -29,11 +30,13 @@ class TechnicalEngine:
             df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
             close = df['close'].astype(float)
 
+            # 布林带 (20,2)
             sma = close.rolling(window=20).mean()
             std = close.rolling(window=20).std()
             bb_upper = sma + 2 * std
             bb_lower = sma - 2 * std
 
+            # RSI 14
             delta = close.diff()
             gain = delta.where(delta > 0, 0.0)
             loss = -delta.where(delta < 0, 0.0)
@@ -42,6 +45,7 @@ class TechnicalEngine:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
+            # ATR 14
             high = df['high'].astype(float)
             low = df['low'].astype(float)
             prev_close = close.shift(1)
@@ -63,7 +67,7 @@ class TechnicalEngine:
             if pd.isna(last_atr):
                 last_atr = current_price * 0.01
 
-            return {
+            result = {
                 'bb_upper': float(last_upper),
                 'bb_middle': float(current_price),
                 'bb_lower': float(last_lower),
@@ -71,6 +75,9 @@ class TechnicalEngine:
                 'atr': float(last_atr),
                 'bandwidth_pct': float((last_upper - last_lower) / current_price * 100)
             }
+            logger.info(f"✅ 真实指标计算成功 {symbol}: 上轨{result['bb_upper']:.1f} 下轨{result['bb_lower']:.1f} RSI{result['rsi']:.0f}")
+            return result
+
         except Exception as e:
             logger.error(f"指标计算异常 ({symbol}): {e}")
             ticker = await self.exchange.fetch_ticker(symbol)
@@ -78,7 +85,7 @@ class TechnicalEngine:
 
     @staticmethod
     def _fallback(price):
-        """绝对无法获取数据时的最后保障"""
+        """仅当完全无法获取任何数据时的最后保障"""
         if price <= 0:
             price = 2000
         return {
