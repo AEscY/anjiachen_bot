@@ -245,7 +245,68 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    async def cmd_holdings(self, update, context):
+    async def cmd_check(self, update, context):
+        if not self._auth(update): return
+        lines = ["📈 **信号 + 开仓条件**\n"]
+        fg = (await self.real_data.get_fear_greed_index())["value"]
+        bal = await self.exchange.fetch_balance()
+        usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
+
+        for sym in self.symbols:
+            ticker = await self.exchange.fetch_ticker(sym)
+            p = ticker['last']
+            tech = await self.tech.calc(sym, self.timeframe, 50)
+            funding = await self.exchange.fetch_funding_rate(sym)
+            sc = self.signal_engine.score(tech, funding, fg)
+            txt = self.signal_engine.interpret(sc)
+
+            # ---- 开仓条件检测 ----
+            coin = sym.split('/')[0]
+            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+            has_position = free > 0.0001
+
+            # 条件1：信号
+            cond_signal = sc >= self.auto_min_score
+            # 条件2：价格在布林下轨附近
+            cond_price = p <= tech['bb_lower'] * 1.02
+            # 条件3：盘口
+            cond_book = True
+            if self.orderbook_filter:
+                ob = await self.exchange.fetch_orderbook(sym)
+                cond_book, _ = await self.orderbook_engine.validate(ob)
+            # 条件4：无持仓
+            cond_no_pos = not has_position
+            # 条件5：余额足够
+            cond_balance = usdt_free >= self.single_order_usdt + self.reserve_bottom
+            # 条件6：单日限额（若启用）
+            cond_daily = True
+            if self.max_daily_trades > 0 and self.daily_trades >= self.max_daily_trades:
+                cond_daily = False
+            # 条件7：单币种限额（若启用）
+            cond_coin_limit = True
+            if self.max_per_coin_usdt > 0 and has_position:
+                coin_value = free * p
+                cond_coin_limit = coin_value < self.max_per_coin_usdt
+
+            cond_str = (
+                f"{'✅' if cond_signal else '❌'}信 "
+                f"{'✅' if cond_price else '❌'}价 "
+                f"{'✅' if cond_book else '❌'}盘 "
+                f"{'✅' if cond_no_pos else '❌'}仓 "
+                f"{'✅' if cond_balance else '❌'}钱 "
+                f"{'✅' if cond_daily else '❌'}日 "
+                f"{'✅' if cond_coin_limit else '❌'}额"
+            )
+            all_met = cond_signal and cond_price and cond_book and cond_no_pos and cond_balance and cond_daily and cond_coin_limit
+            status = "🎯 可开仓" if all_met else "⏳ 等待"
+            # ------------------
+
+            lines.append(
+                f"{sym}: {p:.2f} | 信号: {txt} ({sc})\n"
+                f"   条件: {cond_str} → {status}"
+            )
+
+        await update.effective_message.reply_text("\n".join(lines))
         if not self._auth(update): return
         bal = await self.exchange.fetch_balance()
         lines = ["📋 **当前持币**\n"]
