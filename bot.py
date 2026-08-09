@@ -125,6 +125,7 @@ class QuantBot:
         self.max_daily_trades = 0
         self.auto_trade_enabled = False
         self.auto_min_score = 75
+        self.max_per_coin_usdt = cfg.get('max_per_coin_usdt', 0)
 
         self.taker_fee = settings.TAKER_FEE
         self.maker_fee = settings.MAKER_FEE
