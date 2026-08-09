@@ -1,21 +1,24 @@
 """
-indicators.py - 技术指标计算（基于交易所真实K线）
+indicators.py - 技术指标计算（直接从交易所拉取 K 线，真实数据）
 """
 import pandas as pd
 import numpy as np
 from config import logger
+
 
 class TechnicalEngine:
     def __init__(self, exchange):
         self.exchange = exchange
 
     async def calc(self, symbol, timeframe='15m', limit=50):
+        """直接从交易所获取 K 线，计算布林带/RSI/ATR，返回指标字典"""
         ohlcv = []
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         except Exception as e:
             logger.warning(f"获取K线异常 ({symbol}): {e}")
 
+        # 数据不足时的降级处理
         if not ohlcv or len(ohlcv) < 20:
             logger.warning(f"K线数据不足 ({symbol})，尝试使用当前价估算")
             ticker = await self.exchange.fetch_ticker(symbol)
@@ -25,14 +28,16 @@ class TechnicalEngine:
             return self._fallback(current_price)
 
         try:
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             close = df['close'].astype(float)
 
+            # 布林带 (20,2)
             sma = close.rolling(window=20).mean()
             std = close.rolling(window=20).std()
             bb_upper = sma + 2 * std
             bb_lower = sma - 2 * std
 
+            # RSI 14
             delta = close.diff()
             gain = delta.where(delta > 0, 0.0)
             loss = -delta.where(delta < 0, 0.0)
@@ -41,6 +46,7 @@ class TechnicalEngine:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
+            # ATR 14
             high = df['high'].astype(float)
             low = df['low'].astype(float)
             prev_close = close.shift(1)
@@ -49,6 +55,7 @@ class TechnicalEngine:
             atr = pd.Series(tr).rolling(window=14).mean()
 
             current_price = close.iloc[-1]
+
             last_upper = bb_upper.iloc[-1]
             last_lower = bb_lower.iloc[-1]
             last_rsi = rsi.iloc[-1]
@@ -79,6 +86,7 @@ class TechnicalEngine:
 
     @staticmethod
     def _fallback(price):
+        """仅当完全无法获取任何数据时的最后保障"""
         if price <= 0:
             price = 2000
         return {
