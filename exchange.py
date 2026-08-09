@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（完全移除模拟降级，假数据返回 None）
+exchange.py - 多交易所管理器（假数据剔除版：失败返回 None，绝不造假）
 """
 import os
 import asyncio
@@ -55,7 +55,7 @@ class ExchangeManager:
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
 
-    # ---------- 行情（失败返回 None，绝不造数据） ----------
+    # ---------- 行情 ----------
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try:
@@ -90,10 +90,10 @@ class ExchangeManager:
         if self.exchange:
             try:
                 res = await self.exchange.fetch_funding_rate(symbol)
-                return res.get('fundingRate', 0) if isinstance(res, dict) else 0
+                return res.get('fundingRate', None) if isinstance(res, dict) else None
             except Exception:
                 pass
-        return 0
+        return None
 
     async def fetch_long_short_ratio(self, symbol):
         if self.exchange:
@@ -101,7 +101,7 @@ class ExchangeManager:
                 return await self.exchange.fetch_long_short_ratio(symbol)
             except Exception:
                 pass
-        return 1.0
+        return None
 
     # ---------- 余额 ----------
     async def fetch_balance(self):
