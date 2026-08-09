@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（余额最终修复版，兼容 OKX 模拟盘）
+exchange.py - 多交易所管理器（余额终极防御版，任何结构不报错）
 """
 import os
 import random
@@ -105,56 +105,57 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（铁壁防御版） ----------
+    # ---------- 余额（铁壁防御递归版） ----------
     async def fetch_balance(self):
-        """获取余额——终极通用版，任何结构都能安全返回，不报错"""
+        """获取余额（终极安全版，任何结构都不会报错）"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
+
+        def safe_search(data, target='USDT'):
+            """递归安全搜索，忽略所有非字典和列表类型"""
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if key == target and isinstance(value, (int, float)):
+                        return float(value)
+                    if isinstance(value, (dict, list)):
+                        result = safe_search(value, target)
+                        if result is not None:
+                            return result
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, (dict, list)):
+                        result = safe_search(item, target)
+                        if result is not None:
+                            return result
+            return None
+
         try:
             raw = await self.exchange.fetch_balance()
-            logger.info(f"=== 余额原始数据开始 ===")
-            logger.info(f"{raw}")
-            logger.info(f"=== 余额原始数据结束 ===")
-            for k, v in raw.items():
-                logger.info(f"顶层键: {k} (类型: {type(v).__name__}) 值: {str(v)[:150]}")
+            logger.info(f"余额原始数据: {raw}")
 
-            # ----- 尝试 1：直接从标准字段提取 -----
-            for field in ('total', 'free', 'used'):
-                sub = raw.get(field)
-                if isinstance(sub, dict) and 'USDT' in sub:
-                    val = sub['USDT']
-                    if isinstance(val, (int, float)):
-                        return {'USDT': {'free': float(val)}}
+            # 1. 递归搜索 USDT 的 free 和 total 字段
+            free_val = safe_search(raw, 'free')
+            total_val = safe_search(raw, 'total')
+            usdt_val = safe_search(raw, 'USDT')
 
-            # ----- 尝试 2：USDT 直接在顶层是数字或字典 -----
-            usdt = raw.get('USDT')
-            if isinstance(usdt, (int, float)):
-                return {'USDT': {'free': float(usdt)}}
-            if isinstance(usdt, dict):
-                val = usdt.get('free', usdt.get('total', 0))
-                return {'USDT': {'free': float(val)}}
+            if usdt_val is not None:
+                return {'USDT': {'free': usdt_val}}
+            if free_val is not None:
+                return {'USDT': {'free': free_val}}
+            if total_val is not None:
+                return {'USDT': {'free': total_val}}
 
-            # ----- 尝试 3：遍历所有顶层值，寻找字典中含 USDT 的 -----
-            for key, val in raw.items():
-                if not isinstance(val, dict):
-                    continue
-                for sub_key, sub_val in val.items():
-                    if isinstance(sub_val, dict) and 'USDT' in sub_val:
-                        return {'USDT': {'free': float(sub_val['USDT'])}}
-                    if sub_key == 'USDT' and isinstance(sub_val, (int, float)):
-                        return {'USDT': {'free': float(sub_val)}}
+            # 2. 如果递归找不到，再用标准字段兜底
+            for field in ('total', 'free', 'USDT'):
+                val = raw.get(field)
+                if isinstance(val, dict):
+                    free = val.get('free', val.get('total', 0))
+                    if isinstance(free, (int, float)):
+                        return {'USDT': {'free': float(free)}}
+                if isinstance(val, (int, float)):
+                    return {'USDT': {'free': float(val)}}
 
-            # ----- 尝试 4：CCXT 常用格式 info.data 数组 -----
-            info = raw.get('info')
-            if isinstance(info, dict):
-                data = info.get('data')
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict) and item.get('ccy') == 'USDT':
-                            avail = item.get('availBal', item.get('cashBal', 0))
-                            return {'USDT': {'free': float(avail)}}
-
-            logger.error("⚠️ 无法解析余额，请将上面的原始数据发给开发者")
+            logger.error("无法解析余额，请将上面的原始数据发给开发者")
         except Exception as e:
             logger.error(f"fetch_balance 异常: {e}", exc_info=True)
         return {'USDT': {'free': 0}}
