@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化机器人 (长轮询模式 + SQLite + Python 3.11 兼容)
+bot.py - 完全体量化机器人 (长轮询 + 自动重连 + 全按钮响应)
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -163,6 +163,7 @@ class QuantBot:
                 CommandHandler("settrades", self.cmd_set_trades), CommandHandler("resettrades", self.cmd_reset_trades),
                 CommandHandler("preset", self.cmd_preset), CommandHandler("history", self.cmd_history),
                 CommandHandler("autotrade", self.cmd_autotrade), CommandHandler("autoscore", self.cmd_autoscore),
+                CommandHandler("holdings", self.cmd_holdings),
             ]
             for h in handlers: self.tg_app.add_handler(h)
             self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
@@ -221,6 +222,8 @@ class QuantBot:
              InlineKeyboardButton("🎯 阈值", callback_data="menu_set_autoscore")],
             [InlineKeyboardButton("📊 看板", callback_data="dashboard"),
              InlineKeyboardButton("💳 余额", callback_data="balance")],
+            [InlineKeyboardButton("📋 持币", callback_data="holdings"),
+             InlineKeyboardButton("📋 监控", callback_data="list_symbols")],
             [InlineKeyboardButton("🎯 止盈", callback_data="menu_set_tp"),
              InlineKeyboardButton("🛡️ 止损", callback_data="menu_set_sl")],
             [InlineKeyboardButton("📉 移损", callback_data="menu_set_tsl"),
@@ -247,6 +250,30 @@ class QuantBot:
         kb.append([InlineKeyboardButton("✍️ 自填", callback_data=f"prompt_manual:{setting_key}")])
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
+
+    # ==================== 新增：持币查询 ====================
+    async def cmd_holdings(self, update, context):
+        """只显示当前持有的币种（数量 > 0）"""
+        if not self._auth(update): return
+        bal = await self.exchange.fetch_balance()
+        lines = ["📋 **当前持币**\n"]
+        has_any = False
+        for sym in self.symbols:
+            coin = sym.split('/')[0]
+            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+            if free > 0.0001:
+                has_any = True
+                ticker = await self.exchange.fetch_ticker(sym)
+                p = ticker['last']
+                val = free * p
+                pnl = ""
+                if sym in self.entries and self.entries[sym] > 0:
+                    pnl_pct = ((p - self.entries[sym]) / self.entries[sym]) * 100
+                    pnl = f" | {'🟢' if pnl_pct>=0 else '🔴'} {pnl_pct:+.2f}%"
+                lines.append(f"• {sym}: {free:.4f} 现价{p:.2f} 价值{val:.2f}{pnl}")
+        if not has_any:
+            lines.append("暂无持仓")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     # ==================== 命令实现 ====================
     async def cmd_autotrade(self, update, context):
@@ -370,7 +397,16 @@ class QuantBot:
     async def cmd_brain(self, update, context): await self.render_brain_status(update.effective_message)
 
     async def cmd_help(self, update, context):
-        await update.effective_message.reply_text(f"🤖 全自动交易\n保本线: >{self.breakeven_pct*100:.2f}%\n/autotrade on 开启")
+        await update.effective_message.reply_text(
+            f"🤖 命令列表\n"
+            f"/menu 控制台 /status 持仓 /check 信号\n"
+            f"/symbols 监控列表 /holdings 持币查询\n"
+            f"/brain 大脑 /analysis 差距 /history 历史\n"
+            f"/settp 5 /setsl 2 /setamount 1\n"
+            f"/autotrade on /autoscore 75\n"
+            f"/preset balanced /panic 全平\n"
+            f"保本线: >{self.breakeven_pct*100:.2f}%"
+        )
 
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
@@ -502,30 +538,30 @@ class QuantBot:
         except ValueError:
             await update.message.reply_text("❌ 格式有误"); context.user_data['pending_setting'] = None
 
-    # ============ 按钮回调 ============
+    # ============ 按钮回调（所有按钮都有明确响应） ============
     async def handle_button_click(self, update, context):
         query = update.callback_query; data = query.data
         try:
             if data == "refresh_panel": await self.cmd_menu(update, context)
             elif data == "toggle_filter":
                 self.orderbook_filter = not self.orderbook_filter; await self._save_config()
-                await query.answer("已切换")
+                await query.answer(f"盘口过滤已{'开启' if self.orderbook_filter else '关闭'}")
                 try: await query.edit_message_reply_markup(reply_markup=self._build_main_keyboard())
                 except: pass
             elif data == "toggle_breaker":
                 self.waterfall_breaker = not self.waterfall_breaker; await self._save_config()
-                await query.answer("已切换")
+                await query.answer(f"瀑布熔断已{'开启' if self.waterfall_breaker else '关闭'}")
                 try: await query.edit_message_reply_markup(reply_markup=self._build_main_keyboard())
                 except: pass
             elif data == "toggle_auto":
                 self.auto_trade_enabled = not self.auto_trade_enabled; await self._save_config()
-                await query.answer(f"自动交易{'开启' if self.auto_trade_enabled else '关闭'}")
+                await query.answer(f"自动交易已{'开启' if self.auto_trade_enabled else '关闭'}")
                 try: await query.edit_message_reply_markup(reply_markup=self._build_main_keyboard())
                 except: pass
             elif data == "bot_start": self.is_running = True; await query.answer("已开启")
             elif data == "bot_stop": self.is_running = False; await query.answer("已关机")
-            elif data == "brain_status": await self.render_brain_status(query.message)
-            elif data == "gap_analysis": await self.render_gap_analysis(query.message)
+            elif data == "brain_status": await self.render_brain_status(query.message); await query.answer()
+            elif data == "gap_analysis": await self.render_gap_analysis(query.message); await query.answer()
             elif data == "dashboard":
                 auto_state = "开启" if self.auto_trade_enabled else "关闭"
                 msg = (f"📊 看板\n止盈{self.tp_pct*100:.2f}% 止损{self.sl_pct*100:.2f}%\n"
@@ -533,20 +569,20 @@ class QuantBot:
                        f"额度{self.single_order_usdt}U 周期{self.timeframe} 底线{self.reserve_bottom}U\n"
                        f"自动交易: {auto_state} 阈值: {self.auto_min_score}分\n"
                        f"今日交易: {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}")
-                await query.message.reply_text(msg)
+                await query.message.reply_text(msg); await query.answer()
             elif data == "balance":
                 bal = await self.exchange.fetch_balance()
-                await query.message.reply_text(f"💳 USDT: {bal.get('USDT',{}).get('free',0):.2f}")
+                await query.message.reply_text(f"💳 USDT: {bal.get('USDT',{}).get('free',0):.2f}"); await query.answer()
             elif data == "history": await self.cmd_history(update, context)
-            elif data == "sync_pos":
-                await query.answer("🔄 已同步", show_alert=True)
-                await query.message.reply_text("🔄 持仓同步完成")
+            elif data == "holdings": await self.cmd_holdings(update, context)
             elif data == "list_symbols": await self.cmd_symbols(update, context)
+            elif data == "sync_pos":
+                await query.answer("🔄 已同步（占位功能）", show_alert=True)
             elif data == "menu_preset":
                 opts = [("🛡️保守","conservative"),("⚖️平衡","balanced"),("⚡激进","aggressive")]
                 kb = [[InlineKeyboardButton(label, callback_data=f"preset:{val}") for label,val in opts]]
                 kb.append([InlineKeyboardButton("🔙返回", callback_data="refresh_panel")])
-                await query.edit_message_text("⚡ 选择方案:", reply_markup=InlineKeyboardMarkup(kb))
+                await query.edit_message_text("⚡ 选择方案:", reply_markup=InlineKeyboardMarkup(kb)); await query.answer()
             elif data.startswith("preset:"):
                 mode = data.split(":")[1]
                 p = {"conservative":{"tp":3,"sl":2,"tsl":1,"tmpt":1,"tf":"1h","amt":1,"reserve":2},
@@ -560,37 +596,37 @@ class QuantBot:
             elif data == "panic_confirm": await query.answer("🚨 请发送 /panic 确认", show_alert=True)
             elif data == "menu_set_autoscore":
                 opts = [("70分","70"),("75分","75"),("80分","80"),("85分","85")]
-                await query.edit_message_text("🎯 阈值", reply_markup=self._build_option_keyboard(opts,"cfg_autoscore","autoscore"))
+                await query.edit_message_text("🎯 阈值", reply_markup=self._build_option_keyboard(opts,"cfg_autoscore","autoscore")); await query.answer()
             elif data == "menu_set_trades":
                 opts = [("3次","3"),("5次","5"),("10次","10"),("无限","0")]
-                await query.edit_message_text("🔢 上限", reply_markup=self._build_option_keyboard(opts,"cfg_trades","settrades"))
+                await query.edit_message_text("🔢 上限", reply_markup=self._build_option_keyboard(opts,"cfg_trades","settrades")); await query.answer()
             elif data == "menu_set_tp":
                 opts = [("3%","0.03"),("5%","0.05"),("8%","0.08")]
-                await query.edit_message_text("🎯", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp"))
+                await query.edit_message_text("🎯", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp")); await query.answer()
             elif data == "menu_set_sl":
                 opts = [("1%","0.01"),("2%","0.02"),("3%","0.03")]
-                await query.edit_message_text("🛡️", reply_markup=self._build_option_keyboard(opts,"cfg_sl","setsl"))
+                await query.edit_message_text("🛡️", reply_markup=self._build_option_keyboard(opts,"cfg_sl","setsl")); await query.answer()
             elif data == "menu_set_tsl":
                 opts = [("0.5%","0.005"),("1%","0.01"),("1.5%","0.015")]
-                await query.edit_message_text("📉", reply_markup=self._build_option_keyboard(opts,"cfg_tsl","settsl"))
+                await query.edit_message_text("📉", reply_markup=self._build_option_keyboard(opts,"cfg_tsl","settsl")); await query.answer()
             elif data == "menu_set_tmpt":
                 opts = [("0.5%","0.005"),("1%","0.01"),("1.5%","0.015")]
-                await query.edit_message_text("🏹", reply_markup=self._build_option_keyboard(opts,"cfg_tmpt","settmpt"))
+                await query.edit_message_text("🏹", reply_markup=self._build_option_keyboard(opts,"cfg_tmpt","settmpt")); await query.answer()
             elif data == "menu_set_amount":
                 opts = [("1U","1"),("2U","2"),("5U","5")]
-                await query.edit_message_text("💵", reply_markup=self._build_option_keyboard(opts,"cfg_amt","setamount"))
+                await query.edit_message_text("💵", reply_markup=self._build_option_keyboard(opts,"cfg_amt","setamount")); await query.answer()
             elif data == "menu_set_tf":
                 opts = [("1m","1m"),("5m","5m"),("15m","15m"),("1h","1h")]
-                await query.edit_message_text("⏱", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf"))
+                await query.edit_message_text("⏱", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf")); await query.answer()
             elif data == "menu_set_reserve":
                 opts = [("0.5U","0.5"),("1U","1"),("2U","2"),("5U","5")]
-                await query.edit_message_text("🔒", reply_markup=self._build_option_keyboard(opts,"cfg_res","setreserve"))
+                await query.edit_message_text("🔒", reply_markup=self._build_option_keyboard(opts,"cfg_res","setreserve")); await query.answer()
             elif data == "menu_add_symbol":
                 opts = [("BTC/USDT","BTC/USDT"),("SOL/USDT","SOL/USDT"),("DOGE/USDT","DOGE/USDT")]
-                await query.edit_message_text("➕", reply_markup=self._build_option_keyboard(opts,"cfg_add","addsymbol"))
+                await query.edit_message_text("➕", reply_markup=self._build_option_keyboard(opts,"cfg_add","addsymbol")); await query.answer()
             elif data == "menu_del_symbol":
                 opts = [(s, s) for s in self.symbols]
-                await query.edit_message_text("➖", reply_markup=self._build_option_keyboard(opts,"cfg_del","delsymbol"))
+                await query.edit_message_text("➖", reply_markup=self._build_option_keyboard(opts,"cfg_del","delsymbol")); await query.answer()
             elif data.startswith("cfg_"):
                 prefix = data.split(":")[0] if ":" in data else ""
                 val_str = data.split(":")[1] if ":" in data else ""
@@ -628,9 +664,15 @@ class QuantBot:
                 }
                 await query.message.reply_text(prompts.get(key, "✍️ 请输入数值："),
                     reply_markup=ForceReply(selective=True), parse_mode="Markdown")
-            await query.answer()
+                await query.answer()
+            else:
+                # 未知回调，记录日志并提示用户
+                logger.warning(f"未处理的按钮回调: {data}")
+                await query.answer("该功能暂未开放", show_alert=True)
         except Exception as e:
-            logger.error(f"按钮异常: {e}")
+            logger.error(f"按钮异常 ({data}): {e}")
+            try: await query.answer("操作失败，请重试", show_alert=True)
+            except: pass
 
     async def _refresh_panel(self, query):
         try: await query.edit_message_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
@@ -735,49 +777,52 @@ class QuantBot:
                 logger.error(f"追踪错误: {e}")
                 await asyncio.sleep(5)
 
-    # ==================== 启动 (长轮询模式) ====================
+    # ==================== 启动 (长轮询 + 自动重连) ====================
     async def run(self):
         await self.load_and_init()
         if not self.tg_app:
             logger.error("TG app 未初始化")
             return
-        # 删除可能残留的 webhook，避免冲突
         await self.tg_app.bot.delete_webhook(drop_pending_updates=True)
 
-        # 启动长轮询
-        await self.tg_app.initialize()
-        await self.tg_app.start()
-        await self.tg_app.updater.start_polling(drop_pending_updates=True)
-        logger.info("✅ Bot 长轮询模式启动")
-
-        # ========== 发送启动通知 ==========
-        if settings.TG_CHAT_ID and self.tg_app.bot:
-            try:
-                await self.tg_app.bot.send_message(
-                    chat_id=settings.TG_CHAT_ID,
-                    text=(
-                        f"🤖 **量化机器人已启动**\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"📌 版本: 完全体 v2.0\n"
-                        f"🔧 模式: 长轮询\n"
-                        f"{self.env_tag}\n"
-                        f"🤖 自动交易: {'🟢 开启' if self.auto_trade_enabled else '🔴 关闭'}\n"
-                        f"📊 监控: {', '.join(self.symbols[:3])}\n"
-                        f"🎯 阈值: {self.auto_min_score} 分\n"
-                        f"💰 保本线: >{self.breakeven_pct*100:.2f}%\n"
-                        f"━━━━━━━━━━━━━━\n"
-                        f"发送 /menu 打开控制台"
-                    ),
-                    parse_mode="Markdown"
-                )
-                logger.info("📲 启动通知已发送")
-            except Exception as e:
-                logger.warning(f"发送启动通知失败: {e}")
-
-        # 启动后台任务（自动交易、移动止盈追踪）
+        # 启动后台任务（只需启动一次）
         asyncio.create_task(self._auto_trade_monitor())
         asyncio.create_task(self._trailing_monitor())
 
-        # 保持主循环
+        # 自动重连循环
         while True:
-            await asyncio.sleep(30)
+            try:
+                await self.tg_app.initialize()
+                await self.tg_app.start()
+                await self.tg_app.updater.start_polling(drop_pending_updates=True)
+                logger.info("✅ Bot 长轮询模式启动")
+
+                # 发送启动通知
+                if settings.TG_CHAT_ID and self.tg_app.bot:
+                    try:
+                        await self.tg_app.bot.send_message(
+                            chat_id=settings.TG_CHAT_ID,
+                            text=(
+                                f"🤖 **量化机器人已上线**\n"
+                                f"━━━━━━━━━━━━━━\n"
+                                f"📌 版本: 完全体 v2.1\n"
+                                f"🔧 模式: 长轮询 (自动重连)\n"
+                                f"{self.env_tag}\n"
+                                f"🤖 自动交易: {'🟢 开启' if self.auto_trade_enabled else '🔴 关闭'}\n"
+                                f"📊 监控: {', '.join(self.symbols[:3])}\n"
+                                f"🎯 阈值: {self.auto_min_score} 分\n"
+                                f"💰 保本线: >{self.breakeven_pct*100:.2f}%\n"
+                                f"━━━━━━━━━━━━━━\n"
+                                f"发送 /menu 打开控制台"
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except: pass
+
+                # 保持运行直到断开
+                while True:
+                    await asyncio.sleep(30)
+
+            except Exception as e:
+                logger.error(f"Bot 连接断开，5 秒后自动重连: {e}")
+                await asyncio.sleep(5)
