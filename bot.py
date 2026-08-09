@@ -1,5 +1,5 @@
 """
-bot.py - 最终优化完整版（动态网格、回撤熔断、API异常熔断、仪表盘）
+bot.py - 最终完整版（动态网格、回撤熔断、API异常熔断、学习系统、仪表盘）
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -139,7 +139,7 @@ class QuantBot:
         self.max_daily_trades = 0; self.auto_trade_enabled = False; self.auto_min_score = 75
         self.max_per_coin_usdt = 0; self.max_daily_loss_pct = 0.05
         self.max_total_allocated_pct = 0.8
-        self.max_drawdown_pct = 0.15  # 回撤熔断阈值
+        self.max_drawdown_pct = 0.15
         self.api_error_count = 0; self.max_api_errors = 5; self.api_error_pause_time = 0
 
         self.taker_fee = settings.TAKER_FEE; self.maker_fee = settings.MAKER_FEE
@@ -185,6 +185,7 @@ class QuantBot:
             self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
             self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
 
+    # ---------- 余额辅助 ----------
     def _get_usdt_free(self, bal):
         try:
             usdt = bal.get('USDT', {})
@@ -194,6 +195,7 @@ class QuantBot:
             return float(free)
         except: return 0
 
+    # ---------- 数据库加载 ----------
     async def load_and_init(self):
         await init_db()
         cfg = await load_config()
@@ -232,6 +234,7 @@ class QuantBot:
 
     def _parse_pct(self, val): return val / 100.0
 
+    # ---------- 动态止盈止损调整 ----------
     async def _adjust_tp_sl_by_volatility(self, symbol):
         try:
             tech = await self.tech.calc(symbol, self.timeframe, 20)
@@ -241,6 +244,7 @@ class QuantBot:
         except Exception:
             return self.tp_pct, self.sl_pct
 
+    # ---------- 键盘 ----------
     def _build_main_keyboard(self):
         f_status = "已开启" if self.orderbook_filter else "已关闭"
         b_status = "已开启" if self.waterfall_breaker else "已关闭"
@@ -286,15 +290,50 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    # ==================== 命令实现（同之前的完整版，为节省篇幅此处略，实际文件包含所有命令） ====================
-    # 请注意：此处省略了之前所有命令函数（cmd_holdings, cmd_autotrade, cmd_autoscore, cmd_set_max_coin, cmd_entry, 
-    # cmd_set_trades, cmd_reset_trades, cmd_preset, cmd_history, cmd_status, cmd_check, cmd_symbols, cmd_menu, 
-    # cmd_panic, cmd_analysis, cmd_brain, cmd_help, cmd_set_tp, cmd_set_sl, cmd_set_tsl, cmd_set_trailing_tp,
-    # cmd_set_amount, cmd_set_tf, cmd_set_reserve, cmd_add_symbol, cmd_del_symbol, render_brain_status, 
-    # render_gap_analysis, handle_text_input, handle_button_click, _refresh_panel, panic_sell_all 等），
-    # 它们与之前提供的最终完整版完全相同。实际部署时必须包含全部这些函数。
+    # ==================== 命令实现 ====================
+    async def cmd_holdings(self, update, context):
+        if not self._auth(update): return
+        bal = await self.exchange.fetch_balance()
+        lines = ["📋 **当前持币**\n"]
+        has_any = False
+        for sym in self.symbols:
+            coin = sym.split('/')[0]
+            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+            if free > 0.0001:
+                has_any = True
+                ticker = await self.exchange.fetch_ticker(sym)
+                if ticker:
+                    p = ticker['last']; val = free * p
+                    pnl = ""
+                    if sym in self.entries and self.entries[sym] > 0:
+                        pnl_pct = ((p - self.entries[sym]) / self.entries[sym]) * 100
+                        pnl = f" | {'🟢' if pnl_pct>=0 else '🔴'} {pnl_pct:+.2f}%"
+                    lines.append(f"• {sym}: {free:.4f} 现价{p:.2f} 价值{val:.2f}{pnl}")
+        if not has_any: lines.append("暂无持仓")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # ==================== 新增命令 ====================
+    async def cmd_autotrade(self, update, context):
+        if not self._auth(update): return
+        try:
+            mode = context.args[0].lower()
+            if mode == "on": self.auto_trade_enabled = True; await self._save_config(); await update.effective_message.reply_text("🤖 自动交易已开启")
+            elif mode == "off": self.auto_trade_enabled = False; await self._save_config(); await update.effective_message.reply_text("🤖 自动交易已关闭")
+            else: await update.effective_message.reply_text("用法: /autotrade on|off")
+        except: pass
+
+    async def cmd_autoscore(self, update, context):
+        if not self._auth(update): return
+        try:
+            score = int(context.args[0])
+            if 50 <= score <= 95: self.auto_min_score = score; await self._save_config(); await update.effective_message.reply_text(f"✅ 阈值: {score}分")
+            else: await update.effective_message.reply_text("阈值需在50-95之间")
+        except: pass
+
+    async def cmd_set_max_coin(self, update, context):
+        if not self._auth(update): return
+        try: self.max_per_coin_usdt = float(context.args[0]); await self._save_config(); await update.effective_message.reply_text(f"✅ 单币最大持仓: {self.max_per_coin_usdt}U")
+        except: await update.effective_message.reply_text("❌ 格式: /setmaxcoin 200")
+
     async def cmd_set_max_loss(self, update, context):
         if not self._auth(update): return
         try:
@@ -350,7 +389,392 @@ class QuantBot:
         else:
             await update.effective_message.reply_text("❌ 备份失败")
 
-    # ==================== 自动交易（包含动态网格、回撤熔断、API异常熔断） ====================
+    async def cmd_entry(self, update, context):
+        if not self._auth(update): return
+        try: sym = context.args[0].upper(); price = float(context.args[1]); self.entries[sym] = price; await update.effective_message.reply_text(f"📝 {sym} 入场价: {price:.2f}")
+        except: await update.effective_message.reply_text("❌ `/entry ETH/USDT 3120`")
+
+    async def cmd_set_trades(self, update, context):
+        if not self._auth(update): return
+        try: self.max_daily_trades = int(context.args[0]); await self._save_config(); await update.effective_message.reply_text(f"✅ 单日最大交易: {self.max_daily_trades}")
+        except: pass
+
+    async def cmd_reset_trades(self, update, context):
+        if not self._auth(update): return
+        self.daily_trades = 0; await update.effective_message.reply_text("✅ 计数已重置")
+
+    async def cmd_preset(self, update, context):
+        if not self._auth(update): return
+        try:
+            mode = context.args[0].lower()
+            presets = {
+                "conservative": {"tp": 3, "sl": 2, "tsl": 1, "tmpt": 1, "tf": "1h", "amt": 1, "reserve": 2},
+                "balanced": {"tp": 1.5, "sl": 1, "tsl": 0.5, "tmpt": 0.5, "tf": "15m", "amt": 1, "reserve": 1},
+                "aggressive": {"tp": 0.8, "sl": 0.5, "tsl": 0.3, "tmpt": 0.3, "tf": "5m", "amt": 1, "reserve": 0.5},
+            }
+            if mode not in presets: await update.effective_message.reply_text("可选: conservative / balanced / aggressive"); return
+            p = presets[mode]; self.tp_pct = p["tp"]/100; self.sl_pct = p["sl"]/100; self.trailing_sl_pct = p["tsl"]/100; self.trailing_tp_pct = p["tmpt"]/100; self.timeframe = p["tf"]; self.single_order_usdt = p["amt"]; self.reserve_bottom = p["reserve"]
+            await self._save_config()
+            names = {"conservative": "保守", "balanced": "平衡", "aggressive": "激进"}
+            await update.effective_message.reply_text(f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct*100:.1f}% 止损{self.sl_pct*100:.1f}%")
+        except: pass
+
+    async def cmd_history(self, update, context):
+        if not self._auth(update): return
+        if not self.trades: await update.effective_message.reply_text("📜 暂无记录"); return
+        lines = ["📜 **最近交易**\n"]
+        for t in self.trades[:10]: lines.append(f"{'🟢' if t['pnl_pct']>0 else '🔴'} {t['time']} {t['symbol']} {t['pnl_pct']:+.2f}%")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def cmd_status(self, update, context):
+        if not self._auth(update): return
+        lines = ["📊 **持仓**\n"]
+        bal = await self.exchange.fetch_balance()
+        for sym in self.symbols:
+            ticker = await self.exchange.fetch_ticker(sym)
+            if ticker is None: continue
+            p = ticker['last']; coin = sym.split('/')[0]
+            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+            val = free * p
+            pnl = ""
+            if sym in self.entries and self.entries[sym] > 0 and free > 0:
+                pnl_pct = ((p - self.entries[sym]) / self.entries[sym]) * 100
+                pnl = f" | {'🟢' if pnl_pct>=0 else '🔴'} {pnl_pct:+.2f}%"
+            lines.append(f"{sym}: {free:.4f} 现价{p:.2f} 价值{val:.2f}{pnl}")
+        lines.append(f"💵 USDT: {self._get_usdt_free(bal):.2f}")
+        await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_check(self, update, context):
+        if not self._auth(update): return
+        lines = ["📈 **信号 + 开仓条件**\n"]
+        fg_data = await self.real_data.get_fear_greed_index()
+        fg = fg_data["value"] if fg_data else None
+        bal = await self.exchange.fetch_balance()
+        usdt_free = self._get_usdt_free(bal)
+        for sym in self.symbols:
+            try:
+                ticker = await self.exchange.fetch_ticker(sym)
+                if ticker is None: continue
+                p = ticker['last']
+                tech = await self.tech.calc(sym, self.timeframe, 50)
+                funding = await self.exchange.fetch_funding_rate(sym)
+                sc = self.signal_engine.score(tech, funding, fg)
+                txt = self.signal_engine.interpret(sc)
+                coin = sym.split('/')[0]
+                free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+                coin_value = free * p
+                cond_signal = sc >= self.auto_min_score
+                cond_price = p <= tech['bb_lower'] * 1.02
+                cond_book = True
+                if self.orderbook_filter:
+                    ob = await self.exchange.fetch_orderbook(sym)
+                    cond_book, _ = await self.orderbook_engine.validate(ob)
+                cond_pos = True
+                if self.max_per_coin_usdt > 0:
+                    cond_pos = coin_value < self.max_per_coin_usdt
+                cond_balance = usdt_free >= self.single_order_usdt + self.reserve_bottom
+                cond_daily = True if self.max_daily_trades <= 0 or self.daily_trades < self.max_daily_trades else False
+                cond_str = (f"{'✅' if cond_signal else '❌'}信 {'✅' if cond_price else '❌'}价 {'✅' if cond_book else '❌'}盘 "
+                            f"{'✅' if cond_pos else '❌'}仓 {'✅' if cond_balance else '❌'}钱 {'✅' if cond_daily else '❌'}天")
+                all_met = all([cond_signal, cond_price, cond_book, cond_pos, cond_balance, cond_daily])
+                status = "🎯 可开仓" if all_met else "⏳ 等待"
+                lines.append(f"{sym}: {p:.2f} | 信号: {txt} ({sc})\n   条件: {cond_str} → {status}")
+            except Exception: continue
+        await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_symbols(self, update, context):
+        if not self._auth(update): return
+        s_list = "\n".join([f"• `{s}`" for s in self.symbols])
+        await update.effective_message.reply_text(f"📋 **监控列表**:\n{s_list}", parse_mode="Markdown")
+
+    async def cmd_menu(self, update, context):
+        if not self._auth(update): await update.message.reply_text("⛔ 未授权"); return
+        await update.effective_message.reply_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
+
+    async def cmd_panic(self, update, context):
+        if not self._auth(update): return
+        await self.panic_sell_all(); await update.effective_message.reply_text("🚨 全平")
+
+    async def cmd_analysis(self, update, context): await self.render_gap_analysis(update.effective_message)
+    async def cmd_brain(self, update, context): await self.render_brain_status(update.effective_message)
+
+    async def cmd_help(self, update, context):
+        await update.effective_message.reply_text(
+            f"🤖 **命令列表**\n"
+            f"/stats 仪表盘 /backup 备份\n"
+            f"/menu 控制台 /status 持仓 /check 信号\n"
+            f"/settp 5 /setsl 2 /setamount 1\n"
+            f"/autotrade on /learn on\n"
+            f"/preset balanced /panic 全平\n"
+            f"保本线: >{self.breakeven_pct*100:.2f}%"
+        )
+
+    async def cmd_set_tp(self, update, context):
+        if not self._auth(update): return
+        try:
+            val = self._parse_pct(float(context.args[0]))
+            if val < self.breakeven_pct: await update.effective_message.reply_text(f"❌ 低于保本线 {self.breakeven_pct*100:.2f}%"); return
+            if self.sl_pct > 0 and val / self.sl_pct < 1.2: await update.effective_message.reply_text("❌ 盈亏比不足"); return
+            self.tp_pct = val; await self._save_config(); await update.effective_message.reply_text(f"✅ 止盈: {self.tp_pct*100:.2f}%")
+        except: pass
+
+    async def cmd_set_sl(self, update, context):
+        if not self._auth(update): return
+        try:
+            val = self._parse_pct(float(context.args[0]))
+            if self.tp_pct > 0 and self.tp_pct / val < 1.2: await update.effective_message.reply_text("❌ 盈亏比不足"); return
+            self.sl_pct = val; await self._save_config(); await update.effective_message.reply_text("✅")
+        except: pass
+
+    async def cmd_set_tsl(self, update, context):
+        if not self._auth(update): return
+        try: self.trailing_sl_pct = self._parse_pct(float(context.args[0])); await self._save_config(); await update.effective_message.reply_text("✅")
+        except: pass
+
+    async def cmd_set_trailing_tp(self, update, context):
+        if not self._auth(update): return
+        try: val = self._parse_pct(float(context.args[0])); self.trailing_tp_pct = val; await self._save_config(); await update.effective_message.reply_text(f"✅ 移动止盈: {self.trailing_tp_pct*100:.2f}%")
+        except: pass
+
+    async def cmd_set_amount(self, update, context):
+        if not self._auth(update): return
+        try: self.single_order_usdt = float(context.args[0]); await self._save_config(); await update.effective_message.reply_text("✅")
+        except: pass
+
+    async def cmd_set_tf(self, update, context):
+        if not self._auth(update): return
+        try: self.timeframe = context.args[0].lower(); await self._save_config(); await update.effective_message.reply_text("✅")
+        except: pass
+
+    async def cmd_set_reserve(self, update, context):
+        if not self._auth(update): return
+        try: self.reserve_bottom = float(context.args[0]); await self._save_config(); await update.effective_message.reply_text(f"✅ 底线: {self.reserve_bottom}U")
+        except: pass
+
+    async def cmd_add_symbol(self, update, context):
+        if not self._auth(update): return
+        try: sym = context.args[0].upper(); self.symbols.append(sym); await self._save_config(); await update.effective_message.reply_text("✅")
+        except: pass
+
+    async def cmd_del_symbol(self, update, context):
+        if not self._auth(update): return
+        try: sym = context.args[0].upper(); self.symbols.remove(sym); await self._save_config(); await update.effective_message.reply_text("✅")
+        except: pass
+
+    # ==================== 诊断渲染 ====================
+    async def render_brain_status(self, msg_obj):
+        try:
+            macro = await self.real_data.check_macro_risk()
+            lines = [f"🧠 **AI 超级大脑** {self.env_tag}", f"1️⃣ 宏观: {macro['status']}"]
+            for idx, sym in enumerate(self.symbols):
+                try:
+                    ticker = await self.exchange.fetch_ticker(sym)
+                    if ticker is None: continue
+                    p = ticker['last']
+                    liq = await self.real_data.get_liquidation_risk(sym)
+                    ob = await self.exchange.fetch_orderbook(sym)
+                    ob_valid, ob_msg = await self.orderbook_engine.validate(ob) if ob else (False, "无数据")
+                    tech = await self.tech.calc(sym, self.timeframe, 50)
+                    lines.append(f"{idx+2}️⃣ {sym}: {p:.2f} 费率{liq['funding_rate']*100:+.4f}% 盘口{ob_msg} 布林{tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}")
+                except: lines.append(f"{idx+2}️⃣ {sym}: 数据获取失败")
+            await msg_obj.reply_text("\n".join(lines))
+        except Exception as e: logger.error(f"brain err: {e}")
+
+    async def render_gap_analysis(self, msg_obj):
+        try:
+            lines = ["📈 **差距分析**\n"]
+            for sym in self.symbols:
+                ticker = await self.exchange.fetch_ticker(sym)
+                if ticker is None: continue
+                p = ticker['last']
+                try:
+                    tech = await self.tech.calc(sym, self.timeframe, 50)
+                    target = min(tech['bb_lower'], p*0.99); gap = ((p-target)/p)*100
+                    lines.append(f"{sym}: {p:.2f} → {target:.2f} ({gap:+.2f}%)")
+                except: lines.append(f"{sym}: 指标计算失败")
+            await msg_obj.reply_text("\n".join(lines))
+        except Exception as e: logger.error(f"analysis err: {e}")
+
+    # ==================== 自填模式 ====================
+    async def handle_text_input(self, update, context):
+        pending = context.user_data.get('pending_setting')
+        if not pending: return
+        try:
+            user_text = update.message.text.strip()
+            if pending in ("settf", "addsymbol", "delsymbol"):
+                if pending == "settf": self.timeframe = user_text.lower()
+                elif pending == "addsymbol": sym = user_text.upper(); self.symbols.append(sym) if sym not in self.symbols else await update.message.reply_text("⚠️ 已存在")
+                elif pending == "delsymbol": sym = user_text.upper(); self.symbols.remove(sym) if sym in self.symbols else await update.message.reply_text("⚠️ 不存在")
+            else:
+                val = float(user_text)
+                if pending == "settp": pct = self._parse_pct(val); self.tp_pct = pct
+                elif pending == "setsl": self.sl_pct = self._parse_pct(val)
+                elif pending == "settsl": self.trailing_sl_pct = self._parse_pct(val)
+                elif pending == "settmpt": self.trailing_tp_pct = self._parse_pct(val)
+                elif pending == "setamount": self.single_order_usdt = val
+                elif pending == "setreserve": self.reserve_bottom = val
+                elif pending == "settrades": self.max_daily_trades = int(val)
+                elif pending == "autoscore": self.auto_min_score = int(val)
+                elif pending == "setmaxcoin": self.max_per_coin_usdt = val
+                elif pending == "setmaxloss": self.max_daily_loss_pct = val / 100.0
+            await self._save_config(); context.user_data['pending_setting'] = None; await update.message.reply_text("✅")
+        except ValueError: await update.message.reply_text("❌ 格式有误"); context.user_data['pending_setting'] = None
+
+    # ==================== 按钮回调（完整版） ====================
+    async def handle_button_click(self, update, context):
+        query = update.callback_query
+        data = query.data
+        try:
+            if data == "refresh_panel": await self.cmd_menu(update, context)
+            elif data == "toggle_filter":
+                self.orderbook_filter = not self.orderbook_filter; await self._save_config()
+                await query.answer(f"盘口过滤已{'开启' if self.orderbook_filter else '关闭'}")
+                try: await query.edit_message_reply_markup(reply_markup=self._build_main_keyboard())
+                except: pass
+            elif data == "toggle_breaker":
+                self.waterfall_breaker = not self.waterfall_breaker; await self._save_config()
+                await query.answer(f"瀑布熔断已{'开启' if self.waterfall_breaker else '关闭'}")
+                try: await query.edit_message_reply_markup(reply_markup=self._build_main_keyboard())
+                except: pass
+            elif data == "toggle_auto":
+                self.auto_trade_enabled = not self.auto_trade_enabled; await self._save_config()
+                await query.answer(f"自动交易已{'开启' if self.auto_trade_enabled else '关闭'}")
+                try: await query.edit_message_reply_markup(reply_markup=self._build_main_keyboard())
+                except: pass
+            elif data == "bot_start": self.is_running = True; await query.answer("已开启")
+            elif data == "bot_stop": self.is_running = False; await query.answer("已关机")
+            elif data == "brain_status": await self.render_brain_status(query.message); await query.answer()
+            elif data == "gap_analysis": await self.render_gap_analysis(query.message); await query.answer()
+            elif data == "dashboard":
+                auto_state = "开启" if self.auto_trade_enabled else "关闭"
+                msg = (f"📊 看板\n止盈{self.tp_pct*100:.2f}% 止损{self.sl_pct*100:.2f}%\n移损{self.trailing_sl_pct*100:.2f}% 移盈{self.trailing_tp_pct*100:.2f}%\n"
+                       f"额度{self.single_order_usdt}U 周期{self.timeframe} 底线{self.reserve_bottom}U\n"
+                       f"自动交易: {auto_state} 阈值: {self.auto_min_score}分\n单币限额: {self.max_per_coin_usdt}U\n"
+                       f"日熔断: {self.max_daily_loss_pct*100:.1f}%\n总仓位上限: {self.max_total_allocated_pct*100:.0f}%\n"
+                       f"今日交易: {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}")
+                await query.message.reply_text(msg); await query.answer()
+            elif data == "balance":
+                bal = await self.exchange.fetch_balance()
+                await query.message.reply_text(f"💳 USDT: {self._get_usdt_free(bal):.2f}"); await query.answer()
+            elif data == "history": await self.cmd_history(update, context)
+            elif data == "holdings": await self.cmd_holdings(update, context)
+            elif data == "list_symbols": await self.cmd_symbols(update, context)
+            elif data == "stats_panel": await self.cmd_stats(update, context)
+            elif data == "backup_panel": await self.cmd_backup(update, context)
+            elif data == "sync_pos":
+                bal = await self.exchange.fetch_balance()
+                await query.message.reply_text(f"🔄 持仓已刷新\n💵 USDT: {self._get_usdt_free(bal):.2f}")
+                await query.answer("已同步")
+            elif data == "menu_preset":
+                opts = [("🛡️保守","conservative"),("⚖️平衡","balanced"),("⚡激进","aggressive")]
+                kb = [[InlineKeyboardButton(label, callback_data=f"preset:{val}") for label,val in opts]]
+                kb.append([InlineKeyboardButton("🔙返回", callback_data="refresh_panel")])
+                await query.edit_message_text("⚡ 选择方案:", reply_markup=InlineKeyboardMarkup(kb)); await query.answer()
+            elif data.startswith("preset:"):
+                mode = data.split(":")[1]
+                p = {"conservative":{"tp":3,"sl":2,"tsl":1,"tmpt":1,"tf":"1h","amt":1,"reserve":2},
+                     "balanced":{"tp":1.5,"sl":1,"tsl":0.5,"tmpt":0.5,"tf":"15m","amt":1,"reserve":1},
+                     "aggressive":{"tp":0.8,"sl":0.5,"tsl":0.3,"tmpt":0.3,"tf":"5m","amt":1,"reserve":0.5}}[mode]
+                self.tp_pct=p["tp"]/100; self.sl_pct=p["sl"]/100; self.trailing_sl_pct=p["tsl"]/100; self.trailing_tp_pct=p["tmpt"]/100
+                self.timeframe=p["tf"]; self.single_order_usdt=p["amt"]; self.reserve_bottom=p["reserve"]
+                await self._save_config(); await query.answer("✅ 已生效", show_alert=True); await self._refresh_panel(query)
+            elif data == "menu_set_autoscore":
+                opts = [("70分","70"),("75分","75"),("80分","80"),("85分","85")]
+                await query.edit_message_text("🎯 阈值", reply_markup=self._build_option_keyboard(opts,"cfg_autoscore","autoscore")); await query.answer()
+            elif data == "menu_set_trades":
+                opts = [("3次","3"),("5次","5"),("10次","10"),("无限","0")]
+                await query.edit_message_text("🔢 上限", reply_markup=self._build_option_keyboard(opts,"cfg_trades","settrades")); await query.answer()
+            elif data == "menu_set_tp":
+                opts = [("3%","0.03"),("5%","0.05"),("8%","0.08")]
+                await query.edit_message_text("🎯", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp")); await query.answer()
+            elif data == "menu_set_sl":
+                opts = [("1%","0.01"),("2%","0.02"),("3%","0.03")]
+                await query.edit_message_text("🛡️", reply_markup=self._build_option_keyboard(opts,"cfg_sl","setsl")); await query.answer()
+            elif data == "menu_set_tsl":
+                opts = [("0.5%","0.005"),("1%","0.01"),("1.5%","0.015")]
+                await query.edit_message_text("📉", reply_markup=self._build_option_keyboard(opts,"cfg_tsl","settsl")); await query.answer()
+            elif data == "menu_set_tmpt":
+                opts = [("0.5%","0.005"),("1%","0.01"),("1.5%","0.015")]
+                await query.edit_message_text("🏹", reply_markup=self._build_option_keyboard(opts,"cfg_tmpt","settmpt")); await query.answer()
+            elif data == "menu_set_amount":
+                opts = [("1U","1"),("2U","2"),("5U","5")]
+                await query.edit_message_text("💵", reply_markup=self._build_option_keyboard(opts,"cfg_amt","setamount")); await query.answer()
+            elif data == "menu_set_tf":
+                opts = [("1m","1m"),("5m","5m"),("15m","15m"),("1h","1h")]
+                await query.edit_message_text("⏱", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf")); await query.answer()
+            elif data == "menu_set_reserve":
+                opts = [("0.5U","0.5"),("1U","1"),("2U","2"),("5U","5")]
+                await query.edit_message_text("🔒", reply_markup=self._build_option_keyboard(opts,"cfg_res","setreserve")); await query.answer()
+            elif data == "menu_add_symbol":
+                opts = [("BTC/USDT","BTC/USDT"),("SOL/USDT","SOL/USDT"),("DOGE/USDT","DOGE/USDT")]
+                await query.edit_message_text("➕", reply_markup=self._build_option_keyboard(opts,"cfg_add","addsymbol")); await query.answer()
+            elif data == "menu_del_symbol":
+                opts = [(s, s) for s in self.symbols]
+                await query.edit_message_text("➖", reply_markup=self._build_option_keyboard(opts,"cfg_del","delsymbol")); await query.answer()
+            elif data.startswith("cfg_"):
+                prefix = data.split(":")[0] if ":" in data else ""
+                val_str = data.split(":")[1] if ":" in data else ""
+                if prefix == "cfg_tp":
+                    val_f = float(val_str)
+                    if val_f < self.breakeven_pct: await query.answer(f"❌ 低于保本线", show_alert=True); return
+                    if self.sl_pct > 0 and val_f / self.sl_pct < 1.2: await query.answer("❌ 盈亏比不足", show_alert=True); return
+                    self.tp_pct = val_f
+                elif prefix == "cfg_sl":
+                    val_f = float(val_str)
+                    if self.tp_pct > 0 and self.tp_pct / val_f < 1.2: await query.answer("❌ 盈亏比不足", show_alert=True); return
+                    self.sl_pct = val_f
+                elif prefix == "cfg_tsl": self.trailing_sl_pct = float(val_str)
+                elif prefix == "cfg_tmpt": self.trailing_tp_pct = float(val_str)
+                elif prefix == "cfg_amt": self.single_order_usdt = float(val_str)
+                elif prefix == "cfg_tf": self.timeframe = val_str
+                elif prefix == "cfg_res": self.reserve_bottom = float(val_str)
+                elif prefix == "cfg_autoscore": self.auto_min_score = int(val_str)
+                elif prefix == "cfg_trades": self.max_daily_trades = int(val_str)
+                elif prefix == "cfg_add":
+                    if val_str not in self.symbols: self.symbols.append(val_str)
+                    else: await query.answer("已存在", show_alert=True); return
+                elif prefix == "cfg_del":
+                    if val_str in self.symbols: self.symbols.remove(val_str)
+                    else: await query.answer("不存在", show_alert=True); return
+                await self._save_config(); await query.answer("✅", show_alert=True); await self._refresh_panel(query)
+            elif data.startswith("prompt_manual:"):
+                key = data.split(":")[1]
+                context.user_data['pending_setting'] = key
+                prompts = {
+                    "settp": "✍️ 止盈率（例：6.5%）：", "setsl": "✍️ 硬止损率（例：2.5%）：",
+                    "settsl": "✍️ 移动止损回调（例：1.5%）：", "settmpt": "✍️ 移动止盈回调（例：1%）：",
+                    "setamount": "✍️ 单笔 USDT（例：150）：", "settf": "✍️ K线周期（例：15m）：",
+                    "setreserve": "✍️ 安全底线（例：100）：", "addsymbol": "✍️ 币种（例：DOGE/USDT）：",
+                    "delsymbol": "✍️ 要删除的币种：", "autoscore": "✍️ 信号阈值（50-95）：",
+                    "settrades": "✍️ 单日最大交易次数：", "setmaxcoin": "✍️ 单币最大持仓U：",
+                    "setmaxloss": "✍️ 日熔断百分比（例：5）：",
+                }
+                await query.message.reply_text(prompts.get(key, "✍️ 请输入数值："), reply_markup=ForceReply(selective=True), parse_mode="Markdown")
+                await query.answer()
+            elif data == "panic_confirm":
+                await query.answer("🚨 请发送 /panic 确认", show_alert=True)
+            else:
+                logger.warning(f"未处理的按钮: {data}")
+                await query.answer("此按钮暂未绑定功能", show_alert=True)
+        except Exception as e:
+            logger.error(f"按钮异常 ({data}): {e}")
+            try: await query.answer("操作失败，请重试", show_alert=True)
+            except: pass
+
+    async def _refresh_panel(self, query):
+        try: await query.edit_message_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
+        except: pass
+
+    async def panic_sell_all(self):
+        for sym in self.symbols:
+            await self.exchange.cancel_all_orders(sym)
+            bal = await self.exchange.fetch_balance()
+            coin = sym.split('/')[0]
+            amount = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else 0
+            if isinstance(amount, (int, float)) and amount > 0:
+                await self.exchange.create_market_sell_order(sym, amount)
+
+    # ==================== 自动交易（动态网格、多重熔断） ====================
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
         while True:
@@ -599,6 +1023,7 @@ class QuantBot:
                 logger.error(f"追踪任务异常: {e}")
                 await asyncio.sleep(5)
 
+    # ==================== 自适应学习 ====================
     async def _learn_from_trades(self):
         if not self.learning_enabled: return
         now = asyncio.get_event_loop().time()
@@ -623,6 +1048,7 @@ class QuantBot:
                 try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text=f"🧠 自适应调整：胜率{win_rate:.0%}，阈值→{self.auto_min_score}，仓位→{self.single_order_usdt}U")
                 except: pass
 
+    # ==================== 启动 ====================
     async def run(self):
         await self.load_and_init()
         if not self.tg_app: return
@@ -634,9 +1060,9 @@ class QuantBot:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ Bot 最终优化版启动")
+                logger.info("✅ Bot 最终完整版启动")
                 if settings.TG_CHAT_ID:
-                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (全优化版)")
+                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (完整优化版)")
                     except: pass
                 while True: await asyncio.sleep(30)
             except Exception as e:
