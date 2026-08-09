@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（兼容余额结构）
+exchange.py - 多交易所管理器（余额结构最终修复版）
 """
 import os, random, asyncio
 import ccxt.async_support as ccxt
@@ -96,41 +96,42 @@ class ExchangeManager:
         return 1.0
 
     async def fetch_balance(self):
-        """获取余额，兼容多种数据结构，修复字符串索引错误"""
+        """获取余额（最终修复版，杜绝类型错误）"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
             raw = await self.exchange.fetch_balance()
             logger.info(f"余额原始数据: {raw}")
 
-            # 1. 标准 CCXT 格式：{'USDT': {'free': xxx, 'used': xxx, 'total': xxx}}
-            if 'USDT' in raw and isinstance(raw['USDT'], dict):
-                usdt_data = raw['USDT']
-                free = usdt_data.get('free', usdt_data.get('total', 0))
+            # 1. raw['USDT'] 是字典 → 直接取 free
+            usdt = raw.get('USDT', None)
+            if isinstance(usdt, dict):
+                free = usdt.get('free', usdt.get('total', 0))
                 return {'USDT': {'free': float(free)}}
 
-            # 2. 自由格式：{'free': {'USDT': xxx}}
-            if 'free' in raw and isinstance(raw['free'], dict) and 'USDT' in raw['free']:
-                return {'USDT': {'free': float(raw['free']['USDT'])}}
+            # 2. raw['USDT'] 是数值 → 直接返回
+            if isinstance(usdt, (int, float)):
+                return {'USDT': {'free': float(usdt)}}
 
-            # 3. 总量格式：{'total': {'USDT': xxx}}
-            if 'total' in raw and isinstance(raw['total'], dict) and 'USDT' in raw['total']:
-                return {'USDT': {'free': float(raw['total']['USDT'])}}
+            # 3. raw['free'] 是字典且含 USDT
+            free_dict = raw.get('free', None)
+            if isinstance(free_dict, dict) and 'USDT' in free_dict:
+                return {'USDT': {'free': float(free_dict['USDT'])}}
 
-            # 4. 直接数值：{'USDT': 5000}
-            if 'USDT' in raw and isinstance(raw['USDT'], (int, float)):
-                return {'USDT': {'free': float(raw['USDT'])}}
+            # 4. raw['total'] 是字典且含 USDT
+            total_dict = raw.get('total', None)
+            if isinstance(total_dict, dict) and 'USDT' in total_dict:
+                return {'USDT': {'free': float(total_dict['USDT'])}}
 
-            # 5. 遍历查找（仅当值为字典或数值时处理）
+            # 5. 遍历查找（严格类型过滤）
             for key, val in raw.items():
+                if not isinstance(val, dict):
+                    continue
                 if 'USDT' in str(key).upper():
-                    if isinstance(val, dict):
-                        free_val = val.get('free', val.get('total', 0))
-                        return {'USDT': {'free': float(free_val)}}
-                    elif isinstance(val, (int, float)):
-                        return {'USDT': {'free': float(val)}}
+                    free_val = val.get('free', val.get('total', 0))
+                    return {'USDT': {'free': float(free_val)}}
 
-            logger.warning(f"无法解析余额结构: {raw}")
+            logger.warning(f"无法解析余额: {raw}")
         except Exception as e:
             logger.error(f"获取余额失败: {e}")
         return {'USDT': {'free': 0}}
