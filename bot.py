@@ -750,7 +750,31 @@ class QuantBot:
         await self.tg_app.updater.start_polling(drop_pending_updates=True)
         logger.info("✅ Bot 长轮询模式启动")
 
-        # 启动后台任务
+        # ========== 发送启动通知 ==========
+        if settings.TG_CHAT_ID and self.tg_app.bot:
+            try:
+                await self.tg_app.bot.send_message(
+                    chat_id=settings.TG_CHAT_ID,
+                    text=(
+                        f"🤖 **量化机器人已启动**\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        f"📌 版本: 完全体 v2.0\n"
+                        f"🔧 模式: 长轮询\n"
+                        f"{self.env_tag}\n"
+                        f"🤖 自动交易: {'🟢 开启' if self.auto_trade_enabled else '🔴 关闭'}\n"
+                        f"📊 监控: {', '.join(self.symbols[:3])}\n"
+                        f"🎯 阈值: {self.auto_min_score} 分\n"
+                        f"💰 保本线: >{self.breakeven_pct*100:.2f}%\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        f"发送 /menu 打开控制台"
+                    ),
+                    parse_mode="Markdown"
+                )
+                logger.info("📲 启动通知已发送")
+            except Exception as e:
+                logger.warning(f"发送启动通知失败: {e}")
+
+        # 启动后台任务（自动交易、移动止盈追踪）
         asyncio.create_task(self._auto_trade_monitor())
         asyncio.create_task(self._trailing_monitor())
 
