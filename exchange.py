@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（假数据剔除版：失败返回 None，绝不造假）
+exchange.py - 多交易所管理器（现价校验 + 假数据剔除）
 """
 import os
 import asyncio
@@ -59,7 +59,18 @@ class ExchangeManager:
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try:
-                return await self.exchange.fetch_ticker(symbol)
+                ticker = await self.exchange.fetch_ticker(symbol)
+                if ticker and 'last' in ticker:
+                    # 现价合理性校验：如果价格与上一次相差超过 20%，记录警告但仍返回
+                    # 但不阻止交易，由上层决定
+                    if not hasattr(self, '_last_prices'):
+                        self._last_prices = {}
+                    if symbol in self._last_prices and ticker['last'] > 0:
+                        change = abs(ticker['last'] - self._last_prices[symbol]) / self._last_prices[symbol]
+                        if change > 0.2:
+                            logger.warning(f"⚠️ 价格异常波动 ({symbol}): {change:.1%}")
+                    self._last_prices[symbol] = ticker['last']
+                    return ticker
             except Exception as e:
                 logger.warning(f"获取现价失败 {symbol}: {e}")
         return None
