@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
     "max_daily_trades": 0,
     "auto_trade_enabled": False,
     "auto_min_score": 75
+    "max_per_coin_usdt": 0,
 }
 
 async def init_db():
