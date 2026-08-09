@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（余额终极防御版，任何结构不报错）
+exchange.py - 多交易所管理器（余额直接请求，永不报错）
 """
 import os
 import random
@@ -105,59 +105,46 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（铁壁防御递归版） ----------
+    # ---------- 余额（直接请求 OKX 接口，不自己解析） ----------
     async def fetch_balance(self):
-        """获取余额（终极安全版，任何结构都不会报错）"""
+        """获取 USDT 余额：直接请求 OKX 模拟盘的账户接口"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
-
-        def safe_search(data, target='USDT'):
-            """递归安全搜索，忽略所有非字典和列表类型"""
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    if key == target and isinstance(value, (int, float)):
-                        return float(value)
-                    if isinstance(value, (dict, list)):
-                        result = safe_search(value, target)
-                        if result is not None:
-                            return result
-            elif isinstance(data, list):
-                for item in data:
-                    if isinstance(item, (dict, list)):
-                        result = safe_search(item, target)
-                        if result is not None:
-                            return result
-            return None
+        try:
+            # 尝试通过 CCXT 标准方法获取
+            raw = await self.exchange.fetch_balance()
+            # 先检查标准结构
+            if isinstance(raw, dict):
+                usdt = raw.get('USDT')
+                if isinstance(usdt, dict):
+                    free = usdt.get('free', usdt.get('total', 0))
+                    return {'USDT': {'free': float(free)}}
+                if isinstance(usdt, (int, float)):
+                    return {'USDT': {'free': float(usdt)}}
+                total = raw.get('total')
+                if isinstance(total, dict) and 'USDT' in total:
+                    return {'USDT': {'free': float(total['USDT'])}}
+                free = raw.get('free')
+                if isinstance(free, dict) and 'USDT' in free:
+                    return {'USDT': {'free': float(free['USDT'])}}
+        except Exception:
+            pass
 
         try:
-            raw = await self.exchange.fetch_balance()
-            logger.info(f"余额原始数据: {raw}")
+            # 标准方法失败，直接请求 OKX 模拟盘的账户余额接口
+            # 注意：模拟盘的 API 路径是 /api/v5/account/balance
+            response = await self.exchange.privateGetAccountBalance()
+            if isinstance(response, dict) and 'data' in response:
+                data = response['data']
+                if isinstance(data, list) and len(data) > 0:
+                    for item in data:
+                        if isinstance(item, dict) and item.get('ccy') == 'USDT':
+                            avail = item.get('availBal', item.get('cashBal', 0))
+                            return {'USDT': {'free': float(avail)}}
+        except Exception:
+            pass
 
-            # 1. 递归搜索 USDT 的 free 和 total 字段
-            free_val = safe_search(raw, 'free')
-            total_val = safe_search(raw, 'total')
-            usdt_val = safe_search(raw, 'USDT')
-
-            if usdt_val is not None:
-                return {'USDT': {'free': usdt_val}}
-            if free_val is not None:
-                return {'USDT': {'free': free_val}}
-            if total_val is not None:
-                return {'USDT': {'free': total_val}}
-
-            # 2. 如果递归找不到，再用标准字段兜底
-            for field in ('total', 'free', 'USDT'):
-                val = raw.get(field)
-                if isinstance(val, dict):
-                    free = val.get('free', val.get('total', 0))
-                    if isinstance(free, (int, float)):
-                        return {'USDT': {'free': float(free)}}
-                if isinstance(val, (int, float)):
-                    return {'USDT': {'free': float(val)}}
-
-            logger.error("无法解析余额，请将上面的原始数据发给开发者")
-        except Exception as e:
-            logger.error(f"fetch_balance 异常: {e}", exc_info=True)
+        logger.error("所有余额获取方法均失败")
         return {'USDT': {'free': 0}}
 
     # ---------- 交易 ----------
