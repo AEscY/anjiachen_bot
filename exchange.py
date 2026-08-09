@@ -1,177 +1,41 @@
-"""
-exchange.py - 多交易所管理器（兼容余额结构与防滑点下单）
-"""
-import os, random, asyncio
-import ccxt.async_support as ccxt
-from config import settings, logger
-
-class ExchangeManager:
-    def __init__(self):
-        self.exchange = None
-        self._init_exchange()
-
-    def _get_credentials(self):
-        name = settings.EXCHANGE_NAME
-        if name == 'okx':
-            key = settings.OKX_API_KEY or settings.API_KEY
-            secret = settings.OKX_SECRET_KEY or settings.SECRET_KEY
-            password = settings.OKX_PASSPHRASE or settings.PASSWORD
-        elif name == 'binance':
-            key = os.getenv('BINANCE_API_KEY', '') or settings.API_KEY
-            secret = os.getenv('BINANCE_SECRET_KEY', '') or settings.SECRET_KEY
-            password = settings.PASSWORD
-        else:
-            key = settings.API_KEY
-            secret = settings.SECRET_KEY
-            password = settings.PASSWORD
-        return key, secret, password
-
-    def _init_exchange(self):
-        name = settings.EXCHANGE_NAME
-        key, secret, password = self._get_credentials()
-        if not key:
-            logger.warning(f"⚠️ 未配置 {name} API 密钥，将使用模拟数据")
-            return
-        try:
-            exchange_class = getattr(ccxt, name, None)
-            if exchange_class is None:
-                logger.error(f"❌ 不支持的交易所: {name}")
-                return
-            config = {'apiKey': key, 'secret': secret, 'enableRateLimit': True}
-            if name in ('okx', 'bybit'):
-                config['password'] = password
-            self.exchange = exchange_class(config)
-
-            if settings.IS_SANDBOX:
-                if name == 'okx':
-                    self.exchange.urls['api'] = 'https://aws.okx.com'
-                    logger.info("🧪 OKX 模拟盘模式已启用")
-                elif name == 'binance':
-                    self.exchange.urls['api'] = self.exchange.urls['test']
-
-            logger.info(f"✅ 交易所连接成功: {name}")
-        except Exception as e:
-            logger.warning(f"交易所连接失败 ({name}): {e}")
-
-    async def fetch_ticker(self, symbol):
-        if self.exchange:
-            try: return await self.exchange.fetch_ticker(symbol)
-            except: pass
-        return {'last': random.uniform(3000, 3200)}
-
-    async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
-        if not self.exchange:
-            logger.warning("交易所未连接，无法获取K线")
-            return []
-        for attempt in range(3):
-            try:
-                data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-                if data and len(data) > 0:
-                    return data
-            except Exception as e:
-                logger.warning(f"K线获取失败 (第{attempt+1}次): {e}")
-            await asyncio.sleep(2)
-        return []
-
-    async def fetch_orderbook(self, symbol, limit=5):
-        if self.exchange:
-            try: return await self.exchange.fetch_order_book(symbol, limit)
-            except: pass
-        ticker = await self.fetch_ticker(symbol)
-        p = ticker['last']
-        return {'bids': [[p * 0.9998, 12.5]], 'asks': [[p * 1.0002, 10.2]]}
-
-    async def fetch_funding_rate(self, symbol):
-        if self.exchange:
-            try:
-                res = await self.exchange.fetch_funding_rate(symbol)
-                return res.get('fundingRate', 0) if isinstance(res, dict) else 0
-            except: pass
-        return 0
-
-    async def fetch_long_short_ratio(self, symbol):
-        if self.exchange:
-            try: return await self.exchange.fetch_long_short_ratio(symbol)
-            except: pass
-        return 1.0
-
-    async def fetch_balance(self):
-        """获取余额，兼容多种数据结构，修复字符串索引错误"""
+async def fetch_balance(self):
+        """获取余额（极简安全版，打印原始结构以便调试）"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
             raw = await self.exchange.fetch_balance()
+            # 打印完整结构和各键的类型，帮助我们一次性定位问题
             logger.info(f"余额原始数据: {raw}")
+            for k, v in raw.items():
+                logger.info(f"  键: {k}, 类型: {type(v).__name__}, 值预览: {str(v)[:100]}")
 
-            if 'USDT' in raw and isinstance(raw['USDT'], dict):
-                usdt_data = raw['USDT']
-                free = usdt_data.get('free', usdt_data.get('total', 0))
-                return {'USDT': {'free': float(free)}}
+            # 1. 优先使用 CCXT 标准字段 'total'
+            total = raw.get('total')
+            if isinstance(total, dict) and 'USDT' in total:
+                return {'USDT': {'free': float(total['USDT'])}}
 
-            if 'free' in raw and isinstance(raw['free'], dict) and 'USDT' in raw['free']:
-                return {'USDT': {'free': float(raw['free']['USDT'])}}
+            # 2. 其次使用 'free'
+            free = raw.get('free')
+            if isinstance(free, dict) and 'USDT' in free:
+                return {'USDT': {'free': float(free['USDT'])}}
 
-            if 'total' in raw and isinstance(raw['total'], dict) and 'USDT' in raw['total']:
-                return {'USDT': {'free': float(raw['total']['USDT'])}}
+            # 3. 尝试直接取 'USDT' 键
+            usdt = raw.get('USDT')
+            if isinstance(usdt, dict):
+                return {'USDT': {'free': float(usdt.get('free', usdt.get('total', 0)))}}
+            if isinstance(usdt, (int, float)):
+                return {'USDT': {'free': float(usdt)}}
 
-            if 'USDT' in raw and isinstance(raw['USDT'], (int, float)):
-                return {'USDT': {'free': float(raw['USDT'])}}
-
+            # 4. 遍历所有键，只处理 dict 类型的值，且键包含 USDT
             for key, val in raw.items():
+                if not isinstance(val, dict):
+                    continue
                 if 'USDT' in str(key).upper():
-                    if isinstance(val, dict):
-                        free_val = val.get('free', val.get('total', 0))
-                        return {'USDT': {'free': float(free_val)}}
-                    elif isinstance(val, (int, float)):
-                        return {'USDT': {'free': float(val)}}
+                    free_val = val.get('free', val.get('total', 0))
+                    return {'USDT': {'free': float(free_val)}}
 
-            logger.warning(f"无法解析余额结构: {raw}")
+            # 如果以上都找不到，返回 0，并提示用户发送日志
+            logger.error(f"无法解析余额，请将上面的日志发送给开发者")
         except Exception as e:
-            logger.error(f"获取余额失败: {e}")
+            logger.error(f"获取余额失败: {e}", exc_info=True)
         return {'USDT': {'free': 0}}
-
-    async def create_smart_buy_order(self, symbol, amount, max_slippage=0.005):
-        """带有滑点限制的智能买单，无法提交时回退到市价单"""
-        if self.exchange:
-            try:
-                ticker = await self.fetch_ticker(symbol)
-                max_price = ticker['last'] * (1 + max_slippage)
-                return await self.exchange.create_order(symbol, 'limit', 'buy', amount, max_price, {'timeInForce': 'IOC'})
-            except Exception as e:
-                logger.warning(f"防滑点买单回退市价单 ({symbol}): {e}")
-                return await self.create_market_buy_order(symbol, amount)
-        return None
-
-    async def create_smart_sell_order(self, symbol, amount, max_slippage=0.005):
-        """带有滑点限制的智能卖单，无法提交时回退到市价单"""
-        if self.exchange:
-            try:
-                ticker = await self.fetch_ticker(symbol)
-                min_price = ticker['last'] * (1 - max_slippage)
-                return await self.exchange.create_order(symbol, 'limit', 'sell', amount, min_price, {'timeInForce': 'IOC'})
-            except Exception as e:
-                logger.warning(f"防滑点卖单回退市价单 ({symbol}): {e}")
-                return await self.create_market_sell_order(symbol, amount)
-        return None
-
-    async def create_market_buy_order(self, symbol, amount):
-        if self.exchange:
-            try: return await self.exchange.create_order(symbol, 'market', 'buy', amount)
-            except: pass
-        return None
-
-    async def create_market_sell_order(self, symbol, amount):
-        if self.exchange:
-            try: return await self.exchange.create_order(symbol, 'market', 'sell', amount)
-            except: pass
-        return None
-
-    async def cancel_all_orders(self, symbol):
-        if self.exchange:
-            try: return await self.exchange.cancel_all_orders(symbol)
-            except: pass
-        return True
-
-    async def close(self):
-        if self.exchange:
-            await self.exchange.close()
