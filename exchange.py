@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（增加K线重试）
+exchange.py - 多交易所管理器（增加K线重试和日志）
 """
 import os, random, asyncio
 import ccxt.async_support as ccxt
@@ -57,22 +57,25 @@ class ExchangeManager:
         return {'last': random.uniform(3000, 3200)}
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
-        """获取K线，失败时重试三次"""
-        if self.exchange:
-            for attempt in range(3):
-                try:
-                    logger.info(f"📊 获取K线 {symbol} {timeframe} (第{attempt+1}次)")
-                    data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-                    if data and len(data) > 0:
-                        logger.info(f"✅ K线获取成功 {symbol}: {len(data)}条")
-                        return data
-                    else:
-                        logger.warning(f"⚠️ K线为空 {symbol}，等待重试...")
-                        await asyncio.sleep(2)
-                except Exception as e:
-                    logger.warning(f"K线获取失败 {symbol} (第{attempt+1}次): {e}")
-                    await asyncio.sleep(2)
-            logger.error(f"❌ K线获取彻底失败 {symbol}")
+        """获取K线，失败时重试，并在日志中详细记录"""
+        if not self.exchange:
+            logger.warning("交易所未连接，无法获取K线")
+            return []
+
+        for attempt in range(3):
+            try:
+                logger.info(f"📊 获取K线 {symbol} {timeframe} (第{attempt+1}次)")
+                data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                if data and len(data) > 0:
+                    logger.info(f"✅ K线获取成功 {symbol}: {len(data)}条, 最新时间 {data[-1][0]}")
+                    return data
+                else:
+                    logger.warning(f"⚠️ K线为空 {symbol}")
+            except Exception as e:
+                logger.warning(f"K线获取失败 {symbol} (第{attempt+1}次): {e}")
+            await asyncio.sleep(2)
+
+        logger.error(f"❌ K线获取彻底失败 {symbol}")
         return []
 
     async def fetch_orderbook(self, symbol, limit=5):
