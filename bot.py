@@ -776,20 +776,24 @@ class QuantBot:
                 await asyncio.sleep(5)
 
     # ==================== 启动 (Webhook 模式) ====================
-    async def run(self):
+   async def run(self):
         await self.load_and_init()
-        if not self.tg_app: return
+        if not self.tg_app:
+            logger.error("TG app 未初始化")
+            return
+        # 清理可能残留的 webhook
+        await self.tg_app.bot.delete_webhook(drop_pending_updates=True)
+
+        # 启动长轮询（稳定方案）
         await self.tg_app.initialize()
         await self.tg_app.start()
-        webhook_url = settings.WEBHOOK_URL + "/webhook"
-        await self.tg_app.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set to {webhook_url}")
+        await self.tg_app.updater.start_polling(drop_pending_updates=True)
+        logger.info("✅ Bot 长轮询模式启动")
+
+        # 启动后台任务（自动交易、移动止盈追踪）
         asyncio.create_task(self._auto_trade_monitor())
         asyncio.create_task(self._trailing_monitor())
-        await self.tg_app.run_webhook(
-            listen="0.0.0.0",
-            port=settings.PORT,
-            url_path="webhook",
-            webhook_url=webhook_url,
-            drop_pending_updates=True
-        )
+
+        # 保持主循环运行
+        while True:
+            await asyncio.sleep(30)
