@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（兼容余额结构 & 智能滑点保护）
+exchange.py - 多交易所管理器（兼容余额结构与防滑点下单）
 """
 import os, random, asyncio
 import ccxt.async_support as ccxt
@@ -96,48 +96,61 @@ class ExchangeManager:
         return 1.0
 
     async def fetch_balance(self):
+        """获取余额，兼容多种数据结构，修复字符串索引错误"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
             raw = await self.exchange.fetch_balance()
+            logger.info(f"余额原始数据: {raw}")
+
             if 'USDT' in raw and isinstance(raw['USDT'], dict):
-                free = raw['USDT'].get('free', raw['USDT'].get('total', 0))
+                usdt_data = raw['USDT']
+                free = usdt_data.get('free', usdt_data.get('total', 0))
                 return {'USDT': {'free': float(free)}}
+
             if 'free' in raw and isinstance(raw['free'], dict) and 'USDT' in raw['free']:
                 return {'USDT': {'free': float(raw['free']['USDT'])}}
+
             if 'total' in raw and isinstance(raw['total'], dict) and 'USDT' in raw['total']:
                 return {'USDT': {'free': float(raw['total']['USDT'])}}
+
             if 'USDT' in raw and isinstance(raw['USDT'], (int, float)):
                 return {'USDT': {'free': float(raw['USDT'])}}
+
             for key, val in raw.items():
                 if 'USDT' in str(key).upper():
                     if isinstance(val, dict):
-                        return {'USDT': {'free': float(val.get('free', val.get('total', 0)))}}
+                        free_val = val.get('free', val.get('total', 0))
+                        return {'USDT': {'free': float(free_val)}}
                     elif isinstance(val, (int, float)):
                         return {'USDT': {'free': float(val)}}
+
+            logger.warning(f"无法解析余额结构: {raw}")
         except Exception as e:
             logger.error(f"获取余额失败: {e}")
         return {'USDT': {'free': 0}}
 
     async def create_smart_buy_order(self, symbol, amount, max_slippage=0.005):
-        """防滑点智能买单"""
+        """带有滑点限制的智能买单，无法提交时回退到市价单"""
         if self.exchange:
             try:
                 ticker = await self.fetch_ticker(symbol)
-                price = ticker['last'] * (1 + max_slippage)
-                return await self.exchange.create_order(symbol, 'limit', 'buy', amount, price, {'timeInForce': 'IOC'})
-            except Exception:
+                max_price = ticker['last'] * (1 + max_slippage)
+                return await self.exchange.create_order(symbol, 'limit', 'buy', amount, max_price, {'timeInForce': 'IOC'})
+            except Exception as e:
+                logger.warning(f"防滑点买单回退市价单 ({symbol}): {e}")
                 return await self.create_market_buy_order(symbol, amount)
         return None
 
     async def create_smart_sell_order(self, symbol, amount, max_slippage=0.005):
-        """防滑点智能卖单"""
+        """带有滑点限制的智能卖单，无法提交时回退到市价单"""
         if self.exchange:
             try:
                 ticker = await self.fetch_ticker(symbol)
-                price = ticker['last'] * (1 - max_slippage)
-                return await self.exchange.create_order(symbol, 'limit', 'sell', amount, price, {'timeInForce': 'IOC'})
-            except Exception:
+                min_price = ticker['last'] * (1 - max_slippage)
+                return await self.exchange.create_order(symbol, 'limit', 'sell', amount, min_price, {'timeInForce': 'IOC'})
+            except Exception as e:
+                logger.warning(f"防滑点卖单回退市价单 ({symbol}): {e}")
                 return await self.create_market_sell_order(symbol, amount)
         return None
 
