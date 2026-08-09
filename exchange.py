@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（修复 OKX 模拟盘 K 线）
+exchange.py - 多交易所管理器（兼容余额结构）
 """
 import os, random, asyncio
 import ccxt.async_support as ccxt
@@ -41,17 +41,14 @@ class ExchangeManager:
             if name in ('okx', 'bybit'):
                 config['password'] = password
             self.exchange = exchange_class(config)
-            
-            # --- 模拟盘配置修复 ---
+
             if settings.IS_SANDBOX:
                 if name == 'okx':
-                    # 关键：使用 OKX 模拟盘专用 API 地址
                     self.exchange.urls['api'] = 'https://aws.okx.com'
                     logger.info("🧪 OKX 模拟盘模式已启用")
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
-            # --------------------
-            
+
             logger.info(f"✅ 交易所连接成功: {name}")
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
@@ -63,7 +60,6 @@ class ExchangeManager:
         return {'last': random.uniform(3000, 3200)}
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
-        """获取K线，失败时重试"""
         if not self.exchange:
             logger.warning("交易所未连接，无法获取K线")
             return []
@@ -100,9 +96,30 @@ class ExchangeManager:
         return 1.0
 
     async def fetch_balance(self):
+        """兼容多种余额返回结构"""
         if self.exchange:
-            try: return await self.exchange.fetch_balance()
-            except: pass
+            try:
+                raw = await self.exchange.fetch_balance()
+                logger.info(f"余额原始数据: {raw}")
+                if 'USDT' in raw:
+                    if isinstance(raw['USDT'], dict):
+                        return {'USDT': {'free': float(raw['USDT'].get('free', 0))}}
+                    elif isinstance(raw['USDT'], (int, float)):
+                        return {'USDT': {'free': float(raw['USDT'])}}
+                if 'total' in raw and 'USDT' in raw['total']:
+                    return {'USDT': {'free': float(raw['total']['USDT'])}}
+                if 'free' in raw and 'USDT' in raw['free']:
+                    return {'USDT': {'free': float(raw['free']['USDT'])}}
+                for key in raw:
+                    if 'USDT' in str(key).upper():
+                        val = raw[key]
+                        if isinstance(val, dict) and 'free' in val:
+                            return {'USDT': {'free': float(val['free'])}}
+                        elif isinstance(val, (int, float)):
+                            return {'USDT': {'free': float(val)}}
+                logger.warning(f"无法解析余额: {raw}")
+            except Exception as e:
+                logger.error(f"获取余额失败: {e}")
         return {'USDT': {'free': 0}}
 
     async def create_market_buy_order(self, symbol, amount):
