@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化机器人（条件看板 + 单币限额 + 盈亏比校验）
+bot.py - 完全体量化机器人（余额修复 + 条件看板 + 限额 + 盈亏比）
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -125,7 +125,7 @@ class QuantBot:
         self.max_daily_trades = 0
         self.auto_trade_enabled = False
         self.auto_min_score = 75
-        self.max_per_coin_usdt = 0   # 新增：单币种持仓限额
+        self.max_per_coin_usdt = 0
 
         self.taker_fee = settings.TAKER_FEE
         self.maker_fee = settings.MAKER_FEE
@@ -161,11 +161,26 @@ class QuantBot:
                 CommandHandler("preset", self.cmd_preset), CommandHandler("history", self.cmd_history),
                 CommandHandler("autotrade", self.cmd_autotrade), CommandHandler("autoscore", self.cmd_autoscore),
                 CommandHandler("holdings", self.cmd_holdings),
-                CommandHandler("setmaxcoin", self.cmd_set_max_coin),   # 新增
+                CommandHandler("setmaxcoin", self.cmd_set_max_coin),
             ]
             for h in handlers: self.tg_app.add_handler(h)
             self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
             self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+
+    # ---------- 余额辅助 ----------
+    def _get_usdt_free(self, bal):
+        """兼容多种余额数据结构"""
+        try:
+            usdt = bal.get('USDT', {})
+            if isinstance(usdt, dict):
+                free = usdt.get('free', 0)
+            elif isinstance(usdt, (int, float)):
+                free = usdt
+            else:
+                free = 0
+            return float(free)
+        except:
+            return 0
 
     async def load_and_init(self):
         await init_db()
@@ -183,7 +198,7 @@ class QuantBot:
         self.max_daily_trades = cfg.get('max_daily_trades', 0)
         self.auto_trade_enabled = cfg.get('auto_trade_enabled', False)
         self.auto_min_score = cfg.get('auto_min_score', 75)
-        self.max_per_coin_usdt = cfg.get('max_per_coin_usdt', 0)    # 加载限额
+        self.max_per_coin_usdt = cfg.get('max_per_coin_usdt', 0)
         self.trades = await load_trades()
 
     async def _save_config(self):
@@ -195,7 +210,7 @@ class QuantBot:
             'orderbook_filter': self.orderbook_filter, 'waterfall_breaker': self.waterfall_breaker,
             'max_daily_trades': self.max_daily_trades,
             'auto_trade_enabled': self.auto_trade_enabled, 'auto_min_score': self.auto_min_score,
-            'max_per_coin_usdt': self.max_per_coin_usdt   # 保存限额
+            'max_per_coin_usdt': self.max_per_coin_usdt
         }
         await save_config(cfg)
 
@@ -295,7 +310,6 @@ class QuantBot:
         except: pass
 
     async def cmd_set_max_coin(self, update, context):
-        """设置单币种最大持仓限额"""
         if not self._auth(update): return
         try:
             self.max_per_coin_usdt = float(context.args[0])
@@ -366,16 +380,15 @@ class QuantBot:
                 pnl_pct = ((p - self.entries[sym]) / self.entries[sym]) * 100
                 pnl = f" | {'🟢' if pnl_pct>=0 else '🔴'} {pnl_pct:+.2f}%"
             lines.append(f"{sym}: {free:.4f} 现价{p:.2f} 价值{val:.2f}{pnl}")
-        lines.append(f"💵 USDT: {bal.get('USDT',{}).get('free',0):.2f}")
+        lines.append(f"💵 USDT: {self._get_usdt_free(bal):.2f}")
         await update.effective_message.reply_text("\n".join(lines))
 
-    # ============ 条件看板 ============
     async def cmd_check(self, update, context):
         if not self._auth(update): return
         lines = ["📈 **信号 + 开仓条件**\n"]
         fg = (await self.real_data.get_fear_greed_index())["value"]
         bal = await self.exchange.fetch_balance()
-        usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
+        usdt_free = self._get_usdt_free(bal)
 
         for sym in self.symbols:
             ticker = await self.exchange.fetch_ticker(sym)
@@ -454,7 +467,6 @@ class QuantBot:
             f"保本线: >{self.breakeven_pct*100:.2f}%"
         )
 
-    # ============ 盈亏比强制校验 ============
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
@@ -663,13 +675,13 @@ class QuantBot:
                 await query.message.reply_text(msg); await query.answer()
             elif data == "balance":
                 bal = await self.exchange.fetch_balance()
-                await query.message.reply_text(f"💳 USDT: {bal.get('USDT',{}).get('free',0):.2f}"); await query.answer()
+                await query.message.reply_text(f"💳 USDT: {self._get_usdt_free(bal):.2f}"); await query.answer()
             elif data == "history": await self.cmd_history(update, context)
             elif data == "holdings": await self.cmd_holdings(update, context)
             elif data == "list_symbols": await self.cmd_symbols(update, context)
             elif data == "sync_pos":
                 bal = await self.exchange.fetch_balance()
-                await query.message.reply_text(f"🔄 持仓已刷新\n💵 USDT: {bal.get('USDT',{}).get('free',0):.2f}")
+                await query.message.reply_text(f"🔄 持仓已刷新\n💵 USDT: {self._get_usdt_free(bal):.2f}")
                 await query.answer("已同步")
             elif data == "menu_preset":
                 opts = [("🛡️保守","conservative"),("⚖️平衡","balanced"),("⚡激进","aggressive")]
@@ -798,20 +810,19 @@ class QuantBot:
                     await asyncio.sleep(30); continue
                 fg = (await self.real_data.get_fear_greed_index())["value"]
                 bal = await self.exchange.fetch_balance()
-                usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
+                usdt_free = self._get_usdt_free(bal)
                 if usdt_free < self.single_order_usdt + self.reserve_bottom:
                     await asyncio.sleep(30); continue
                 for sym in self.symbols:
                     coin = sym.split('/')[0]
                     free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
                     if free > 0.0001:
-                        # 单币种限额检查
                         if self.max_per_coin_usdt > 0:
                             ticker_tmp = await self.exchange.fetch_ticker(sym)
                             coin_value = free * ticker_tmp['last']
                             if coin_value >= self.max_per_coin_usdt:
                                 continue
-                        continue   # 已有持仓，跳过
+                        continue
                     ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
                     tech = await self.tech.calc(sym, self.timeframe, 50)
                     funding = await self.exchange.fetch_funding_rate(sym)
@@ -895,7 +906,7 @@ class QuantBot:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ Bot 长轮询模式启动 (条件看板+限额+盈亏比)")
+                logger.info("✅ Bot 长轮询模式启动 (余额修复)")
 
                 if settings.TG_CHAT_ID and self.tg_app.bot:
                     try:
@@ -904,7 +915,7 @@ class QuantBot:
                             text=(
                                 f"🤖 **量化机器人已上线**\n"
                                 f"━━━━━━━━━━━━━━\n"
-                                f"📌 版本: v3.1 条件看板\n"
+                                f"📌 版本: v3.2 余额修复\n"
                                 f"🔧 模式: 长轮询 (自动重连)\n"
                                 f"{self.env_tag}\n"
                                 f"🤖 自动交易: {'🟢 开启' if self.auto_trade_enabled else '🔴 关闭'}\n"
