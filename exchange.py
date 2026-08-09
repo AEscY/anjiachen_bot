@@ -1,9 +1,7 @@
 """
-exchange.py - 多交易所管理器
-根据 EXCHANGE_NAME 环境变量自动切换交易所，支持 OKX、Binance 等。
+exchange.py - 多交易所管理器（增加K线重试）
 """
-import os
-import random
+import os, random, asyncio
 import ccxt.async_support as ccxt
 from config import settings, logger
 
@@ -13,7 +11,6 @@ class ExchangeManager:
         self._init_exchange()
 
     def _get_credentials(self):
-        """根据交易所名称返回 API 密钥"""
         name = settings.EXCHANGE_NAME
         if name == 'okx':
             key = settings.OKX_API_KEY or settings.API_KEY
@@ -41,15 +38,9 @@ class ExchangeManager:
                 logger.error(f"❌ 不支持的交易所: {name}")
                 return
             config = {'apiKey': key, 'secret': secret, 'enableRateLimit': True}
-            # 部分交易所需要额外字段
-            if name == 'okx':
+            if name in ('okx', 'bybit'):
                 config['password'] = password
-            elif name == 'bybit':
-                config['password'] = password
-
             self.exchange = exchange_class(config)
-
-            # 模拟盘设置
             if settings.IS_SANDBOX:
                 if name == 'okx':
                     self.exchange.set_sandbox_mode(True)
@@ -59,18 +50,29 @@ class ExchangeManager:
         except Exception as e:
             logger.warning(f"交易所连接失败 ({name}): {e}")
 
-    # ---------- 行情相关 ----------
     async def fetch_ticker(self, symbol):
         if self.exchange:
             try: return await self.exchange.fetch_ticker(symbol)
             except: pass
-        # 降级为模拟数据
         return {'last': random.uniform(3000, 3200)}
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
+        """获取K线，失败时重试三次"""
         if self.exchange:
-            try: return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            except: pass
+            for attempt in range(3):
+                try:
+                    logger.info(f"📊 获取K线 {symbol} {timeframe} (第{attempt+1}次)")
+                    data = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                    if data and len(data) > 0:
+                        logger.info(f"✅ K线获取成功 {symbol}: {len(data)}条")
+                        return data
+                    else:
+                        logger.warning(f"⚠️ K线为空 {symbol}，等待重试...")
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    logger.warning(f"K线获取失败 {symbol} (第{attempt+1}次): {e}")
+                    await asyncio.sleep(2)
+            logger.error(f"❌ K线获取彻底失败 {symbol}")
         return []
 
     async def fetch_orderbook(self, symbol, limit=5):
@@ -90,13 +92,11 @@ class ExchangeManager:
         return 0
 
     async def fetch_long_short_ratio(self, symbol):
-        """获取多空持仓比，部分交易所可能不支持"""
         if self.exchange:
             try: return await self.exchange.fetch_long_short_ratio(symbol)
             except: pass
         return 1.0
 
-    # ---------- 账户与交易 ----------
     async def fetch_balance(self):
         if self.exchange:
             try: return await self.exchange.fetch_balance()
@@ -104,14 +104,12 @@ class ExchangeManager:
         return {'USDT': {'free': 0}}
 
     async def create_market_buy_order(self, symbol, amount):
-        """市价买入，amount 为基础货币数量"""
         if self.exchange:
             try: return await self.exchange.create_order(symbol, 'market', 'buy', amount)
             except: pass
         return None
 
     async def create_market_sell_order(self, symbol, amount):
-        """市价卖出"""
         if self.exchange:
             try: return await self.exchange.create_order(symbol, 'market', 'sell', amount)
             except: pass
