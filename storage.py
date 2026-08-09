@@ -21,13 +21,13 @@ async def init_db():
         await db.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT, symbol TEXT, entry REAL, exit REAL, pnl_pct REAL)''')
-        # 新增持仓持久化表，防止重启丢失状态
+        # 新增持仓状态持久化表
         await db.execute('''CREATE TABLE IF NOT EXISTS active_positions (
             symbol TEXT PRIMARY KEY, entry_price REAL, trailing_high REAL, is_trailing_active INTEGER)''')
         await db.commit()
 
 async def save_position_state(symbol: str, entry_price: float, trailing_high: float, is_active: bool):
-    """保存活跃持仓状态"""
+    """保存活跃持仓状态到数据库"""
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(
@@ -39,7 +39,7 @@ async def save_position_state(symbol: str, entry_price: float, trailing_high: fl
         logger.error(f"保存持仓状态失败 {symbol}: {e}")
 
 async def delete_position_state(symbol: str):
-    """平仓后清除持仓状态"""
+    """平仓后清除持久化持仓记录"""
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute("DELETE FROM active_positions WHERE symbol = ?", (symbol,))
@@ -48,7 +48,7 @@ async def delete_position_state(symbol: str):
         logger.error(f"清除持仓状态失败 {symbol}: {e}")
 
 async def load_position_states():
-    """重启时恢复所有持仓状态"""
+    """重启时从 SQLite 恢复持仓状态"""
     positions = {}
     try:
         async with aiosqlite.connect(DB_FILE) as db:
@@ -63,7 +63,6 @@ async def load_position_states():
         logger.error(f"恢复持仓状态失败: {e}")
     return positions
 
-# 保持原有 load_config, save_config, load_trades, save_trade 不变...
 async def load_config():
     config = dict(DEFAULT_CONFIG)
     try:
@@ -76,7 +75,8 @@ async def load_config():
                         elif isinstance(config[key], int): config[key] = int(value)
                         elif isinstance(config[key], float): config[key] = float(value)
                         else: config[key] = value
-    except Exception as e: logger.error(f"加载配置失败: {e}")
+    except Exception as e:
+        logger.error(f"加载配置失败: {e}")
     if isinstance(config.get("symbols"), str):
         config["symbols"] = [s.strip() for s in config["symbols"].split(",") if s.strip()]
     return config
@@ -88,7 +88,8 @@ async def save_config(cfg: dict):
                 val = ",".join(value) if isinstance(value, list) else (str(value).lower() if isinstance(value, bool) else str(value))
                 await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, val))
             await db.commit()
-    except Exception as e: logger.error(f"保存配置失败: {e}")
+    except Exception as e:
+        logger.error(f"保存配置失败: {e}")
 
 async def load_trades(limit=50):
     trades = []
@@ -97,7 +98,8 @@ async def load_trades(limit=50):
             async with db.execute("SELECT time, symbol, entry, exit, pnl_pct FROM trades ORDER BY id DESC LIMIT ?", (limit,)) as cursor:
                 async for row in cursor:
                     trades.append({"time": row[0], "symbol": row[1], "entry": row[2], "exit": row[3], "pnl_pct": row[4]})
-    except Exception as e: logger.error(f"加载交易记录失败: {e}")
+    except Exception as e:
+        logger.error(f"加载交易记录失败: {e}")
     return list(reversed(trades))
 
 async def save_trade(trade: dict):
@@ -106,4 +108,5 @@ async def save_trade(trade: dict):
             await db.execute("INSERT INTO trades (time, symbol, entry, exit, pnl_pct) VALUES (?, ?, ?, ?, ?)",
                             (trade["time"], trade["symbol"], trade["entry"], trade["exit"], trade["pnl_pct"]))
             await db.commit()
-    except Exception as e: logger.error(f"保存交易记录失败: {e}")
+    except Exception as e:
+        logger.error(f"保存交易记录失败: {e}")
