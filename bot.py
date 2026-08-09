@@ -1,5 +1,5 @@
 """
-bot.py - 完全体量化机器人（全真实数据，异步技术指标，完整版）
+bot.py - 完全体量化机器人（条件看板 + 单币限额 + 盈亏比校验）
 """
 import asyncio, random, aiohttp
 from datetime import datetime, timezone, timedelta
@@ -125,7 +125,7 @@ class QuantBot:
         self.max_daily_trades = 0
         self.auto_trade_enabled = False
         self.auto_min_score = 75
-        self.max_per_coin_usdt = cfg.get('max_per_coin_usdt', 0)
+        self.max_per_coin_usdt = 0   # 新增：单币种持仓限额
 
         self.taker_fee = settings.TAKER_FEE
         self.maker_fee = settings.MAKER_FEE
@@ -161,6 +161,7 @@ class QuantBot:
                 CommandHandler("preset", self.cmd_preset), CommandHandler("history", self.cmd_history),
                 CommandHandler("autotrade", self.cmd_autotrade), CommandHandler("autoscore", self.cmd_autoscore),
                 CommandHandler("holdings", self.cmd_holdings),
+                CommandHandler("setmaxcoin", self.cmd_set_max_coin),   # 新增
             ]
             for h in handlers: self.tg_app.add_handler(h)
             self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
@@ -182,6 +183,7 @@ class QuantBot:
         self.max_daily_trades = cfg.get('max_daily_trades', 0)
         self.auto_trade_enabled = cfg.get('auto_trade_enabled', False)
         self.auto_min_score = cfg.get('auto_min_score', 75)
+        self.max_per_coin_usdt = cfg.get('max_per_coin_usdt', 0)    # 加载限额
         self.trades = await load_trades()
 
     async def _save_config(self):
@@ -192,7 +194,8 @@ class QuantBot:
             'reserve_bottom': self.reserve_bottom, 'symbols': self.symbols,
             'orderbook_filter': self.orderbook_filter, 'waterfall_breaker': self.waterfall_breaker,
             'max_daily_trades': self.max_daily_trades,
-            'auto_trade_enabled': self.auto_trade_enabled, 'auto_min_score': self.auto_min_score
+            'auto_trade_enabled': self.auto_trade_enabled, 'auto_min_score': self.auto_min_score,
+            'max_per_coin_usdt': self.max_per_coin_usdt   # 保存限额
         }
         await save_config(cfg)
 
@@ -246,68 +249,7 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    async def cmd_check(self, update, context):
-        if not self._auth(update): return
-        lines = ["📈 **信号 + 开仓条件**\n"]
-        fg = (await self.real_data.get_fear_greed_index())["value"]
-        bal = await self.exchange.fetch_balance()
-        usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
-
-        for sym in self.symbols:
-            ticker = await self.exchange.fetch_ticker(sym)
-            p = ticker['last']
-            tech = await self.tech.calc(sym, self.timeframe, 50)
-            funding = await self.exchange.fetch_funding_rate(sym)
-            sc = self.signal_engine.score(tech, funding, fg)
-            txt = self.signal_engine.interpret(sc)
-
-            # ---- 开仓条件检测 ----
-            coin = sym.split('/')[0]
-            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
-            has_position = free > 0.0001
-
-            # 条件1：信号
-            cond_signal = sc >= self.auto_min_score
-            # 条件2：价格在布林下轨附近
-            cond_price = p <= tech['bb_lower'] * 1.02
-            # 条件3：盘口
-            cond_book = True
-            if self.orderbook_filter:
-                ob = await self.exchange.fetch_orderbook(sym)
-                cond_book, _ = await self.orderbook_engine.validate(ob)
-            # 条件4：无持仓
-            cond_no_pos = not has_position
-            # 条件5：余额足够
-            cond_balance = usdt_free >= self.single_order_usdt + self.reserve_bottom
-            # 条件6：单日限额（若启用）
-            cond_daily = True
-            if self.max_daily_trades > 0 and self.daily_trades >= self.max_daily_trades:
-                cond_daily = False
-            # 条件7：单币种限额（若启用）
-            cond_coin_limit = True
-            if self.max_per_coin_usdt > 0 and has_position:
-                coin_value = free * p
-                cond_coin_limit = coin_value < self.max_per_coin_usdt
-
-            cond_str = (
-                f"{'✅' if cond_signal else '❌'}信 "
-                f"{'✅' if cond_price else '❌'}价 "
-                f"{'✅' if cond_book else '❌'}盘 "
-                f"{'✅' if cond_no_pos else '❌'}仓 "
-                f"{'✅' if cond_balance else '❌'}钱 "
-                f"{'✅' if cond_daily else '❌'}日 "
-                f"{'✅' if cond_coin_limit else '❌'}额"
-            )
-            all_met = cond_signal and cond_price and cond_book and cond_no_pos and cond_balance and cond_daily and cond_coin_limit
-            status = "🎯 可开仓" if all_met else "⏳ 等待"
-            # ------------------
-
-            lines.append(
-                f"{sym}: {p:.2f} | 信号: {txt} ({sc})\n"
-                f"   条件: {cond_str} → {status}"
-            )
-
-        await update.effective_message.reply_text("\n".join(lines))
+    async def cmd_holdings(self, update, context):
         if not self._auth(update): return
         bal = await self.exchange.fetch_balance()
         lines = ["📋 **当前持币**\n"]
@@ -351,6 +293,15 @@ class QuantBot:
                 await update.effective_message.reply_text(f"✅ 自动开仓阈值: {score}分")
             else: await update.effective_message.reply_text("阈值需在50-95之间")
         except: pass
+
+    async def cmd_set_max_coin(self, update, context):
+        """设置单币种最大持仓限额"""
+        if not self._auth(update): return
+        try:
+            self.max_per_coin_usdt = float(context.args[0])
+            await self._save_config()
+            await update.effective_message.reply_text(f"✅ 单币种最大持仓: {self.max_per_coin_usdt} U")
+        except: await update.effective_message.reply_text("❌ 格式: /setmaxcoin 200")
 
     async def cmd_entry(self, update, context):
         if not self._auth(update): return
@@ -418,17 +369,59 @@ class QuantBot:
         lines.append(f"💵 USDT: {bal.get('USDT',{}).get('free',0):.2f}")
         await update.effective_message.reply_text("\n".join(lines))
 
+    # ============ 条件看板 ============
     async def cmd_check(self, update, context):
         if not self._auth(update): return
-        lines = ["📈 **信号**\n"]
+        lines = ["📈 **信号 + 开仓条件**\n"]
         fg = (await self.real_data.get_fear_greed_index())["value"]
+        bal = await self.exchange.fetch_balance()
+        usdt_free = bal.get('USDT', {}).get('free', 0) if isinstance(bal.get('USDT'), dict) else float(bal.get('USDT', 0))
+
         for sym in self.symbols:
-            ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
+            ticker = await self.exchange.fetch_ticker(sym)
+            p = ticker['last']
             tech = await self.tech.calc(sym, self.timeframe, 50)
             funding = await self.exchange.fetch_funding_rate(sym)
             sc = self.signal_engine.score(tech, funding, fg)
             txt = self.signal_engine.interpret(sc)
-            lines.append(f"{sym}: {p:.2f} | 信号: {txt} ({sc})")
+
+            coin = sym.split('/')[0]
+            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+            has_position = free > 0.0001
+
+            cond_signal = sc >= self.auto_min_score
+            cond_price = p <= tech['bb_lower'] * 1.02
+            cond_book = True
+            if self.orderbook_filter:
+                ob = await self.exchange.fetch_orderbook(sym)
+                cond_book, _ = await self.orderbook_engine.validate(ob)
+            cond_no_pos = not has_position
+            cond_balance = usdt_free >= self.single_order_usdt + self.reserve_bottom
+            cond_daily = True
+            if self.max_daily_trades > 0 and self.daily_trades >= self.max_daily_trades:
+                cond_daily = False
+            cond_coin_limit = True
+            if self.max_per_coin_usdt > 0 and has_position:
+                coin_value = free * p
+                cond_coin_limit = coin_value < self.max_per_coin_usdt
+
+            cond_str = (
+                f"{'✅' if cond_signal else '❌'}信 "
+                f"{'✅' if cond_price else '❌'}价 "
+                f"{'✅' if cond_book else '❌'}盘 "
+                f"{'✅' if cond_no_pos else '❌'}仓 "
+                f"{'✅' if cond_balance else '❌'}钱 "
+                f"{'✅' if cond_daily else '❌'}日 "
+                f"{'✅' if cond_coin_limit else '❌'}额"
+            )
+            all_met = cond_signal and cond_price and cond_book and cond_no_pos and cond_balance and cond_daily and cond_coin_limit
+            status = "🎯 可开仓" if all_met else "⏳ 等待"
+
+            lines.append(
+                f"{sym}: {p:.2f} | 信号: {txt} ({sc})\n"
+                f"   条件: {cond_str} → {status}"
+            )
+
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_symbols(self, update, context):
@@ -451,21 +444,27 @@ class QuantBot:
     async def cmd_help(self, update, context):
         await update.effective_message.reply_text(
             f"🤖 命令列表\n"
-            f"/menu 控制台 /status 持仓 /check 信号\n"
+            f"/menu 控制台 /status 持仓 /check 信号+条件\n"
             f"/symbols 监控列表 /holdings 持币查询\n"
             f"/brain 大脑 /analysis 差距 /history 历史\n"
             f"/settp 5 /setsl 2 /setamount 1\n"
+            f"/setmaxcoin 200 单币限额\n"
             f"/autotrade on /autoscore 75\n"
             f"/preset balanced /panic 全平\n"
             f"保本线: >{self.breakeven_pct*100:.2f}%"
         )
 
+    # ============ 盈亏比强制校验 ============
     async def cmd_set_tp(self, update, context):
         if not self._auth(update): return
         try:
             val = self._parse_pct(float(context.args[0]))
             if val < self.breakeven_pct:
                 await update.effective_message.reply_text(f"❌ 低于保本线 {self.breakeven_pct*100:.2f}%"); return
+            if self.sl_pct > 0 and val / self.sl_pct < 1.2:
+                await update.effective_message.reply_text(
+                    f"❌ 止盈/止损比不足 1.2:1\n当前止盈{val*100:.2f}% 止损{self.sl_pct*100:.2f}%，请先调整止损"
+                ); return
             self.tp_pct = val; await self._save_config()
             await update.effective_message.reply_text(f"✅ 止盈: {self.tp_pct*100:.2f}%")
         except: pass
@@ -473,7 +472,12 @@ class QuantBot:
     async def cmd_set_sl(self, update, context):
         if not self._auth(update): return
         try:
-            self.sl_pct = self._parse_pct(float(context.args[0])); await self._save_config()
+            val = self._parse_pct(float(context.args[0]))
+            if self.tp_pct > 0 and self.tp_pct / val < 1.2:
+                await update.effective_message.reply_text(
+                    f"❌ 止盈/止损比不足 1.2:1\n当前止盈{self.tp_pct*100:.2f}% 止损{val*100:.2f}%，请先调整止盈"
+                ); return
+            self.sl_pct = val; await self._save_config()
             await update.effective_message.reply_text("✅")
         except: pass
 
@@ -533,7 +537,6 @@ class QuantBot:
         except: pass
 
     async def render_brain_status(self, msg_obj):
-        """超级大脑诊断 - 自动遍历所有监控币种"""
         try:
             macro = await self.real_data.check_macro_risk()
             lines = [
@@ -542,22 +545,12 @@ class QuantBot:
                 f"1️⃣ **宏观舆情**: {macro['status']}",
                 f"━━━━━━━━━━━━━━━━━━"
             ]
-
             for idx, sym in enumerate(self.symbols):
                 try:
-                    ticker = await self.exchange.fetch_ticker(sym)
-                    p = ticker['last']
-
-                    # 获取清算风险（含资金费率、多空比）
+                    ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
                     liq = await self.real_data.get_liquidation_risk(sym)
-
-                    # 获取盘口
-                    ob = await self.exchange.fetch_orderbook(sym)
-                    ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
-
-                    # 获取技术指标
+                    ob = await self.exchange.fetch_orderbook(sym); ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
                     tech = await self.tech.calc(sym, self.timeframe, 50)
-
                     lines.append(
                         f"{idx+2}️⃣ **{sym}**\n"
                         f"   • 现价: {p:.2f} USDT\n"
@@ -568,37 +561,20 @@ class QuantBot:
                     )
                 except Exception as e:
                     lines.append(f"{idx+2}️⃣ **{sym}**: ⚠️ 获取数据失败")
-                    logger.error(f"诊断 {sym} 异常: {e}")
-
             lines.append("━━━━━━━━━━━━━━━━━━")
             lines.append("🤖 *全部基于真实交易所数据*")
-
             msg = "\n".join(lines)
-
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 刷新大脑诊断", callback_data="brain_status")],
                 [InlineKeyboardButton("🔙 返回控制台", callback_data="refresh_panel")]
             ])
-
             if hasattr(msg_obj, 'edit_text'):
-                try:
-                    await msg_obj.edit_text(msg, reply_markup=kb, parse_mode="Markdown")
-                except Exception:
-                    await msg_obj.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
+                try: await msg_obj.edit_text(msg, reply_markup=kb, parse_mode="Markdown")
+                except: await msg_obj.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
             else:
                 await msg_obj.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
-
         except Exception as e:
-            logger.error(f"大脑诊断异常: {e}")
-        try:
-            macro = await self.real_data.check_macro_risk()
-            sym = self.symbols[0]; ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
-            liq = await self.real_data.get_liquidation_risk(sym)
-            ob = await self.exchange.fetch_orderbook(sym); ob_valid, ob_msg = await self.orderbook_engine.validate(ob)
-            tech = await self.tech.calc(sym, self.timeframe, 50)
-            msg = f"🧠 {sym}\n宏观: {macro['status']}\n费率: {liq['funding_rate']*100:+.4f}%\n盘口: {ob_msg}\n布林: {tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}"
-            await msg_obj.reply_text(msg)
-        except Exception as e: logger.error(f"brain err: {e}")
+            logger.error(f"brain err: {e}")
 
     async def render_gap_analysis(self, msg_obj):
         try:
@@ -632,14 +608,21 @@ class QuantBot:
                 if pending == "settp":
                     pct = self._parse_pct(val)
                     if pct < self.breakeven_pct: await update.message.reply_text("❌ 低于保本线"); return
+                    if self.sl_pct > 0 and pct / self.sl_pct < 1.2:
+                        await update.message.reply_text("❌ 盈亏比不足"); return
                     self.tp_pct = pct
-                elif pending == "setsl": self.sl_pct = self._parse_pct(val)
+                elif pending == "setsl":
+                    pct = self._parse_pct(val)
+                    if self.tp_pct > 0 and self.tp_pct / pct < 1.2:
+                        await update.message.reply_text("❌ 盈亏比不足"); return
+                    self.sl_pct = pct
                 elif pending == "settsl": self.trailing_sl_pct = self._parse_pct(val)
                 elif pending == "settmpt": self.trailing_tp_pct = self._parse_pct(val)
                 elif pending == "setamount": self.single_order_usdt = val
                 elif pending == "setreserve": self.reserve_bottom = val
                 elif pending == "settrades": self.max_daily_trades = int(val)
                 elif pending == "autoscore": self.auto_min_score = int(val)
+                elif pending == "setmaxcoin": self.max_per_coin_usdt = val
             await self._save_config()
             context.user_data['pending_setting'] = None
             await update.message.reply_text("✅")
@@ -675,6 +658,7 @@ class QuantBot:
                        f"移损{self.trailing_sl_pct*100:.2f}% 移盈{self.trailing_tp_pct*100:.2f}%\n"
                        f"额度{self.single_order_usdt}U 周期{self.timeframe} 底线{self.reserve_bottom}U\n"
                        f"自动交易: {auto_state} 阈值: {self.auto_min_score}分\n"
+                       f"单币限额: {self.max_per_coin_usdt}U\n"
                        f"今日交易: {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}")
                 await query.message.reply_text(msg); await query.answer()
             elif data == "balance":
@@ -742,8 +726,14 @@ class QuantBot:
                 if prefix == "cfg_tp":
                     val_f = float(val_str)
                     if val_f < self.breakeven_pct: await query.answer(f"❌ 低于保本线", show_alert=True); return
+                    if self.sl_pct > 0 and val_f / self.sl_pct < 1.2:
+                        await query.answer("❌ 盈亏比不足", show_alert=True); return
                     self.tp_pct = val_f
-                elif prefix == "cfg_sl": self.sl_pct = float(val_str)
+                elif prefix == "cfg_sl":
+                    val_f = float(val_str)
+                    if self.tp_pct > 0 and self.tp_pct / val_f < 1.2:
+                        await query.answer("❌ 盈亏比不足", show_alert=True); return
+                    self.sl_pct = val_f
                 elif prefix == "cfg_tsl": self.trailing_sl_pct = float(val_str)
                 elif prefix == "cfg_tmpt": self.trailing_tp_pct = float(val_str)
                 elif prefix == "cfg_amt": self.single_order_usdt = float(val_str)
@@ -769,7 +759,7 @@ class QuantBot:
                     "setamount": "✍️ 单笔 USDT（例：150）：", "settf": "✍️ K线周期（例：15m）：",
                     "setreserve": "✍️ 安全底线（例：100）：", "addsymbol": "✍️ 币种（例：DOGE/USDT）：",
                     "delsymbol": "✍️ 要删除的币种：", "autoscore": "✍️ 信号阈值（50-95）：",
-                    "settrades": "✍️ 单日最大交易次数：",
+                    "settrades": "✍️ 单日最大交易次数：", "setmaxcoin": "✍️ 单币最大持仓U：",
                 }
                 await query.message.reply_text(prompts.get(key, "✍️ 请输入数值："),
                     reply_markup=ForceReply(selective=True), parse_mode="Markdown")
@@ -814,7 +804,14 @@ class QuantBot:
                 for sym in self.symbols:
                     coin = sym.split('/')[0]
                     free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
-                    if free > 0.0001: continue
+                    if free > 0.0001:
+                        # 单币种限额检查
+                        if self.max_per_coin_usdt > 0:
+                            ticker_tmp = await self.exchange.fetch_ticker(sym)
+                            coin_value = free * ticker_tmp['last']
+                            if coin_value >= self.max_per_coin_usdt:
+                                continue
+                        continue   # 已有持仓，跳过
                     ticker = await self.exchange.fetch_ticker(sym); p = ticker['last']
                     tech = await self.tech.calc(sym, self.timeframe, 50)
                     funding = await self.exchange.fetch_funding_rate(sym)
@@ -898,7 +895,7 @@ class QuantBot:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ Bot 长轮询模式启动 (全真实数据)")
+                logger.info("✅ Bot 长轮询模式启动 (条件看板+限额+盈亏比)")
 
                 if settings.TG_CHAT_ID and self.tg_app.bot:
                     try:
@@ -907,15 +904,15 @@ class QuantBot:
                             text=(
                                 f"🤖 **量化机器人已上线**\n"
                                 f"━━━━━━━━━━━━━━\n"
-                                f"📌 版本: 完全体 v3.0 (全真实数据)\n"
+                                f"📌 版本: v3.1 条件看板\n"
                                 f"🔧 模式: 长轮询 (自动重连)\n"
                                 f"{self.env_tag}\n"
                                 f"🤖 自动交易: {'🟢 开启' if self.auto_trade_enabled else '🔴 关闭'}\n"
-                                f"📊 监控: {', '.join(self.symbols[:3])}\n"
                                 f"🎯 阈值: {self.auto_min_score} 分\n"
                                 f"💰 保本线: >{self.breakeven_pct*100:.2f}%\n"
+                                f"📊 单币限额: {self.max_per_coin_usdt}U\n"
                                 f"━━━━━━━━━━━━━━\n"
-                                f"发送 /menu 打开控制台"
+                                f"发送 /check 查看开仓条件"
                             ),
                             parse_mode="Markdown"
                         )
