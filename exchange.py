@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（恢复 CCXT 原生模拟盘设置，余额可用）
+exchange.py - 多交易所管理器（修复持仓数据解析）
 """
 import os
 import random
@@ -45,11 +45,10 @@ class ExchangeManager:
                 config['password'] = password
             self.exchange = exchange_class(config)
 
-            # ---- 关键：只使用 CCXT 原生模拟盘设置，不手动改 URLs ----
             if settings.IS_SANDBOX:
                 if name == 'okx':
                     self.exchange.set_sandbox_mode(True)
-                    logger.info("🧪 OKX 模拟盘模式已启用 (set_sandbox_mode)")
+                    logger.info("🧪 OKX 模拟盘模式已启用")
                 elif name == 'binance':
                     self.exchange.urls['api'] = self.exchange.urls['test']
 
@@ -106,29 +105,40 @@ class ExchangeManager:
                 pass
         return 1.0
 
-    # ---------- 余额（标准解析，CCXT 原生地址后正常工作） ----------
+    # ---------- 余额（返回完整标准化数据） ----------
     async def fetch_balance(self):
-        """获取余额，使用标准解析方式"""
+        """
+        获取余额，返回 CCXT 标准格式的完整字典。
+        兼容 OKX 模拟盘的特殊数据结构。
+        """
         if not self.exchange:
             return {'USDT': {'free': 0}}
+
         try:
             raw = await self.exchange.fetch_balance()
-            logger.info(f"余额原始数据: {raw}")
 
-            # 标准 CCXT 格式：{'USDT': {'free': xxx, 'total': xxx}}
-            if isinstance(raw, dict):
-                usdt = raw.get('USDT')
-                if isinstance(usdt, dict):
-                    free = usdt.get('free', usdt.get('total', 0))
-                    return {'USDT': {'free': float(free)}}
-                if isinstance(usdt, (int, float)):
-                    return {'USDT': {'free': float(usdt)}}
-                total = raw.get('total')
-                if isinstance(total, dict) and 'USDT' in total:
-                    return {'USDT': {'free': float(total['USDT'])}}
-                free_field = raw.get('free')
-                if isinstance(free_field, dict) and 'USDT' in free_field:
-                    return {'USDT': {'free': float(free_field['USDT'])}}
+            # 如果 raw 已经是标准格式，直接返回
+            if isinstance(raw, dict) and 'USDT' in raw and isinstance(raw['USDT'], (dict, int, float)):
+                return raw
+
+            # 否则尝试从 info.data 中提取
+            info = raw.get('info') if isinstance(raw, dict) else None
+            if isinstance(info, dict):
+                data_list = info.get('data')
+                if isinstance(data_list, list):
+                    result = {}
+                    for item in data_list:
+                        if isinstance(item, dict):
+                            ccy = item.get('ccy', '')
+                            avail = float(item.get('availBal', 0))
+                            frozen = float(item.get('frozenBal', 0))
+                            result[ccy] = {
+                                'free': avail,
+                                'used': frozen,
+                                'total': avail + frozen
+                            }
+                    if result:
+                        return result
 
         except Exception as e:
             logger.error(f"fetch_balance 失败: {e}", exc_info=True)
