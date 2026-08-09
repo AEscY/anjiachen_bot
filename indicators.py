@@ -1,5 +1,5 @@
 """
-indicators.py - 技术指标计算（数据不足抛异常，不返回模拟值）
+indicators.py - 技术指标计算（支持动态布林带倍数）
 """
 import pandas as pd
 import numpy as np
@@ -10,7 +10,11 @@ class TechnicalEngine:
     def __init__(self, exchange):
         self.exchange = exchange
 
-    async def calc(self, symbol, timeframe='15m', limit=50):
+    async def calc(self, symbol, timeframe='15m', limit=50, bb_multiplier=2.0):
+        """
+        计算布林带/RSI/ATR
+        bb_multiplier: 动态标准差倍数，默认2.0
+        """
         ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         if ohlcv is None or len(ohlcv) < 20:
             logger.error(f"K线数据不可用或不足 ({symbol})")
@@ -22,8 +26,8 @@ class TechnicalEngine:
 
             sma = close.rolling(window=20).mean()
             std = close.rolling(window=20).std()
-            bb_upper = sma + 2 * std
-            bb_lower = sma - 2 * std
+            bb_upper = sma + bb_multiplier * std
+            bb_lower = sma - bb_multiplier * std
 
             delta = close.diff()
             gain = delta.where(delta > 0, 0.0)
@@ -48,7 +52,8 @@ class TechnicalEngine:
                 'bb_lower': float(bb_lower.iloc[-1]),
                 'rsi': float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50,
                 'atr': float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.01,
-                'bandwidth_pct': float((bb_upper.iloc[-1] - bb_lower.iloc[-1]) / current_price * 100)
+                'bandwidth_pct': float((bb_upper.iloc[-1] - bb_lower.iloc[-1]) / current_price * 100),
+                'bb_multiplier': bb_multiplier
             }
         except Exception as e:
             logger.error(f"指标计算异常 ({symbol}): {e}")
