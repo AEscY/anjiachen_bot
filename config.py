@@ -55,5 +55,16 @@ class Settings(BaseSettings):
     MAKER_FEE: float = float(os.getenv("MAKER_FEE", "0.0008"))          # 挂单费率 0.08%
     MIN_PROFIT_MARGIN: float = float(os.getenv("MIN_PROFIT_MARGIN", "0.001"))  # 最小安全垫 0.1%
 
+    @property
+    def allowed_users_list(self) -> list[int]:
+        """将逗号分隔的用户ID字符串转换为列表"""
+        if not self.ALLOWED_USERS:
+            return []
+        return [int(x.strip()) for x in self.ALLOWED_USERS.split(",") if x.strip().isdigit()]
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
+
 
 settings = Settings()
