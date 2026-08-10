@@ -1,7 +1,5 @@
 """
-ws_manager.py - WebSocket 实时数据管理器
-替代 REST 轮询，通过 ccxt.pro 的 watch_* 方法获取实时价格和订单簿。
-延迟从 30s 降到 100ms 以内。
+ws_manager.py - WebSocket 实时数据管理器（修复多币种监听）
 """
 import asyncio
 import ccxt.pro as ccxt_pro
@@ -34,43 +32,44 @@ class WSDataManager:
 
         self.exchange = exchange_class(config)
         if settings.IS_SANDBOX and name == 'okx':
-            self.exchange.urls['api'] = self.exchange.urls['test']
             self.exchange.set_sandbox_mode(True)
 
         logger.info(f"🔌 WebSocket 已连接到 {name}")
         return True
 
     async def watch_tickers(self, symbols):
-        """实时监听价格变动"""
+        """实时监听价格变动（逐个币种监听）"""
         self._running = True
         while self._running:
-            try:
-                ticker = await self.exchange.watch_ticker(' '.join(symbols))
-                if ticker and 'symbol' in ticker:
-                    self.tickers[ticker['symbol']] = {
-                        'last': ticker.get('last', 0),
-                        'bid': ticker.get('bid', 0),
-                        'ask': ticker.get('ask', 0),
-                        'timestamp': asyncio.get_event_loop().time()
-                    }
-            except Exception as e:
-                logger.warning(f"WebSocket 断线，3 秒后重连: {e}")
-                await asyncio.sleep(3)
+            for sym in symbols:
+                try:
+                    ticker = await self.exchange.watch_ticker(sym)
+                    if ticker and 'symbol' in ticker:
+                        self.tickers[ticker['symbol']] = {
+                            'last': ticker.get('last', 0),
+                            'bid': ticker.get('bid', 0),
+                            'ask': ticker.get('ask', 0),
+                            'timestamp': asyncio.get_event_loop().time()
+                        }
+                except Exception as e:
+                    logger.warning(f"WebSocket {sym} 断线: {e}")
+            await asyncio.sleep(0.1)  # 避免CPU空转
 
     async def watch_orderbooks(self, symbols, limit=5):
-        """实时监听订单簿"""
+        """实时监听订单簿（逐个币种监听）"""
         while self._running:
-            try:
-                ob = await self.exchange.watch_order_book(' '.join(symbols), limit)
-                if ob and 'symbol' in ob:
-                    self.orderbooks[ob['symbol']] = {
-                        'bids': ob.get('bids', []),
-                        'asks': ob.get('asks', []),
-                        'timestamp': asyncio.get_event_loop().time()
-                    }
-            except Exception as e:
-                logger.warning(f"WebSocket 订单簿断线: {e}")
-                await asyncio.sleep(3)
+            for sym in symbols:
+                try:
+                    ob = await self.exchange.watch_order_book(sym, limit)
+                    if ob and 'symbol' in ob:
+                        self.orderbooks[ob['symbol']] = {
+                            'bids': ob.get('bids', []),
+                            'asks': ob.get('asks', []),
+                            'timestamp': asyncio.get_event_loop().time()
+                        }
+                except Exception as e:
+                    logger.warning(f"WebSocket 订单簿 {sym} 断线: {e}")
+            await asyncio.sleep(0.1)
 
     def get_ticker(self, symbol):
         """获取缓存的最新价格（非阻塞）"""
