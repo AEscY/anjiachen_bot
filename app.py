@@ -1,30 +1,28 @@
 """
-app.py - 量化网格机器人 主入口（长轮询 + 健康检查 HTTP）
+app.py - 量化网格机器人 主入口（完整版）
 """
 import asyncio
+import os
 import traceback
 from exchange import ExchangeManager
 from bot import QuantBot
 
 
 async def health_check(reader, writer):
-    """极简 HTTP 响应，用于 Render 健康检查"""
+    """HTTP 健康检查响应"""
     writer.write(b"HTTP/1.1 200 OK\r\n\r\nOK")
     await writer.drain()
     writer.close()
 
 
 async def main():
-    # 启动健康检查 HTTP 服务（Render 需要）
-    port = 10000  # Render 默认 PORT 环境变量
+    port = int(os.getenv("PORT", 10000))
     health_server = await asyncio.start_server(health_check, '0.0.0.0', port)
     print(f"🩺 健康检查服务运行在端口 {port}")
 
-    # 启动量化机器人
     exchange = ExchangeManager()
     bot = QuantBot(exchange)
 
-    # 同时运行两个任务
     await asyncio.gather(
         bot.run(),
         health_server.serve_forever()
@@ -41,4 +39,7 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except:
+            pass
