@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（假数据剔除版：失败返回 None）
+exchange.py - 多交易所管理器（假数据剔除版：失败返回 None，绝不造假）
 """
 import os
 import asyncio
