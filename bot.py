@@ -1,5 +1,5 @@
 """
-bot.py - 最终完整版（动态网格、多重熔断、学习系统、仪表盘、完整按钮）
+bot.py - 最终完整版（加仓无限制、动态网格、多重熔断、学习系统、完整按钮）
 """
 import asyncio, random, aiohttp, base64, os
 from datetime import datetime, timezone, timedelta
@@ -474,9 +474,10 @@ class QuantBot:
                 if self.orderbook_filter:
                     ob = await self.exchange.fetch_orderbook(sym)
                     cond_book, _ = await self.orderbook_engine.validate(ob)
+                # 仓位条件：始终允许加仓，除非超过单币限额
                 cond_pos = True
-                if self.max_per_coin_usdt > 0:
-                    cond_pos = coin_value < self.max_per_coin_usdt
+                if self.max_per_coin_usdt > 0 and coin_value >= self.max_per_coin_usdt:
+                    cond_pos = False
                 cond_balance = usdt_free >= self.single_order_usdt + self.reserve_bottom
                 cond_daily = True if self.max_daily_trades <= 0 or self.daily_trades < self.max_daily_trades else False
                 cond_str = (f"{'✅' if cond_signal else '❌'}信 {'✅' if cond_price else '❌'}价 {'✅' if cond_book else '❌'}盘 "
@@ -782,7 +783,7 @@ class QuantBot:
             if isinstance(amount, (int, float)) and amount > 0:
                 await self.exchange.create_market_sell_order(sym, amount)
 
-    # ==================== 自动交易（动态网格、多重熔断） ====================
+    # ==================== 自动交易（加仓无限制版） ====================
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
         while True:
@@ -855,6 +856,7 @@ class QuantBot:
                         free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else 0
                         coin_value = free * p
 
+                        # 只有设置了单币限额且超过时才跳过
                         if self.max_per_coin_usdt > 0 and coin_value >= self.max_per_coin_usdt:
                             continue
 
@@ -1070,7 +1072,7 @@ class QuantBot:
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
                 logger.info("✅ Bot 最终完整版启动")
                 if settings.TG_CHAT_ID:
-                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (最终完整版)")
+                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (加仓无限制版)")
                     except: pass
                 while True: await asyncio.sleep(30)
             except Exception as e:
