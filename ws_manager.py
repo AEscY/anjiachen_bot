@@ -60,24 +60,24 @@ class WSDataManager:
                 logger.warning(f"WebSocket 批量订阅断线: {e}")
                 await asyncio.sleep(1)
 
-    async def watch_orderbooks(self, symbols, limit=5):
-        """批量订阅订单簿（使用 watch_order_books）"""
-        while self._running:
-            try:
-                # 批量订阅所有币种订单簿
-                orderbooks = await self.exchange.watch_order_books(symbols, limit)
-                if orderbooks:
-                    async with self._lock:
-                        for symbol, ob in orderbooks.items():
-                            if ob and 'symbol' in ob:
-                                self.orderbooks[ob['symbol']] = {
-                                    'bids': ob.get('bids', []),
-                                    'asks': ob.get('asks', []),
-                                    'timestamp': time.time()
-                                }
-            except Exception as e:
-                logger.warning(f"WebSocket 订单簿批量订阅断线: {e}")
-                await asyncio.sleep(1)
+    async def watch_tickers(self, symbols):
+    self._running = True
+    while self._running:
+        try:
+            tickers = await self.exchange.watch_tickers(symbols)
+            if tickers:
+                async with self._lock:
+                    for symbol, ticker in tickers.items():
+                        if ticker and 'symbol' in ticker:
+                            self.tickers[ticker['symbol']] = {
+                                'last': ticker.get('last', 0),
+                                'bid': ticker.get('bid', 0),
+                                'ask': ticker.get('ask', 0),
+                                'timestamp': time.time()
+                            }
+        except Exception as e:
+            logger.warning(f"WebSocket 批量订阅断线: {e}")
+            await asyncio.sleep(1)
 
     def get_ticker(self, symbol):
         """获取缓存的最新价格（非阻塞）"""
