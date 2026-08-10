@@ -1,5 +1,5 @@
 """
-exchange.py - 多交易所管理器（假数据剔除版：失败返回 None，绝不造假）
+exchange.py - 多交易所管理器（修复余额解析、订单取消返回值）
 """
 import os
 import asyncio
@@ -49,7 +49,7 @@ class ExchangeManager:
                     self.exchange.set_sandbox_mode(True)
                     logger.info("🧪 OKX 模拟盘模式已启用")
                 elif name == 'binance':
-                    self.exchange.urls['api'] = self.exchange.urls['test']
+                    self.exchange.set_sandbox_mode(True)
 
             logger.info(f"✅ 交易所连接成功: {name}")
         except Exception as e:
@@ -105,18 +105,26 @@ class ExchangeManager:
         return None
 
     async def fetch_balance(self):
+        """修复余额解析，增加健壮性"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
             raw = await self.exchange.fetch_balance()
-            if isinstance(raw, dict) and 'USDT' in raw and isinstance(raw['USDT'], (dict, int, float)):
+            if not raw:
+                return {'USDT': {'free': 0}}
+
+            # 方法1：标准 ccxt 余额格式
+            if isinstance(raw, dict):
                 result = {}
                 for key, val in raw.items():
-                    if isinstance(val, dict):
+                    if isinstance(val, dict) and 'free' in val:
                         result[key] = val
                     elif isinstance(val, (int, float)):
                         result[key] = {'free': float(val), 'used': 0, 'total': float(val)}
-                return result
+                if result:
+                    return result
+
+            # 方法2：OKX 特殊格式
             info = raw.get('info') if isinstance(raw, dict) else None
             if isinstance(info, dict):
                 data_list = info.get('data')
@@ -125,38 +133,44 @@ class ExchangeManager:
                     for item in data_list:
                         if isinstance(item, dict):
                             ccy = item.get('ccy', '')
-                            avail = float(item.get('availBal', 0))
-                            frozen = float(item.get('frozenBal', 0))
-                            result[ccy] = {'free': avail, 'used': frozen, 'total': avail + frozen}
+                            if ccy:
+                                avail = float(item.get('availBal', 0))
+                                frozen = float(item.get('frozenBal', 0))
+                                result[ccy] = {'free': avail, 'used': frozen, 'total': avail + frozen}
                     if result:
                         return result
+
+            return {'USDT': {'free': 0}}
         except Exception as e:
             logger.error(f"获取余额失败: {e}")
-        return {'USDT': {'free': 0}}
+            return {'USDT': {'free': 0}}
 
     async def create_market_buy_order(self, symbol, amount):
         if self.exchange:
             try:
                 return await self.exchange.create_order(symbol, 'market', 'buy', amount)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"市价买单失败 {symbol}: {e}")
         return None
 
     async def create_market_sell_order(self, symbol, amount):
         if self.exchange:
             try:
                 return await self.exchange.create_order(symbol, 'market', 'sell', amount)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"市价卖单失败 {symbol}: {e}")
         return None
 
     async def cancel_all_orders(self, symbol):
+        """取消所有订单，返回是否成功"""
         if self.exchange:
             try:
-                return await self.exchange.cancel_all_orders(symbol)
-            except Exception:
-                pass
-        return True
+                result = await self.exchange.cancel_all_orders(symbol)
+                return result is not None
+            except Exception as e:
+                logger.warning(f"取消订单失败 {symbol}: {e}")
+                return False
+        return False
 
     async def close(self):
         if self.exchange:
