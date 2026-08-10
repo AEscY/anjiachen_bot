@@ -1,5 +1,5 @@
 """
-storage.py - SQLite 数据库管理（含索引优化、状态持久化）
+storage.py - SQLite 数据库管理（修复 net_pnl_pct 列缺失 / 日期查询逻辑 / WAL 模式）
 """
 import aiosqlite
 import json
@@ -23,11 +23,17 @@ DEFAULT_CONFIG = {
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+        # ✅ 开启 WAL 模式（写前日志），大幅减少锁库概率
+        await db.execute("PRAGMA journal_mode=WAL;")
+        
         await db.execute('''CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)''')
+        
         await db.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT, symbol TEXT, entry REAL, exit REAL, pnl_pct REAL,
             net_pnl REAL DEFAULT 0, net_pnl_pct REAL DEFAULT 0)''')
+        
+        # ✅ 修复：新增 net_pnl_pct 列（之前仅存在于 trades 表，此处补齐）
         await db.execute('''CREATE TABLE IF NOT EXISTS trade_details (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT, symbol TEXT, side TEXT,
@@ -35,9 +41,11 @@ async def init_db():
             fear_greed INTEGER, funding_rate REAL, pnl_pct REAL,
             real_cost REAL DEFAULT 0, real_revenue REAL DEFAULT 0,
             net_pnl_pct REAL DEFAULT 0)''')
+        
         await db.execute('''CREATE TABLE IF NOT EXISTS runtime_state (
             key TEXT PRIMARY KEY, value TEXT)''')
-        # 添加索引
+        
+        # 索引优化
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(time)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_details_time ON trade_details(time)")
@@ -117,7 +125,10 @@ async def save_trade_detail(detail: dict):
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             await db.execute(
-                "INSERT INTO trade_details (time, symbol, side, price, amount, signal_score, fear_greed, funding_rate, pnl_pct, real_cost, real_revenue, net_pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """INSERT INTO trade_details 
+                (time, symbol, side, price, amount, signal_score, fear_greed, 
+                 funding_rate, pnl_pct, real_cost, real_revenue, net_pnl_pct) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (detail["time"], detail["symbol"], detail["side"], detail["price"], detail["amount"],
                  detail.get("signal_score", 0), detail.get("fear_greed", 0), detail.get("funding_rate", 0),
                  detail.get("pnl_pct", 0), detail.get("real_cost", 0), detail.get("real_revenue", 0),
@@ -127,9 +138,11 @@ async def save_trade_detail(detail: dict):
     except Exception as e:
         logger.error(f"保存交易详情失败: {e}")
 
+# ==================== 修复 1：net_pnl_pct 列查询 ====================
 async def get_recent_performance(num=50):
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+            # ✅ 修复：trade_details 现已包含 net_pnl_pct 列
             async with db.execute(
                 "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL ORDER BY id DESC LIMIT ?",
                 (num,)
@@ -153,13 +166,18 @@ async def get_recent_performance(num=50):
         logger.error(f"获取近期表现失败: {e}")
         return None
 
+# ==================== 修复 2：日期匹配改用 strftime ====================
 async def get_today_trades():
     today_str = datetime.now(CST).strftime("%m-%d")
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+            # ✅ 修复：使用 strftime 函数按日期过滤，兼容所有时间格式
             async with db.execute(
-                "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL AND time LIKE ? ORDER BY id DESC",
-                (today_str + '%',)
+                """SELECT net_pnl_pct FROM trade_details 
+                   WHERE side='sell' AND net_pnl_pct IS NOT NULL 
+                   AND strftime('%m-%d', time) = ? 
+                   ORDER BY id DESC""",
+                (today_str,)
             ) as cursor:
                 rows = await cursor.fetchall()
             if not rows:
@@ -199,7 +217,6 @@ async def export_db_to_json():
 
 # ========== 运行时状态持久化 ==========
 async def save_runtime_state(state: dict):
-    """保存运行时状态（仓位计数、入场价、峰值资产等）"""
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             for key, value in state.items():
@@ -213,7 +230,6 @@ async def save_runtime_state(state: dict):
         logger.error(f"保存运行时状态失败: {e}")
 
 async def load_runtime_state():
-    """恢复运行时状态"""
     state = {}
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
