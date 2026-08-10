@@ -1,5 +1,5 @@
 """
-indicators.py - 技术指标计算（支持动态布林带倍数）
+indicators.py - 技术指标计算（支持动态布林带倍数，数据不足抛异常）
 """
 import pandas as pd
 import numpy as np
@@ -11,10 +11,6 @@ class TechnicalEngine:
         self.exchange = exchange
 
     async def calc(self, symbol, timeframe='15m', limit=50, bb_multiplier=2.0):
-        """
-        计算布林带/RSI/ATR
-        bb_multiplier: 动态标准差倍数，默认2.0
-        """
         ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         if ohlcv is None or len(ohlcv) < 20:
             logger.error(f"K线数据不可用或不足 ({symbol})")
