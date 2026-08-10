@@ -1,4 +1,44 @@
+# ---------- 核心安全与运行时 (原版保留) ----------
 .env
-__pycache__
-*.pyc
 bot.db
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+
+# ---------- 虚拟环境 (新增) ----------
+.venv/
+venv/
+ENV/
+env/
+virtualenv/
+
+# ---------- IDE 与编辑器配置 (新增) ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode-server/
+
+# ---------- 日志文件 (新增) ----------
+*.log
+logs/
+*.log.*
+
+# ---------- 其他常见忽略 ----------
+*.db-journal
+*.sqlite3
+*.sqlite
+dist/
+build/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
