@@ -1,7 +1,7 @@
 """
-bot.py - 最终完整版（动态网格、回撤熔断、API异常熔断、学习系统、仪表盘）
+bot.py - 最终完整版（动态网格、多重熔断、学习系统、仪表盘、完整按钮）
 """
-import asyncio, random, aiohttp
+import asyncio, random, aiohttp, base64, os
 from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
@@ -157,6 +157,11 @@ class QuantBot:
         self.peak_total_value = 0
 
         self.learning_enabled = True; self.last_learning_check = 0
+
+        # GitHub 自动备份配置
+        self.github_token = os.getenv("GITHUB_TOKEN", "")
+        self.github_repo = os.getenv("GITHUB_REPO", "AEscY/anjiachen_bot")
+        self.github_backup_path = "bot.db"
 
         self.tg_app = None
         if settings.TG_BOT_TOKEN:
@@ -561,24 +566,27 @@ class QuantBot:
         try: sym = context.args[0].upper(); self.symbols.remove(sym); await self._save_config(); await update.effective_message.reply_text("✅")
         except: pass
 
-    # ==================== 诊断渲染 ====================
+    # ==================== 诊断渲染（慢速请求版，避免限频） ====================
     async def render_brain_status(self, msg_obj):
         try:
             macro = await self.real_data.check_macro_risk()
             lines = [f"🧠 **AI 超级大脑** {self.env_tag}", f"1️⃣ 宏观: {macro['status']}"]
             for idx, sym in enumerate(self.symbols):
                 try:
+                    if idx > 0:
+                        await asyncio.sleep(1.5)
                     ticker = await self.exchange.fetch_ticker(sym)
-                    if ticker is None: continue
+                    if ticker is None:
+                        lines.append(f"{idx+2}️⃣ {sym}: 现价获取失败")
+                        continue
                     p = ticker['last']
-                    liq = await self.real_data.get_liquidation_risk(sym)
-                    ob = await self.exchange.fetch_orderbook(sym)
-                    ob_valid, ob_msg = await self.orderbook_engine.validate(ob) if ob else (False, "无数据")
                     tech = await self.tech.calc(sym, self.timeframe, 50)
-                    lines.append(f"{idx+2}️⃣ {sym}: {p:.2f} 费率{liq['funding_rate']*100:+.4f}% 盘口{ob_msg} 布林{tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}")
-                except: lines.append(f"{idx+2}️⃣ {sym}: 数据获取失败")
+                    lines.append(f"{idx+2}️⃣ {sym}: {p:.2f} 布林{tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}")
+                except Exception:
+                    lines.append(f"{idx+2}️⃣ {sym}: 数据获取失败")
             await msg_obj.reply_text("\n".join(lines))
-        except Exception as e: logger.error(f"brain err: {e}")
+        except Exception as e:
+            logger.error(f"brain err: {e}")
 
     async def render_gap_analysis(self, msg_obj):
         try:
@@ -1062,7 +1070,7 @@ class QuantBot:
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
                 logger.info("✅ Bot 最终完整版启动")
                 if settings.TG_CHAT_ID:
-                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (完整优化版)")
+                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (最终完整版)")
                     except: pass
                 while True: await asyncio.sleep(30)
             except Exception as e:
