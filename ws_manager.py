@@ -53,7 +53,7 @@ class WSDataManager:
                         }
                 except Exception as e:
                     logger.warning(f"WebSocket {sym} 断线: {e}")
-            await asyncio.sleep(0.1)  # 避免CPU空转
+            await asyncio.sleep(0.1)
 
     async def watch_orderbooks(self, symbols, limit=5):
         """实时监听订单簿（逐个币种监听）"""
