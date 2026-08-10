@@ -1,6 +1,5 @@
 """
-dashboard.py - 独立 Web 可视化仪表盘 (Streamlit)
-运行方式: streamlit run dashboard.py --server.port 8501
+dashboard.py - Streamlit 仪表盘（增加自动刷新和异常处理）
 """
 import sqlite3
 import pandas as pd
@@ -15,25 +14,30 @@ DB_FILE = "bot.db"
 CST = timezone(timedelta(hours=8))
 
 
+@st.cache_data(ttl=10)
 def load_data():
-    conn = sqlite3.connect(DB_FILE)
-    details = pd.read_sql("SELECT * FROM trade_details ORDER BY id DESC", conn)
-    config = pd.read_sql("SELECT * FROM config", conn)
-    conn.close()
-    return details, config
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30.0)
+        details = pd.read_sql("SELECT * FROM trade_details ORDER BY id DESC LIMIT 500", conn)
+        config = pd.read_sql("SELECT * FROM config", conn)
+        conn.close()
+        return details, config
+    except Exception as e:
+        st.error(f"加载数据失败: {e}")
+        return pd.DataFrame(), pd.DataFrame()
 
 
 details, config = load_data()
 
-# 侧边栏：当前参数
 st.sidebar.subheader("⚙️ 当前参数")
-for _, row in config.iterrows():
-    st.sidebar.text(f"{row['key']}: {row['value']}")
+if not config.empty:
+    for _, row in config.iterrows():
+        st.sidebar.text(f"{row['key']}: {row['value']}")
+else:
+    st.sidebar.info("暂无配置数据")
 
-# 主区域
 col1, col2, col3 = st.columns(3)
 if not details.empty:
-    # 最近平仓
     sells = details[details['side'] == 'sell'].head(20)
     total_pnl = sells['pnl_pct'].sum() if not sells.empty else 0
     win_rate = (sells['pnl_pct'] > 0).mean() if not sells.empty else 0
@@ -41,14 +45,17 @@ if not details.empty:
     col2.metric("胜率", f"{win_rate:.0%}")
     col3.metric("交易次数", len(sells))
 
-    # 盈亏曲线
     if not sells.empty:
         sells['cum_pnl'] = sells['pnl_pct'].cumsum()
         fig = px.line(sells[::-1], x='time', y='cum_pnl', title="累计盈亏曲线")
         st.plotly_chart(fig, use_container_width=True)
 
-    # 最近交易
     st.subheader("📜 最近平仓记录")
     st.dataframe(sells[['time', 'symbol', 'pnl_pct']].head(10))
 else:
     st.info("暂无交易数据")
+
+# 自动刷新
+if st.button("🔄 刷新数据"):
+    st.cache_data.clear()
+    st.rerun()
