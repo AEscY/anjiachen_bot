@@ -1,5 +1,5 @@
 """
-storage.py - SQLite 数据库管理（新增状态持久化 + 交易详情 + 学习统计）
+storage.py - SQLite 数据库管理（含状态持久化、交易详情、学习统计）
 """
 import aiosqlite
 import json
@@ -16,7 +16,8 @@ DEFAULT_CONFIG = {
     "waterfall_breaker": True, "max_daily_trades": 0,
     "auto_trade_enabled": False, "auto_min_score": 75,
     "max_per_coin_usdt": 0, "max_daily_loss_pct": 0.05,
-    "max_total_allocated_pct": 1.0, "max_positions_per_coin": 18
+    "max_total_allocated_pct": 1.0, "max_positions_per_coin": 18,
+    "grid_configs": "{}", "coin_configs": "{}"
 }
 
 async def init_db():
@@ -32,7 +33,6 @@ async def init_db():
             price REAL, amount REAL, signal_score INTEGER,
             fear_greed INTEGER, funding_rate REAL, pnl_pct REAL,
             real_cost REAL DEFAULT 0, real_revenue REAL DEFAULT 0)''')
-        # 新增：运行时状态表
         await db.execute('''CREATE TABLE IF NOT EXISTS runtime_state (
             key TEXT PRIMARY KEY, value TEXT)''')
         await db.commit()
@@ -188,7 +188,7 @@ async def export_db_to_json():
         logger.error(f"导出数据库失败: {e}")
         return None
 
-# ========== 新增：运行时状态持久化 ==========
+# ========== 运行时状态持久化 ==========
 async def save_runtime_state(state: dict):
     """保存运行时状态（仓位计数、入场价、峰值资产等）"""
     try:
