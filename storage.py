@@ -1,5 +1,5 @@
 """
-storage.py - SQLite 数据库管理（含日统计、备份导出）
+storage.py - SQLite 数据库管理（含手续费核算）
 """
 import aiosqlite
 import json
@@ -16,7 +16,7 @@ DEFAULT_CONFIG = {
     "waterfall_breaker": True, "max_daily_trades": 0,
     "auto_trade_enabled": False, "auto_min_score": 75,
     "max_per_coin_usdt": 0, "max_daily_loss_pct": 0.05,
-    "max_total_allocated_pct": 0.8  # 总仓位上限80%
+    "max_total_allocated_pct": 0.8, "max_positions_per_coin": 18
 }
 
 async def init_db():
@@ -24,12 +24,14 @@ async def init_db():
         await db.execute('''CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            time TEXT, symbol TEXT, entry REAL, exit REAL, pnl_pct REAL)''')
+            time TEXT, symbol TEXT, entry REAL, exit REAL, pnl_pct REAL,
+            net_pnl REAL DEFAULT 0, net_pnl_pct REAL DEFAULT 0)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS trade_details (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT, symbol TEXT, side TEXT,
             price REAL, amount REAL, signal_score INTEGER,
-            fear_greed INTEGER, funding_rate REAL, pnl_pct REAL)''')
+            fear_greed INTEGER, funding_rate REAL, pnl_pct REAL,
+            real_cost REAL DEFAULT 0, real_revenue REAL DEFAULT 0)''')
         await db.commit()
 
 async def load_config():
@@ -75,13 +77,14 @@ async def load_trades(limit=50):
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
-                "SELECT time, symbol, entry, exit, pnl_pct FROM trades ORDER BY id DESC LIMIT ?",
+                "SELECT time, symbol, entry, exit, pnl_pct, net_pnl, net_pnl_pct FROM trades ORDER BY id DESC LIMIT ?",
                 (limit,)
             ) as cursor:
                 async for row in cursor:
                     trades.append({
                         "time": row[0], "symbol": row[1],
-                        "entry": row[2], "exit": row[3], "pnl_pct": row[4]
+                        "entry": row[2], "exit": row[3], "pnl_pct": row[4],
+                        "net_pnl": row[5], "net_pnl_pct": row[6]
                     })
     except Exception as e:
         logger.error(f"加载交易记录失败: {e}")
@@ -91,8 +94,9 @@ async def save_trade(trade: dict):
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(
-                "INSERT INTO trades (time, symbol, entry, exit, pnl_pct) VALUES (?, ?, ?, ?, ?)",
-                (trade["time"], trade["symbol"], trade["entry"], trade["exit"], trade["pnl_pct"])
+                "INSERT INTO trades (time, symbol, entry, exit, pnl_pct, net_pnl, net_pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (trade["time"], trade["symbol"], trade["entry"], trade["exit"], trade["pnl_pct"],
+                 trade.get("net_pnl", 0), trade.get("net_pnl_pct", 0))
             )
             await db.commit()
     except Exception as e:
@@ -102,10 +106,10 @@ async def save_trade_detail(detail: dict):
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute(
-                "INSERT INTO trade_details (time, symbol, side, price, amount, signal_score, fear_greed, funding_rate, pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO trade_details (time, symbol, side, price, amount, signal_score, fear_greed, funding_rate, pnl_pct, real_cost, real_revenue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (detail["time"], detail["symbol"], detail["side"], detail["price"], detail["amount"],
                  detail.get("signal_score", 0), detail.get("fear_greed", 0), detail.get("funding_rate", 0),
-                 detail.get("pnl_pct", 0))
+                 detail.get("pnl_pct", 0), detail.get("real_cost", 0), detail.get("real_revenue", 0))
             )
             await db.commit()
     except Exception as e:
@@ -115,13 +119,15 @@ async def get_recent_performance(num=10):
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
-                "SELECT pnl_pct FROM trade_details WHERE side='sell' ORDER BY id DESC LIMIT ?",
+                "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL ORDER BY id DESC LIMIT ?",
                 (num,)
             ) as cursor:
                 rows = await cursor.fetchall()
             if not rows:
                 return None
-            pnls = [row[0] for row in rows]
+            pnls = [row[0] for row in rows if row[0] is not None]
+            if not pnls:
+                return None
             wins = sum(1 for p in pnls if p > 0)
             total = len(pnls)
             avg_win = sum(p for p in pnls if p > 0) / wins if wins > 0 else 0
@@ -139,20 +145,20 @@ async def get_recent_performance(num=10):
         logger.error(f"获取近期表现失败: {e}")
         return None
 
-# ---------- 新增：当日交易统计 ----------
 async def get_today_trades():
-    """获取今日所有平仓交易的盈亏统计"""
     today_str = datetime.now(CST).strftime("%m-%d")
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
-                "SELECT pnl_pct FROM trade_details WHERE side='sell' AND time LIKE ? ORDER BY id DESC",
+                "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL AND time LIKE ? ORDER BY id DESC",
                 (today_str + '%',)
             ) as cursor:
                 rows = await cursor.fetchall()
             if not rows:
                 return None
-            pnls = [row[0] for row in rows]
+            pnls = [row[0] for row in rows if row[0] is not None]
+            if not pnls:
+                return None
             wins = sum(1 for p in pnls if p > 0)
             total = len(pnls)
             total_pnl = sum(pnls)
@@ -173,7 +179,6 @@ async def get_today_trades():
         return None
 
 async def export_db_to_json():
-    """将数据库关键表导出为 JSON 字符串"""
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             db.row_factory = aiosqlite.Row
