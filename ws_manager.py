@@ -11,12 +11,13 @@ class WSDataManager:
     def __init__(self, exchange_rest):
         self.rest = exchange_rest
         self.exchange = None
-        self.tickers = {}
-        self.orderbooks = {}
+        self.tickers = {}          # symbol -> {last, bid, ask, timestamp}
+        self.orderbooks = {}       # symbol -> {bids, asks, timestamp}
         self._running = False
         self._lock = asyncio.Lock()
 
     async def connect(self):
+        """建立 WebSocket 连接"""
         name = settings.EXCHANGE_NAME
         key = settings.OKX_API_KEY or settings.API_KEY
         secret = settings.OKX_SECRET_KEY or settings.SECRET_KEY
@@ -39,9 +40,11 @@ class WSDataManager:
         return True
 
     async def watch_tickers(self, symbols):
+        """批量订阅所有币种价格（使用 watch_tickers 并发）"""
         self._running = True
         while self._running:
             try:
+                # 一次订阅所有币种，CCXT 内部复用 WebSocket 连接
                 tickers = await self.exchange.watch_tickers(symbols)
                 if tickers:
                     async with self._lock:
@@ -58,8 +61,10 @@ class WSDataManager:
                 await asyncio.sleep(1)
 
     async def watch_orderbooks(self, symbols, limit=5):
+        """批量订阅订单簿（使用 watch_order_books）"""
         while self._running:
             try:
+                # 批量订阅所有币种订单簿
                 orderbooks = await self.exchange.watch_order_books(symbols, limit)
                 if orderbooks:
                     async with self._lock:
@@ -75,12 +80,15 @@ class WSDataManager:
                 await asyncio.sleep(1)
 
     def get_ticker(self, symbol):
+        """获取缓存的最新价格（非阻塞）"""
         return self.tickers.get(symbol)
 
     def get_orderbook(self, symbol):
+        """获取缓存的最新订单簿（非阻塞）"""
         return self.orderbooks.get(symbol)
 
     def get_last_price(self, symbol):
+        """获取最新成交价"""
         ticker = self.tickers.get(symbol)
         if ticker:
             return ticker['last']
