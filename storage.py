@@ -1,5 +1,5 @@
 """
-storage.py - SQLite 数据库管理（含状态持久化、交易详情、学习统计）
+storage.py - SQLite 数据库管理（含索引优化、状态持久化）
 """
 import aiosqlite
 import json
@@ -17,11 +17,12 @@ DEFAULT_CONFIG = {
     "auto_trade_enabled": False, "auto_min_score": 75,
     "max_per_coin_usdt": 0, "max_daily_loss_pct": 0.05,
     "max_total_allocated_pct": 1.0, "max_positions_per_coin": 18,
-    "grid_configs": "{}", "coin_configs": "{}"
+    "grid_configs": "{}", "coin_configs": "{}",
+    "max_drawdown_pct": 0.15
 }
 
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,15 +33,22 @@ async def init_db():
             time TEXT, symbol TEXT, side TEXT,
             price REAL, amount REAL, signal_score INTEGER,
             fear_greed INTEGER, funding_rate REAL, pnl_pct REAL,
-            real_cost REAL DEFAULT 0, real_revenue REAL DEFAULT 0)''')
+            real_cost REAL DEFAULT 0, real_revenue REAL DEFAULT 0,
+            net_pnl_pct REAL DEFAULT 0)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS runtime_state (
             key TEXT PRIMARY KEY, value TEXT)''')
+        # 添加索引
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_details_time ON trade_details(time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_details_symbol ON trade_details(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_details_side ON trade_details(side)")
         await db.commit()
 
 async def load_config():
     config = dict(DEFAULT_CONFIG)
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             async with db.execute("SELECT key, value FROM config") as cursor:
                 async for row in cursor:
                     key, value = row
@@ -61,7 +69,7 @@ async def load_config():
 
 async def save_config(cfg: dict):
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             for key, value in cfg.items():
                 if isinstance(value, list):
                     value = ",".join(value)
@@ -78,7 +86,7 @@ async def save_config(cfg: dict):
 async def load_trades(limit=50):
     trades = []
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             async with db.execute(
                 "SELECT time, symbol, entry, exit, pnl_pct, net_pnl, net_pnl_pct FROM trades ORDER BY id DESC LIMIT ?",
                 (limit,)
@@ -95,7 +103,7 @@ async def load_trades(limit=50):
 
 async def save_trade(trade: dict):
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             await db.execute(
                 "INSERT INTO trades (time, symbol, entry, exit, pnl_pct, net_pnl, net_pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (trade["time"], trade["symbol"], trade["entry"], trade["exit"], trade["pnl_pct"],
@@ -107,20 +115,21 @@ async def save_trade(trade: dict):
 
 async def save_trade_detail(detail: dict):
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             await db.execute(
-                "INSERT INTO trade_details (time, symbol, side, price, amount, signal_score, fear_greed, funding_rate, pnl_pct, real_cost, real_revenue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO trade_details (time, symbol, side, price, amount, signal_score, fear_greed, funding_rate, pnl_pct, real_cost, real_revenue, net_pnl_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (detail["time"], detail["symbol"], detail["side"], detail["price"], detail["amount"],
                  detail.get("signal_score", 0), detail.get("fear_greed", 0), detail.get("funding_rate", 0),
-                 detail.get("pnl_pct", 0), detail.get("real_cost", 0), detail.get("real_revenue", 0))
+                 detail.get("pnl_pct", 0), detail.get("real_cost", 0), detail.get("real_revenue", 0),
+                 detail.get("net_pnl_pct", 0))
             )
             await db.commit()
     except Exception as e:
         logger.error(f"保存交易详情失败: {e}")
 
-async def get_recent_performance(num=10):
+async def get_recent_performance(num=50):
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             async with db.execute(
                 "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL ORDER BY id DESC LIMIT ?",
                 (num,)
@@ -147,7 +156,7 @@ async def get_recent_performance(num=10):
 async def get_today_trades():
     today_str = datetime.now(CST).strftime("%m-%d")
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             async with db.execute(
                 "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL AND time LIKE ? ORDER BY id DESC",
                 (today_str + '%',)
@@ -175,7 +184,7 @@ async def get_today_trades():
 
 async def export_db_to_json():
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM config") as cursor:
                 configs = [dict(row) async for row in cursor]
@@ -192,11 +201,12 @@ async def export_db_to_json():
 async def save_runtime_state(state: dict):
     """保存运行时状态（仓位计数、入场价、峰值资产等）"""
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             for key, value in state.items():
+                val_str = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
                 await db.execute(
                     "INSERT OR REPLACE INTO runtime_state (key, value) VALUES (?, ?)",
-                    (key, json.dumps(value) if not isinstance(value, str) else value)
+                    (key, val_str)
                 )
             await db.commit()
     except Exception as e:
@@ -206,7 +216,7 @@ async def load_runtime_state():
     """恢复运行时状态"""
     state = {}
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
             async with db.execute("SELECT key, value FROM runtime_state") as cursor:
                 async for row in cursor:
                     key, value = row
