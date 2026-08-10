@@ -1,8 +1,10 @@
 """
-exchange.py - 多交易所管理器（修复余额解析、订单取消返回值）
+exchange.py - 多交易所管理器
+修复：fetch_balance 过滤系统保留键 / 异常日志输出 / 沙箱模式标准化
 """
 import os
 import asyncio
+import traceback
 import ccxt.async_support as ccxt
 from config import settings, logger
 
@@ -49,7 +51,11 @@ class ExchangeManager:
                     self.exchange.set_sandbox_mode(True)
                     logger.info("🧪 OKX 模拟盘模式已启用")
                 elif name == 'binance':
+                    # ✅ 修复：使用官方标准沙箱方法，替代手动覆盖 urls
                     self.exchange.set_sandbox_mode(True)
+                    logger.info("🧪 Binance 模拟盘模式已启用")
+                else:
+                    logger.warning(f"⚠️ 交易所 {name} 暂不支持模拟盘模式")
 
             logger.info(f"✅ 交易所连接成功: {name}")
         except Exception as e:
@@ -92,20 +98,20 @@ class ExchangeManager:
             try:
                 res = await self.exchange.fetch_funding_rate(symbol)
                 return res.get('fundingRate', None) if isinstance(res, dict) else None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"获取资金费率失败 {symbol}: {e}")
         return None
 
     async def fetch_long_short_ratio(self, symbol):
         if self.exchange:
             try:
                 return await self.exchange.fetch_long_short_ratio(symbol)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"获取多空比失败 {symbol}: {e}")
         return None
 
     async def fetch_balance(self):
-        """修复余额解析，增加健壮性"""
+        """获取账户余额（修复：过滤 CCXT 系统保留键）"""
         if not self.exchange:
             return {'USDT': {'free': 0}}
         try:
@@ -113,59 +119,72 @@ class ExchangeManager:
             if not raw:
                 return {'USDT': {'free': 0}}
 
-            # 方法1：标准 ccxt 余额格式
-            if isinstance(raw, dict):
-                result = {}
-                for key, val in raw.items():
-                    if isinstance(val, dict) and 'free' in val:
-                        result[key] = val
-                    elif isinstance(val, (int, float)):
-                        result[key] = {'free': float(val), 'used': 0, 'total': float(val)}
-                if result:
-                    return result
+            result = {}
+            # ✅ CCXT 标准余额结构中，顶层可能包含 'free', 'used', 'total', 'info' 等系统键
+            # 这些键也是 dict 类型，需过滤掉，避免被当作币种处理
+            system_keys = {'info', 'free', 'used', 'total', 'datetime', 'timestamp'}
 
-            # 方法2：OKX 特殊格式
-            info = raw.get('info') if isinstance(raw, dict) else None
-            if isinstance(info, dict):
-                data_list = info.get('data')
-                if isinstance(data_list, list):
-                    result = {}
-                    for item in data_list:
-                        if isinstance(item, dict):
-                            ccy = item.get('ccy', '')
-                            if ccy:
-                                avail = float(item.get('availBal', 0))
-                                frozen = float(item.get('frozenBal', 0))
-                                result[ccy] = {'free': avail, 'used': frozen, 'total': avail + frozen}
-                    if result:
-                        return result
+            for key, val in raw.items():
+                # 跳过系统保留键
+                if key in system_keys:
+                    continue
+                # 标准币种数据结构：{'free': xxx, 'used': xxx, 'total': xxx}
+                if isinstance(val, dict) and 'free' in val:
+                    result[key] = {
+                        'free': float(val.get('free', 0)),
+                        'used': float(val.get('used', 0)),
+                        'total': float(val.get('total', 0))
+                    }
+                # 兼容部分交易所返回数值型直接量
+                elif isinstance(val, (int, float)):
+                    result[key] = {'free': float(val), 'used': 0, 'total': float(val)}
 
-            return {'USDT': {'free': 0}}
+            # 若解析失败，兜底返回 USDT 0
+            if not result:
+                logger.warning("⚠️ 余额解析结果为空，请检查交易所返回格式")
+                return {'USDT': {'free': 0}}
+
+            return result
+
         except Exception as e:
-            logger.error(f"获取余额失败: {e}")
+            logger.error(f"获取余额异常: {e}\n{traceback.format_exc()}")
             return {'USDT': {'free': 0}}
 
     async def create_market_buy_order(self, symbol, amount):
-        if self.exchange:
-            try:
-                return await self.exchange.create_order(symbol, 'market', 'buy', amount)
-            except Exception as e:
-                logger.error(f"市价买单失败 {symbol}: {e}")
-        return None
+        """市价买入（修复：异常日志输出）"""
+        if not self.exchange:
+            logger.error("❌ 交易所未初始化")
+            return None
+        try:
+            # 部分交易所对 amount 有精度限制，建议外部调用时预先处理
+            order = await self.exchange.create_order(symbol, 'market', 'buy', amount)
+            logger.info(f"✅ 市价买单成功 {symbol} 数量:{amount:.6f}")
+            return order
+        except Exception as e:
+            # ✅ 修复：输出完整异常信息，便于实盘调试
+            logger.error(f"❌ 市价买单失败 [{symbol}] amount={amount:.6f}: {e}\n{traceback.format_exc()}")
+            return None
 
     async def create_market_sell_order(self, symbol, amount):
-        if self.exchange:
-            try:
-                return await self.exchange.create_order(symbol, 'market', 'sell', amount)
-            except Exception as e:
-                logger.error(f"市价卖单失败 {symbol}: {e}")
-        return None
+        """市价卖出（修复：异常日志输出）"""
+        if not self.exchange:
+            logger.error("❌ 交易所未初始化")
+            return None
+        try:
+            order = await self.exchange.create_order(symbol, 'market', 'sell', amount)
+            logger.info(f"✅ 市价卖单成功 {symbol} 数量:{amount:.6f}")
+            return order
+        except Exception as e:
+            # ✅ 修复：输出完整异常信息，便于实盘调试
+            logger.error(f"❌ 市价卖单失败 [{symbol}] amount={amount:.6f}: {e}\n{traceback.format_exc()}")
+            return None
 
     async def cancel_all_orders(self, symbol):
         """取消所有订单，返回是否成功"""
         if self.exchange:
             try:
                 result = await self.exchange.cancel_all_orders(symbol)
+                logger.info(f"✅ 已取消 {symbol} 全部挂单")
                 return result is not None
             except Exception as e:
                 logger.warning(f"取消订单失败 {symbol}: {e}")
@@ -175,3 +194,4 @@ class ExchangeManager:
     async def close(self):
         if self.exchange:
             await self.exchange.close()
+            logger.info("🔌 交易所连接已关闭")
