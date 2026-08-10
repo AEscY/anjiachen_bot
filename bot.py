@@ -1,5 +1,5 @@
 """
-bot.py - 最终完整版（WebSocket 实时数据、状态持久化、AI 动态优化、监控告警、动态阈值、全部命令）
+bot.py - 最终完整版（固定间距网格、动态仓位、智能布林、BTC风控、成交量过滤、RSI底背离、WebSocket实时数据、状态持久化、AI优化、告警、全部命令）
 """
 import asyncio, random, aiohttp, os, json, aiosqlite
 from datetime import datetime, timezone, timedelta
@@ -123,10 +123,15 @@ class QuantBot:
         self.max_total_allocated_pct = 1.0
         self.max_drawdown_pct = 0.15
         self.api_error_count = 0; self.max_api_errors = 5; self.api_error_pause_time = 0
-
         self.max_positions_per_coin = 18
         self.position_counts = {}
         self.coin_configs = {}
+        self.grid_configs = {}  # symbol -> {"drop_pct":3, "base_amount":1, "increment":0.5}
+        self.btc_risk_paused = False
+        self._last_btc_check_time = 0
+        self._rsi_history = {}
+        self._volume_history = {}
+        self._last_grid_entry = {}
 
         self.taker_fee = settings.TAKER_FEE; self.maker_fee = settings.MAKER_FEE
         self.min_profit_margin = settings.MIN_PROFIT_MARGIN
@@ -141,7 +146,6 @@ class QuantBot:
         self.entry_details = {}
         self.consecutive_failures = 0; self.last_failure_time = 0
         self.peak_total_value = 0
-
         self.learning_enabled = True; self.last_learning_check = 0
         self.ai_optimize_count = 0
 
@@ -173,6 +177,8 @@ class QuantBot:
                 CommandHandler("setcoin", self.cmd_set_coin),
                 CommandHandler("resetcoin", self.cmd_reset_coin),
                 CommandHandler("coininfo", self.cmd_coin_info),
+                CommandHandler("setgrid", self.cmd_set_grid),
+                CommandHandler("resetgrid", self.cmd_reset_grid),
                 CommandHandler("learn", self.cmd_learn),
                 CommandHandler("stats", self.cmd_stats),
                 CommandHandler("backup", self.cmd_backup),
@@ -218,6 +224,11 @@ class QuantBot:
             try: self.coin_configs = json.loads(coin_cfg_raw)
             except: self.coin_configs = {}
         elif isinstance(coin_cfg_raw, dict): self.coin_configs = coin_cfg_raw
+        grid_cfg_raw = cfg.get('grid_configs', '{}')
+        if isinstance(grid_cfg_raw, str):
+            try: self.grid_configs = json.loads(grid_cfg_raw)
+            except: self.grid_configs = {}
+        elif isinstance(grid_cfg_raw, dict): self.grid_configs = grid_cfg_raw
         self.trades = await load_trades()
 
         state = await load_runtime_state()
@@ -247,7 +258,8 @@ class QuantBot:
             'auto_min_score': self.auto_min_score, 'max_per_coin_usdt': self.max_per_coin_usdt,
             'max_daily_loss_pct': self.max_daily_loss_pct, 'max_total_allocated_pct': self.max_total_allocated_pct,
             'max_drawdown_pct': self.max_drawdown_pct, 'max_positions_per_coin': self.max_positions_per_coin,
-            'coin_configs': json.dumps(self.coin_configs)
+            'coin_configs': json.dumps(self.coin_configs),
+            'grid_configs': json.dumps(self.grid_configs)
         }
         await save_config(cfg)
 
@@ -278,8 +290,104 @@ class QuantBot:
                 await self._save_config()
                 await self._alert(f"🤖 AI 动态优化完成\n止盈: {self.tp_pct*100:.1f}%\n止损: {self.sl_pct*100:.1f}%")
 
+    async def _check_btc_risk(self):
+        now = asyncio.get_event_loop().time()
+        if now - self._last_btc_check_time < 60:
+            return not self.btc_risk_paused
+        self._last_btc_check_time = now
+        try:
+            btc_sym = "BTC/USDT"
+            if btc_sym not in self.symbols: return True
+            ticker = self.ws.get_ticker(btc_sym)
+            if ticker is None: ticker = await self.exchange.fetch_ticker(btc_sym)
+            if ticker is None: return True
+            change_24h = ticker.get('percentage', ticker.get('change', 0))
+            if change_24h is None: return True
+            if change_24h < -5:
+                if not self.btc_risk_paused:
+                    await self._alert(f"🚨 BTC 24h 跌幅 {change_24h:.1f}%，暂停山寨币交易", "critical")
+                    self.btc_risk_paused = True
+                return False
+            if change_24h > -3 and self.btc_risk_paused:
+                await self._alert(f"✅ BTC 跌幅收窄至 {change_24h:.1f}%，恢复山寨币交易", "info")
+                self.btc_risk_paused = False
+            return True
+        except Exception as e:
+            logger.error(f"BTC风险检查失败: {e}")
+            return True
+
+    def _check_rsi_divergence(self, symbol, current_tech):
+        try:
+            if symbol not in self._rsi_history:
+                self._rsi_history[symbol] = []
+            history = self._rsi_history[symbol]
+            history.append({
+                'price': current_tech['bb_middle'],
+                'rsi': current_tech['rsi'],
+                'time': asyncio.get_event_loop().time()
+            })
+            if len(history) > 20: history.pop(0)
+            if len(history) < 5: return False
+            recent_prices = [h['price'] for h in history[-5:]]
+            recent_rsi = [h['rsi'] for h in history[-5:]]
+            price_new_low = recent_prices[-1] < min(recent_prices[:-1])
+            rsi_not_new_low = recent_rsi[-1] > min(recent_rsi[:-1])
+            return price_new_low and rsi_not_new_low
+        except Exception:
+            return False
+
+    def _get_avg_volume(self, symbol):
+        try:
+            if symbol not in self._volume_history or len(self._volume_history[symbol]) < 5:
+                return 0
+            return sum(self._volume_history[symbol]) / len(self._volume_history[symbol])
+        except: return 0
+
+    def _get_dynamic_amount(self, sym):
+        """根据恐惧贪婪指数动态调整单笔仓位"""
+        base_amount = self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)
+        fg = self.real_data._fear_greed_cache.get('value', 50)
+        if fg < 25:
+            factor = 0.5
+        elif fg < 45:
+            factor = 0.8
+        elif fg > 75:
+            factor = 1.0
+        else:
+            factor = 1.0
+        return max(1, int(base_amount * factor))
+
+    # ---------- 固定间距网格命令 ----------
+    async def cmd_set_grid(self, update, context):
+        if not self._auth(update): return
+        try:
+            sym = context.args[0].upper()
+            drop_pct = float(context.args[1]) / 100.0
+            base_amount = float(context.args[2])
+            increment = float(context.args[3]) if len(context.args) > 3 else 1.0
+            self.grid_configs[sym] = {"drop_pct": drop_pct, "base_amount": base_amount, "increment": increment}
+            await self._save_config()
+            await update.effective_message.reply_text(
+                f"✅ {sym} 固定网格: 每跌{drop_pct*100:.1f}%买一次, 起始{base_amount}U, 递增{increment}U"
+            )
+        except:
+            await update.effective_message.reply_text("❌ 格式: /setgrid SOL 3 1 0.5")
+
+    async def cmd_reset_grid(self, update, context):
+        if not self._auth(update): return
+        try:
+            sym = context.args[0].upper()
+            if sym in self.grid_configs:
+                del self.grid_configs[sym]
+                await self._save_config()
+                await update.effective_message.reply_text(f"✅ {sym} 固定网格已移除")
+            else:
+                await update.effective_message.reply_text(f"⚠️ {sym} 没有固定网格")
+        except:
+            await update.effective_message.reply_text("❌ 格式: /resetgrid SOL")
+
     # =================================================================
-    # 所有命令处理函数（完整版，无省略）
+    # 以下为所有命令处理函数（完整版，无省略）
     # =================================================================
     def _auth(self, update: Update):
         if not self.allowed: return True
@@ -343,7 +451,6 @@ class QuantBot:
         kb.append([InlineKeyboardButton("🔙 返回", callback_data="refresh_panel")])
         return InlineKeyboardMarkup(kb)
 
-    # ---- 命令处理 ----
     async def cmd_menu(self, update, context):
         if not self._auth(update): await update.message.reply_text("⛔ 未授权"); return
         await update.effective_message.reply_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
@@ -585,6 +692,8 @@ class QuantBot:
             f"/setcoin DOGE tp 1  独立设币种参数\n"
             f"/resetcoin SOL  重置币种参数\n"
             f"/coininfo  查看币种参数和盈亏\n"
+            f"/setgrid SOL 3 1 0.5  固定间距网格\n"
+            f"/resetgrid SOL  移除固定网格\n"
             f"/preset SOL滚雪球  一键高频方案\n"
             f"/setmaxpos 18 仓位上限 /setmaxalloc 100 总仓位上限\n"
             f"/autotrade on /learn on\n"
@@ -921,7 +1030,7 @@ class QuantBot:
             self.position_counts[sym] = 0
         await self._save_runtime_state()
 
-    # ==================== 自动交易（WebSocket 价格 + 动态阈值） ====================
+    # ==================== 自动交易（集成固定网格和动态仓位） ====================
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
         while True:
@@ -972,6 +1081,10 @@ class QuantBot:
                 candidates = []
                 for sym in self.symbols:
                     try:
+                        if sym != "BTC/USDT":
+                            if not await self._check_btc_risk():
+                                continue
+
                         ticker = self.ws.get_ticker(sym)
                         if ticker is None: continue
                         p = ticker['last']
@@ -982,33 +1095,64 @@ class QuantBot:
                         if count >= self.max_positions_per_coin: continue
                         if self.max_per_coin_usdt > 0 and coin_value >= self.max_per_coin_usdt: continue
 
-                        tech_vol = await self.tech.calc(sym, self.timeframe, 20)
-                        vol_factor = max(1.5, min(2.5, 2.0 * (tech_vol['atr'] / tech_vol['bb_middle'] * 100)))
-                        tech = await self.tech.calc(sym, self.timeframe, 50, bb_multiplier=vol_factor)
+                        # 固定间距网格检查
+                        grid = self.grid_configs.get(sym)
+                        if grid:
+                            last_entry = self._last_grid_entry.get(sym, p)
+                            drop_from_last = (p - last_entry) / last_entry if last_entry else 0
+                            if drop_from_last > -grid["drop_pct"]:
+                                continue
+                            coin_amount = grid["base_amount"] * (1 + count * grid["increment"])
+                            self._last_grid_entry[sym] = p
+                        else:
+                            # 动态布林网格
+                            tech_vol = await self.tech.calc(sym, self.timeframe, 20)
+                            vol_factor = max(1.5, min(2.5, 2.0 * (tech_vol['atr'] / tech_vol['bb_middle'] * 100)))
+                            tech = await self.tech.calc(sym, self.timeframe, 50, bb_multiplier=vol_factor)
 
-                        volatility = tech['atr'] / tech['bb_middle']
-                        bb_threshold = 1.01 + min(0.03, volatility * 100)
-                        if p > tech['bb_lower'] * bb_threshold: continue
+                            volatility = tech['atr'] / tech['bb_middle']
+                            bb_threshold = 1.01 + min(0.04, volatility * 150)
+                            if p > tech['bb_lower'] * bb_threshold:
+                                continue
 
-                        funding = await self.exchange.fetch_funding_rate(sym)
-                        sc = self.signal_engine.score(tech, funding, fg)
-                        coin_score = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
-                        if sc < coin_score: continue
+                            # 成交量过滤
+                            if 'volume' in tech:
+                                if sym not in self._volume_history:
+                                    self._volume_history[sym] = []
+                                self._volume_history[sym].append(tech['volume'])
+                                if len(self._volume_history[sym]) > 20:
+                                    self._volume_history[sym].pop(0)
+                                avg_vol = self._get_avg_volume(sym)
+                                if avg_vol > 0 and tech['volume'] > avg_vol * 1.5:
+                                    continue
 
-                        if self.orderbook_filter:
-                            ob = self.ws.get_orderbook(sym)
-                            if ob is None: continue
-                            ob_valid, _ = await self.orderbook_engine.validate(ob)
-                            if not ob_valid: continue
+                            funding = await self.exchange.fetch_funding_rate(sym)
+                            sc = self.signal_engine.score(tech, funding, fg)
+                            coin_score = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
+                            if sc < coin_score: continue
 
-                        dyn_tp, dyn_sl = await self._adjust_tp_sl_by_volatility(sym)
-                        candidates.append((sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor))
+                            if self._check_rsi_divergence(sym, tech):
+                                sc += 10
+
+                            if self.orderbook_filter:
+                                ob = self.ws.get_orderbook(sym)
+                                if ob is None: continue
+                                ob_valid, _ = await self.orderbook_engine.validate(ob)
+                                if not ob_valid: continue
+
+                            coin_amount = self._get_dynamic_amount(sym)  # 动态仓位
+                            dyn_tp, dyn_sl = await self._adjust_tp_sl_by_volatility(sym)
+                            candidates.append((sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor, coin_amount))
                     except Exception: continue
 
                 candidates.sort(key=lambda x: x[0], reverse=True)
 
-                for sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor in candidates:
-                    coin_amount = self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)
+                for item in candidates:
+                    if len(item) == 8:
+                        sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor, coin_amount = item
+                    else:
+                        sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor = item
+                        coin_amount = self._get_dynamic_amount(sym)
                     if usdt_free < coin_amount + self.reserve_bottom: break
                     coin = sym.split('/')[0]; old_usdt_free = usdt_free
                     order = await self.exchange.create_market_buy_order(sym, coin_amount / p)
@@ -1153,9 +1297,9 @@ class QuantBot:
             try:
                 await self.tg_app.initialize(); await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ Bot WebSocket 实时版启动")
+                logger.info("✅ Bot 完整版启动")
                 if settings.TG_CHAT_ID:
-                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (WebSocket 实时版)")
+                    try: await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text="🤖 量化机器人已上线 (固定网格+动态仓位版)")
                     except: pass
                 while True: await asyncio.sleep(30)
             except Exception as e:
