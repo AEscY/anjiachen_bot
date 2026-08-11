@@ -1741,6 +1741,8 @@ class QuantBot:
 
                 candidates.sort(key=lambda x: x[0], reverse=True)
 
+                opened_coins = set()  # ✅ 记录本轮已开仓的币种
+
                 for item in candidates:
                     if len(item) == 8:
                         sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor, coin_amount = item
@@ -1748,11 +1750,16 @@ class QuantBot:
                         sc, sym, p, funding, dyn_tp, dyn_sl, vol_factor = item
                         coin_amount = self._get_dynamic_amount(sym)
 
+                    # ✅ 如果这个币种本轮已经开过仓，跳过（防止单币种重复）
+                    if sym in opened_coins:
+                        continue
+
                     if usdt_free < coin_amount + self.reserve_bottom:
                         break
 
                     coin = sym.split('/')[0]
                     old_usdt_free = usdt_free
+                    old_balance = self._cached_balances.get(coin, 0)
 
                     raw_amount = coin_amount / p
                     rounded_amount = await self._round_amount_by_precision(sym, raw_amount)
@@ -1765,13 +1772,15 @@ class QuantBot:
                         self.daily_trades += 1
                         await asyncio.sleep(2)
 
-                        new_bal = await self.exchange.fetch_balance()
-                        new_free = new_bal.get(coin, {}).get('free', 0) if isinstance(new_bal.get(coin), dict) else 0
-                        old_free = self._cached_balances.get(coin, 0)
+                        await self._refresh_balance_cache(force=True)
+                        new_balance = self._cached_balances.get(coin, 0)
+                        new_usdt_free = self._cached_usdt_free
 
-                        if new_free > old_free:
-                            new_usdt_free = self._get_usdt_free(new_bal)
-                            real_cost = old_usdt_free - new_usdt_free
+                        real_cost = old_usdt_free - new_usdt_free
+                        if real_cost <= 0:
+                            real_cost = coin_amount
+
+                        if new_balance > old_balance:
                             self.entries[sym] = p
                             self._trailing_high[sym] = p
                             self._trailing_active[sym] = False
@@ -1798,8 +1807,9 @@ class QuantBot:
                             })
                             await self._save_runtime_state()
                             self.consecutive_failures = 0
-                            await self._refresh_balance_cache(force=True)
-                            usdt_free = self._cached_usdt_free
+                            usdt_free = new_usdt_free
+                            opened_coins.add(sym)  # ✅ 标记该币种已开仓
+
                             if settings.TG_CHAT_ID:
                                 try:
                                     await self.tg_app.bot.send_message(
@@ -1811,7 +1821,10 @@ class QuantBot:
                         else:
                             self.consecutive_failures += 1
                             self.last_failure_time = asyncio.get_event_loop().time()
-                        await asyncio.sleep(2)
+                    else:
+                        self.consecutive_failures += 1
+                        self.last_failure_time = asyncio.get_event_loop().time()
+                    await asyncio.sleep(1)  # 轻微间隔，防止API限频
                     else:
                         self.consecutive_failures += 1
                         self.last_failure_time = asyncio.get_event_loop().time()
