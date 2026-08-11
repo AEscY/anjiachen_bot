@@ -1,5 +1,5 @@
 """
-bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强 / 补全cmd_check）
+bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强 / 补全cmd_check / 删除XRP、MATIC）
 """
 import asyncio
 import aiohttp
@@ -245,6 +245,7 @@ class QuantBot:
                 CommandHandler("learn", self.cmd_learn),
                 CommandHandler("stats", self.cmd_stats),
                 CommandHandler("backup", self.cmd_backup),
+                CommandHandler("setcoinonly", self.cmd_setcoinonly),
             ]
             for h in handlers:
                 self.tg_app.add_handler(h)
@@ -815,8 +816,6 @@ class QuantBot:
                 "SOL滚雪球": {"tp": 1.0, "sl": 0.5, "tsl": 0.5, "tmpt": 0.3, "tf": "1m", "amt": 1, "reserve": 1, "score": 60},
                 "DOGE滚雪球": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 1, "reserve": 1, "score": 60},
                 "ADA滚雪球": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60},
-                "XRP滚雪球": {"tp": 1.0, "sl": 0.5, "tsl": 0.5, "tmpt": 0.3, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60},
-                "MATIC滚雪球": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60},
             }
             if mode not in presets:
                 await update.effective_message.reply_text("可选: conservative/balanced/aggressive/滚雪球系列")
@@ -841,8 +840,6 @@ class QuantBot:
                 "SOL滚雪球": "SOL滚雪球",
                 "DOGE滚雪球": "DOGE滚雪球",
                 "ADA滚雪球": "ADA滚雪球",
-                "XRP滚雪球": "XRP滚雪球",
-                "MATIC滚雪球": "MATIC滚雪球"
             }
             await update.effective_message.reply_text(
                 f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct * 100:.1f}% 止损{self.sl_pct * 100:.1f}%"
@@ -1028,6 +1025,7 @@ class QuantBot:
             f"/setmaxpos 18 仓位上限 /setmaxalloc 100 总仓位上限\n"
             f"/autotrade on /learn on\n"
             f"/preset balanced /panic 全平\n"
+            f"/setcoinonly ETH  一键固定币种\n"
             f"保本线: >{self.breakeven_pct * 100:.2f}%"
         )
 
@@ -1118,22 +1116,26 @@ class QuantBot:
             return
         try:
             sym = context.args[0].upper()
+            if "/" not in sym:
+                sym = sym + "/USDT"
             self.symbols.append(sym)
             await self._save_config()
-            await update.effective_message.reply_text("✅")
+            await update.effective_message.reply_text(f"✅ 已添加 {sym}")
         except:
-            pass
+            await update.effective_message.reply_text("❌ 格式: /addsymbol ETH")
 
     async def cmd_del_symbol(self, update, context):
         if not self._auth(update):
             return
         try:
             sym = context.args[0].upper()
+            if "/" not in sym:
+                sym = sym + "/USDT"
             self.symbols.remove(sym)
             await self._save_config()
-            await update.effective_message.reply_text("✅")
+            await update.effective_message.reply_text(f"✅ 已删除 {sym}")
         except:
-            pass
+            await update.effective_message.reply_text("❌ 格式: /delsymbol ETH")
 
     # ==================== 固定网格命令 ====================
 
@@ -1277,6 +1279,56 @@ class QuantBot:
         lines.append("💡 /setcoin 修改独立参数 | /resetcoin 重置为全局")
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+    # ==================== 一键固定币种命令 ====================
+
+    async def cmd_setcoinonly(self, update, context):
+        """一键固定币种：清空列表 + 应用对应参数"""
+        if not self._auth(update):
+            return
+        try:
+            sym = context.args[0].upper()
+            if "/" not in sym:
+                sym = sym + "/USDT"
+
+            self.symbols = [sym]
+
+            presets = {
+                "ETH/USDT": {"tp": 0.8, "sl": 0.5, "tsl": 0.5, "tmpt": 0.3, "tf": "1m", "amt": 10, "reserve": 5, "score": 60},
+                "BTC/USDT": {"tp": 0.6, "sl": 0.4, "tsl": 0.4, "tmpt": 0.2, "tf": "1m", "amt": 10, "reserve": 5, "score": 60},
+                "SOL/USDT": {"tp": 1.0, "sl": 0.5, "tsl": 0.5, "tmpt": 0.3, "tf": "1m", "amt": 1, "reserve": 1, "score": 60},
+                "DOGE/USDT": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 1, "reserve": 1, "score": 60},
+                "ADA/USDT": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60},
+            }
+
+            if sym in presets:
+                p = presets[sym]
+                self.tp_pct = p["tp"] / 100
+                self.sl_pct = p["sl"] / 100
+                self.trailing_sl_pct = p["tsl"] / 100
+                self.trailing_tp_pct = p["tmpt"] / 100
+                self.timeframe = p["tf"]
+                self.single_order_usdt = p["amt"]
+                self.reserve_bottom = p["reserve"]
+                self.auto_min_score = p["score"]
+                await self._save_config()
+                await update.effective_message.reply_text(
+                    f"✅ **已固定币种: {sym}**\n"
+                    f"• 止盈: {self.tp_pct*100:.1f}%\n"
+                    f"• 止损: {self.sl_pct*100:.1f}%\n"
+                    f"• 周期: {self.timeframe}\n"
+                    f"• 单笔: {self.single_order_usdt}U\n"
+                    f"• 阈值: {self.auto_min_score}分"
+                )
+            else:
+                await self._save_config()
+                await update.effective_message.reply_text(
+                    f"✅ **已固定币种: {sym}**\n"
+                    f"• 使用当前全局参数\n"
+                    f"• 可用 /setcoin 调整参数"
+                )
+        except Exception as e:
+            await update.effective_message.reply_text(f"❌ 格式: /setcoinonly ETH\n错误: {e}")
+
     async def render_brain_status(self, msg_obj):
         try:
             macro = await self.real_data.check_macro_risk()
@@ -1332,12 +1384,16 @@ class QuantBot:
                     self.timeframe = user_text.lower()
                 elif pending == "addsymbol":
                     sym = user_text.upper()
+                    if "/" not in sym:
+                        sym = sym + "/USDT"
                     if sym not in self.symbols:
                         self.symbols.append(sym)
                     else:
                         await update.message.reply_text("⚠️ 已存在")
                 elif pending == "delsymbol":
                     sym = user_text.upper()
+                    if "/" not in sym:
+                        sym = sym + "/USDT"
                     if sym in self.symbols:
                         self.symbols.remove(sym)
                     else:
@@ -1459,8 +1515,6 @@ class QuantBot:
                     ("🔥SOL", "SOL滚雪球"),
                     ("🔥DOGE", "DOGE滚雪球"),
                     ("🔥ADA", "ADA滚雪球"),
-                    ("🔥XRP", "XRP滚雪球"),
-                    ("🔥MATIC", "MATIC滚雪球")
                 ]
                 kb = [[InlineKeyboardButton(label, callback_data=f"preset:{val}") for label, val in opts[i:i + 2]] for i in range(0, len(opts), 2)]
                 kb.append([InlineKeyboardButton("🔙返回", callback_data="refresh_panel")])
@@ -1477,8 +1531,6 @@ class QuantBot:
                     "SOL滚雪球": {"tp": 1.0, "sl": 0.5, "tsl": 0.5, "tmpt": 0.3, "tf": "1m", "amt": 1, "reserve": 1, "score": 60},
                     "DOGE滚雪球": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 1, "reserve": 1, "score": 60},
                     "ADA滚雪球": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60},
-                    "XRP滚雪球": {"tp": 1.0, "sl": 0.5, "tsl": 0.5, "tmpt": 0.3, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60},
-                    "MATIC滚雪球": {"tp": 1.2, "sl": 0.6, "tsl": 0.6, "tmpt": 0.4, "tf": "1m", "amt": 0.5, "reserve": 0.5, "score": 60}
                 }[mode]
                 self.tp_pct = p["tp"] / 100
                 self.sl_pct = p["sl"] / 100
@@ -1529,7 +1581,7 @@ class QuantBot:
                 await query.edit_message_text("🔒", reply_markup=self._build_option_keyboard(opts, "cfg_res", "setreserve"))
                 await query.answer()
             elif data == "menu_add_symbol":
-                opts = [("BTC/USDT", "BTC/USDT"), ("SOL/USDT", "SOL/USDT"), ("DOGE/USDT", "DOGE/USDT"), ("ADA/USDT", "ADA/USDT"), ("XRP/USDT", "XRP/USDT"), ("MATIC/USDT", "MATIC/USDT")]
+                opts = [("BTC/USDT", "BTC/USDT"), ("SOL/USDT", "SOL/USDT"), ("DOGE/USDT", "DOGE/USDT"), ("ADA/USDT", "ADA/USDT")]
                 await query.edit_message_text("➕", reply_markup=self._build_option_keyboard(opts, "cfg_add", "addsymbol"))
                 await query.answer()
             elif data == "menu_del_symbol":
