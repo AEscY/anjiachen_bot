@@ -243,3 +243,42 @@ async def load_runtime_state():
     except Exception as e:
         logger.error(f"加载运行时状态失败: {e}")
     return state
+    
+    
+    async def get_total_fees():
+    """获取累计手续费（从 trade_details 的 real_cost 总和估算）"""
+    try:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+            async with db.execute(
+                "SELECT SUM(real_cost) FROM trade_details WHERE side='buy'"
+            ) as cursor:
+                row = await cursor.fetchone()
+                buy_cost = row[0] if row and row[0] else 0
+            async with db.execute(
+                "SELECT SUM(real_revenue) FROM trade_details WHERE side='sell'"
+            ) as cursor:
+                row = await cursor.fetchone()
+                sell_revenue = row[0] if row and row[0] else 0
+            # 估算手续费 ≈ (买入成本 + 卖出收入) * 0.001 (0.1%)
+            # 更精确：可以从 exchange 获取实际费率，但这里用估算
+            fees = (buy_cost + sell_revenue) * 0.001
+            return round(fees, 4)
+    except Exception as e:
+        logger.error(f"获取手续费失败: {e}")
+        return 0.0
+
+           async def get_total_net_profit():
+    """获取累计净收益（从 trade_details 的 real_revenue - real_cost 总和）"""
+    try:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+            async with db.execute(
+                "SELECT SUM(real_revenue - real_cost) FROM trade_details WHERE side='sell'"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return round(row[0] if row and row[0] else 0.0, 4)
+    except Exception as e:
+        logger.error(f"获取净收益失败: {e}")
+        return 0.0
+    
+    
+    
