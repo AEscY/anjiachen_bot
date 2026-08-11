@@ -1530,7 +1530,7 @@ class QuantBot:
         except:
             pass
 
-# ==================== 核心监控任务 ====================
+    # ==================== 核心监控任务 ====================
 
     async def panic_sell_all(self):
         for sym in self.symbols:
