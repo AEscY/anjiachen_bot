@@ -1,5 +1,5 @@
 """
-bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强）
+bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强 / 补全cmd_check）
 """
 import asyncio
 import aiohttp
@@ -944,6 +944,56 @@ class QuantBot:
         lines.append(f"• 累计净收益: {total_net_profit:+.4f} USDT")
 
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    # ==================== cmd_check 方法 ====================
+
+    async def cmd_check(self, update, context):
+        """📈 信号 + 开仓条件检查"""
+        if not self._auth(update):
+            return
+        lines = ["📈 **信号 + 开仓条件**\n"]
+        fg_data = await self.real_data.get_fear_greed_index()
+        fg = fg_data["value"] if fg_data else None
+        bal = await self.exchange.fetch_balance()
+        usdt_free = self._get_usdt_free(bal)
+        for sym in self.symbols:
+            try:
+                ticker = self.ws.get_ticker(sym)
+                if ticker is None:
+                    continue
+                p = ticker['last']
+                tech = await self.tech.calc(sym, self.timeframe, 50)
+                funding = await self.exchange.fetch_funding_rate(sym)
+                sc = self.signal_engine.score(tech, funding, fg)
+                txt = self.signal_engine.interpret(sc)
+                coin = sym.split('/')[0]
+                free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
+                coin_value = free * p
+                count = self.position_counts.get(sym, 0)
+                coin_score = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
+                cond_signal = sc >= coin_score
+                cond_price = p <= tech['bb_lower'] * 1.02
+                cond_book = True
+                if self.orderbook_filter:
+                    ob = self.ws.get_orderbook(sym)
+                    if ob is None:
+                        ob = await self.exchange.fetch_orderbook(sym)
+                    cond_book, _ = await self.orderbook_engine.validate(ob)
+                cond_pos = count < self.max_positions_per_coin
+                if self.max_per_coin_usdt > 0 and coin_value >= self.max_per_coin_usdt:
+                    cond_pos = False
+                coin_amount = self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)
+                cond_balance = usdt_free >= coin_amount + self.reserve_bottom
+                cond_daily = True if self.max_daily_trades <= 0 or self.daily_trades < self.max_daily_trades else False
+                cond_str = (f"{'✅' if cond_signal else '❌'}信({coin_score}) {'✅' if cond_price else '❌'}价 "
+                            f"{'✅' if cond_book else '❌'}盘 {'✅' if cond_pos else '❌'}仓({count}/{self.max_positions_per_coin}) "
+                            f"{'✅' if cond_balance else '❌'}钱 {'✅' if cond_daily else '❌'}天")
+                all_met = all([cond_signal, cond_price, cond_book, cond_pos, cond_balance, cond_daily])
+                status = "🎯 可开仓" if all_met else "⏳ 等待"
+                lines.append(f"{sym}: {p:.2f} | 信号: {txt} ({sc})\n   条件: {cond_str} → {status}")
+            except Exception:
+                continue
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_symbols(self, update, context):
         if not self._auth(update):
