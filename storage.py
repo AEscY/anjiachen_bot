@@ -1,5 +1,5 @@
 """
-storage.py - SQLite 数据库管理（修复 net_pnl_pct 列缺失 / 日期查询逻辑 / WAL 模式）
+storage.py - SQLite 数据库管理（含索引优化、状态持久化）
 """
 import aiosqlite
 import json
@@ -23,17 +23,12 @@ DEFAULT_CONFIG = {
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
-        # ✅ 开启 WAL 模式（写前日志），大幅减少锁库概率
         await db.execute("PRAGMA journal_mode=WAL;")
-        
         await db.execute('''CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)''')
-        
         await db.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT, symbol TEXT, entry REAL, exit REAL, pnl_pct REAL,
             net_pnl REAL DEFAULT 0, net_pnl_pct REAL DEFAULT 0)''')
-        
-        # ✅ 修复：新增 net_pnl_pct 列（之前仅存在于 trades 表，此处补齐）
         await db.execute('''CREATE TABLE IF NOT EXISTS trade_details (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             time TEXT, symbol TEXT, side TEXT,
@@ -41,11 +36,8 @@ async def init_db():
             fear_greed INTEGER, funding_rate REAL, pnl_pct REAL,
             real_cost REAL DEFAULT 0, real_revenue REAL DEFAULT 0,
             net_pnl_pct REAL DEFAULT 0)''')
-        
         await db.execute('''CREATE TABLE IF NOT EXISTS runtime_state (
             key TEXT PRIMARY KEY, value TEXT)''')
-        
-        # 索引优化
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(time)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_details_time ON trade_details(time)")
@@ -138,11 +130,9 @@ async def save_trade_detail(detail: dict):
     except Exception as e:
         logger.error(f"保存交易详情失败: {e}")
 
-# ==================== 修复 1：net_pnl_pct 列查询 ====================
 async def get_recent_performance(num=50):
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
-            # ✅ 修复：trade_details 现已包含 net_pnl_pct 列
             async with db.execute(
                 "SELECT net_pnl_pct FROM trade_details WHERE side='sell' AND net_pnl_pct IS NOT NULL ORDER BY id DESC LIMIT ?",
                 (num,)
@@ -166,12 +156,10 @@ async def get_recent_performance(num=50):
         logger.error(f"获取近期表现失败: {e}")
         return None
 
-# ==================== 修复 2：日期匹配改用 strftime ====================
 async def get_today_trades():
     today_str = datetime.now(CST).strftime("%m-%d")
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
-            # ✅ 修复：使用 strftime 函数按日期过滤，兼容所有时间格式
             async with db.execute(
                 """SELECT net_pnl_pct FROM trade_details 
                    WHERE side='sell' AND net_pnl_pct IS NOT NULL 
@@ -215,7 +203,6 @@ async def export_db_to_json():
         logger.error(f"导出数据库失败: {e}")
         return None
 
-# ========== 运行时状态持久化 ==========
 async def save_runtime_state(state: dict):
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
@@ -243,9 +230,10 @@ async def load_runtime_state():
     except Exception as e:
         logger.error(f"加载运行时状态失败: {e}")
     return state
-    
-    
-    async def get_total_fees():
+
+# ==================== 新增：统计函数 ====================
+
+async def get_total_fees():
     """获取累计手续费（从 trade_details 的 real_cost 总和估算）"""
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
@@ -259,15 +247,13 @@ async def load_runtime_state():
             ) as cursor:
                 row = await cursor.fetchone()
                 sell_revenue = row[0] if row and row[0] else 0
-            # 估算手续费 ≈ (买入成本 + 卖出收入) * 0.001 (0.1%)
-            # 更精确：可以从 exchange 获取实际费率，但这里用估算
             fees = (buy_cost + sell_revenue) * 0.001
             return round(fees, 4)
     except Exception as e:
         logger.error(f"获取手续费失败: {e}")
         return 0.0
 
-           async def get_total_net_profit():
+async def get_total_net_profit():
     """获取累计净收益（从 trade_details 的 real_revenue - real_cost 总和）"""
     try:
         async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
@@ -279,6 +265,3 @@ async def load_runtime_state():
     except Exception as e:
         logger.error(f"获取净收益失败: {e}")
         return 0.0
-    
-    
-    
