@@ -1076,6 +1076,40 @@ class QuantBot:
         except:
             pass
 
+    # ==================== 固定网格命令 ====================
+
+    async def cmd_set_grid(self, update, context):
+        if not self._auth(update):
+            return
+        try:
+            sym = context.args[0].upper()
+            drop_pct = float(context.args[1]) / 100.0
+            base_amount = float(context.args[2])
+            increment = float(context.args[3]) if len(context.args) > 3 else 1.0
+            self.grid_configs[sym] = {"drop_pct": drop_pct, "base_amount": base_amount, "increment": increment}
+            await self._save_config()
+            await update.effective_message.reply_text(
+                f"✅ {sym} 固定网格: 每跌{drop_pct*100:.1f}%买一次, 起始{base_amount}U, 递增{increment}U"
+            )
+        except:
+            await update.effective_message.reply_text("❌ 格式: /setgrid SOL 3 1 0.5")
+
+    async def cmd_reset_grid(self, update, context):
+        if not self._auth(update):
+            return
+        try:
+            sym = context.args[0].upper()
+            if sym in self.grid_configs:
+                del self.grid_configs[sym]
+                await self._save_config()
+                await update.effective_message.reply_text(f"✅ {sym} 固定网格已移除")
+            else:
+                await update.effective_message.reply_text(f"⚠️ {sym} 没有固定网格")
+        except:
+            await update.effective_message.reply_text("❌ 格式: /resetgrid SOL")
+
+    # ==================== 币种独立参数命令 ====================
+
     async def cmd_set_coin(self, update, context):
         if not self._auth(update):
             return
