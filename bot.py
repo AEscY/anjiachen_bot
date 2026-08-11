@@ -1,5 +1,5 @@
 """
-bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强 / 补全cmd_check / 删除XRP、MATIC）
+bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强 / 补全cmd_check / 删除XRP、MATIC / 修复setcoin持久化）
 """
 import asyncio
 import aiohttp
@@ -310,24 +310,52 @@ class QuantBot:
         self.max_total_allocated_pct = 1.0
         self.max_drawdown_pct = cfg.get('max_drawdown_pct', 0.15)
         self.max_positions_per_coin = cfg.get('max_positions_per_coin', 18)
+
+        # ========== 修复 coin_configs 加载逻辑 ==========
+        # 从数据库获取 coin_configs 原始值
         coin_cfg_raw = cfg.get('coin_configs', '{}')
-        if isinstance(coin_cfg_raw, str):
-            try:
-                self.coin_configs = json.loads(coin_cfg_raw)
-            except:
-                self.coin_configs = {}
-        elif isinstance(coin_cfg_raw, dict):
+        if isinstance(coin_cfg_raw, dict):
+            # 如果已经是字典，直接使用（某些旧版本可能存储为字典）
             self.coin_configs = coin_cfg_raw
-        grid_cfg_raw = cfg.get('grid_configs', '{}')
-        if isinstance(grid_cfg_raw, str):
+        elif isinstance(coin_cfg_raw, str):
             try:
-                self.grid_configs = json.loads(grid_cfg_raw)
+                parsed = json.loads(coin_cfg_raw)
+                if isinstance(parsed, dict):
+                    self.coin_configs = parsed
+                else:
+                    logger.warning(f"coin_configs 解析结果不是字典: {type(parsed)}，重置为空")
+                    self.coin_configs = {}
+            except json.JSONDecodeError as e:
+                logger.error(f"coin_configs JSON 解析失败: {e}, 原始值: {coin_cfg_raw[:200]}")
+                self.coin_configs = {}
+        else:
+            logger.warning(f"coin_configs 类型异常: {type(coin_cfg_raw)}，重置为空")
+            self.coin_configs = {}
+
+        # 确保 coin_configs 为字典
+        if not isinstance(self.coin_configs, dict):
+            self.coin_configs = {}
+
+        # 加载 grid_configs
+        grid_cfg_raw = cfg.get('grid_configs', '{}')
+        if isinstance(grid_cfg_raw, dict):
+            self.grid_configs = grid_cfg_raw
+        elif isinstance(grid_cfg_raw, str):
+            try:
+                parsed = json.loads(grid_cfg_raw)
+                if isinstance(parsed, dict):
+                    self.grid_configs = parsed
+                else:
+                    self.grid_configs = {}
             except:
                 self.grid_configs = {}
-        elif isinstance(grid_cfg_raw, dict):
-            self.grid_configs = grid_cfg_raw
+        else:
+            self.grid_configs = {}
+
+        # 加载交易记录
         self.trades = await load_trades()
 
+        # 加载运行时状态
         state = await load_runtime_state()
         if state:
             self.position_counts = state.get('position_counts', {})
@@ -336,7 +364,9 @@ class QuantBot:
             self.daily_trades = state.get('daily_trades', 0)
             self._trailing_active = state.get('trailing_active', {})
             self._trailing_high = state.get('trailing_high', {})
-            logger.info("✅ 运行时状态（含移动止损）已恢复")
+
+        logger.info(f"✅ 加载 coin_configs: {self.coin_configs}")
+        logger.info("✅ 运行时状态（含移动止损）已恢复")
 
     async def _save_runtime_state(self):
         state = {
