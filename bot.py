@@ -2638,7 +2638,7 @@ class QuantBot:
                                     net_pnl_pct = pnl_pct
                                 else:
                                     net_pnl_pct = (net_pnl / real_cost) * 100
-                                net_pnl_pct = min(1000, max(-1000, net_pnl_pct)
+                                net_pnl_pct = min(1000, max(-1000, net_pnl_pct))
 
                                 if net_pnl < 0:
                                     self._consecutive_losses += 1
@@ -2680,7 +2680,7 @@ class QuantBot:
                                     net_pnl_pct = pnl_pct
                                 else:
                                     net_pnl_pct = (net_pnl / real_cost) * 100
-                                net_pnl_pct = min(1000, max(-1000, net_pnl_pct)
+                                net_pnl_pct = min(1000, max(-1000, net_pnl_pct))
 
                                 if net_pnl < 0:
                                     self._consecutive_losses += 1
