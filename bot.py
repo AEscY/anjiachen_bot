@@ -1663,12 +1663,11 @@ class QuantBot:
                         continue
 
                 if self.consecutive_failures >= 3:
-                    await self._alert(f"⚠️ 连续开仓失败 {self.consecutive_failures} 次", "warning")
-                    if asyncio.get_event_loop().time() - self.last_failure_time < 1800:
-                        await asyncio.sleep(60)
-                        continue
-                    else:
-                        self.consecutive_failures = 0
+                    await self._alert(f"⚠️ 连续开仓失败 {self.consecutive_failures} 次，暂停60秒", "warning")
+                    self.consecutive_failures = 0
+                    self.last_failure_time = asyncio.get_event_loop().time()
+                    await asyncio.sleep(60)
+                    continue
 
                 fg_data = await self.real_data.get_fear_greed_index()
                 fg = fg_data["value"] if fg_data else None
