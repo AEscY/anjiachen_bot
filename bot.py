@@ -1,5 +1,5 @@
 """
-bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发）
+bot.py - 完整版（修复：告警泛滥 / 单币重复开仓 / 百分比异常 / 多币种并发 / 看板增强）
 """
 import asyncio
 import aiohttp
@@ -16,7 +16,8 @@ from ws_manager import WSDataManager
 from storage import (
     init_db, load_config, save_config, load_trades, save_trade,
     save_trade_detail, get_recent_performance, get_today_trades,
-    export_db_to_json, save_runtime_state, load_runtime_state
+    export_db_to_json, save_runtime_state, load_runtime_state,
+    get_total_fees, get_total_net_profit
 )
 
 CST = timezone(timedelta(hours=8))
@@ -866,75 +867,83 @@ class QuantBot:
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_status(self, update, context):
+        """📊 多币种量化机器人看板"""
         if not self._auth(update):
             return
-        lines = ["📊 **持仓**\n"]
+
         bal = await self.exchange.fetch_balance()
+        usdt_free = self._get_usdt_free(bal)
+
+        total_value = usdt_free
         for sym in self.symbols:
+            coin = sym.split('/')[0]
+            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else 0
             ticker = self.ws.get_ticker(sym)
             if ticker is None:
                 ticker = await self.exchange.fetch_ticker(sym)
-            if ticker is None:
-                continue
-            p = ticker['last']
-            coin = sym.split('/')[0]
-            free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
-            val = free * p
-            count = self.position_counts.get(sym, 0)
-            pnl = ""
-            if sym in self.entries and self.entries[sym] > 0 and free > 0:
-                pnl_pct = ((p - self.entries[sym]) / self.entries[sym]) * 100
-                pnl = f" | {'🟢' if pnl_pct >= 0 else '🔴'} {pnl_pct:+.2f}%"
-            lines.append(f"{sym}: {free:.4f} 现价{p:.2f} 价值{val:.2f} 仓位{count}/{self.max_positions_per_coin}{pnl}")
-        lines.append(f"💵 USDT: {self._get_usdt_free(bal):.2f}")
-        await update.effective_message.reply_text("\n".join(lines))
+            if ticker and ticker.get('last'):
+                total_value += free * ticker['last']
 
-    async def cmd_check(self, update, context):
-        if not self._auth(update):
-            return
-        lines = ["📈 **信号 + 开仓条件**\n"]
-        fg_data = await self.real_data.get_fear_greed_index()
-        fg = fg_data["value"] if fg_data else None
-        bal = await self.exchange.fetch_balance()
-        usdt_free = self._get_usdt_free(bal)
+        occupied = total_value - usdt_free
+
+        today_stats = await get_today_trades()
+        total_fees = await get_total_fees()
+        total_net_profit = await get_total_net_profit()
+
+        perf = await get_recent_performance(20)
+        if perf and perf['total'] > 0:
+            win_rate = perf['win_rate']
+            wins = perf['wins']
+            total_trades = perf['total']
+        else:
+            win_rate = 0.0
+            wins = 0
+            total_trades = 0
+
+        lines = []
+        lines.append(f"📊 **多币种量化机器人看板** {self.env_tag}")
+        lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
+        lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct*100:+.1f}%")
+        lines.append(f"• 占用资金: {occupied:.2f} USDT")
+        lines.append("-" * 40)
+
+        has_position = False
         for sym in self.symbols:
-            try:
-                ticker = self.ws.get_ticker(sym)
-                if ticker is None:
-                    continue
-                p = ticker['last']
-                tech = await self.tech.calc(sym, self.timeframe, 50)
-                funding = await self.exchange.fetch_funding_rate(sym)
-                sc = self.signal_engine.score(tech, funding, fg)
-                txt = self.signal_engine.interpret(sc)
-                coin = sym.split('/')[0]
-                free = bal.get(coin, {}).get('free', 0) if isinstance(bal.get(coin), dict) else float(bal.get(coin, 0))
-                coin_value = free * p
-                count = self.position_counts.get(sym, 0)
-                coin_score = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
-                cond_signal = sc >= coin_score
-                cond_price = p <= tech['bb_lower'] * 1.02
-                cond_book = True
-                if self.orderbook_filter:
-                    ob = self.ws.get_orderbook(sym)
-                    if ob is None:
-                        ob = await self.exchange.fetch_orderbook(sym)
-                    cond_book, _ = await self.orderbook_engine.validate(ob)
-                cond_pos = count < self.max_positions_per_coin
-                if self.max_per_coin_usdt > 0 and coin_value >= self.max_per_coin_usdt:
-                    cond_pos = False
-                coin_amount = self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)
-                cond_balance = usdt_free >= coin_amount + self.reserve_bottom
-                cond_daily = True if self.max_daily_trades <= 0 or self.daily_trades < self.max_daily_trades else False
-                cond_str = (f"{'✅' if cond_signal else '❌'}信({coin_score}) {'✅' if cond_price else '❌'}价 "
-                            f"{'✅' if cond_book else '❌'}盘 {'✅' if cond_pos else '❌'}仓({count}/{self.max_positions_per_coin}) "
-                            f"{'✅' if cond_balance else '❌'}钱 {'✅' if cond_daily else '❌'}天")
-                all_met = all([cond_signal, cond_price, cond_book, cond_pos, cond_balance, cond_daily])
-                status = "🎯 可开仓" if all_met else "⏳ 等待"
-                lines.append(f"{sym}: {p:.2f} | 信号: {txt} ({sc})\n   条件: {cond_str} → {status}")
-            except Exception:
+            count = self.position_counts.get(sym, 0)
+            if count == 0:
                 continue
-        await update.effective_message.reply_text("\n".join(lines))
+            has_position = True
+
+            tp = self._get_coin_param(sym, 'tp_pct', self.tp_pct)
+            sl = self._get_coin_param(sym, 'sl_pct', self.sl_pct)
+            tsl = self._get_coin_param(sym, 'trailing_sl_pct', self.trailing_sl_pct)
+            tmpt = self._get_coin_param(sym, 'trailing_tp_pct', self.trailing_tp_pct)
+            amount = self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)
+            timeframe = self._get_coin_param(sym, 'timeframe', self.timeframe)
+
+            max_pos = self.max_positions_per_coin
+            filled = min(count, max_pos)
+            bar = "▓" * filled + "░" * (max_pos - filled)
+            lines.append(f"\n🔹 **[{sym}]** (周期:{timeframe} | 止盈:{tp*100:+.1f}% | 移动止损:{tsl*100:.1f}% | 单笔:{amount:.1f}U)")
+            lines.append(f"[{bar}] {count}/{max_pos}")
+
+            entry = self.entries.get(sym, 0)
+            high_price = self._trailing_high.get(sym, 0)
+
+            if entry > 0:
+                lines.append(f"└ 仓位#1: 买价{entry:.4f} | 最高{high_price:.4f}")
+                if count > 1:
+                    lines.append(f"└ ... 还有 {count-1} 个仓位")
+
+        if not has_position:
+            lines.append("\n📭 暂无持仓")
+
+        lines.append("-" * 40)
+        lines.append(f"• 胜率: {win_rate*100:.1f}% ({wins}/{total_trades} 胜)")
+        lines.append(f"• 累计手续费: {total_fees:.4f} USDT")
+        lines.append(f"• 累计净收益: {total_net_profit:+.4f} USDT")
+
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_symbols(self, update, context):
         if not self._auth(update):
