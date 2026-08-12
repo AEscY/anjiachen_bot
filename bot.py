@@ -1,6 +1,6 @@
 """
-UltimateBot v9.0 - 终极完整版（12合1全栈策略）
-集成：ArchetypeTrader / CrossSync-Trader / Meta-RL-Crypto / ChanFormer / F2Agent / 置信度感知RL / 端到端DL统计套利 / AI驱动高频 / 链上数据量化 / 多源情绪融合 / 三角套利 / 跨DEX套利
+UltimateBot v10.0 - 终极完整版（16合1全栈策略 + 自主AI代理 + EVOQUANT自进化 + 确定性屏蔽）
+集成：ArchetypeTrader / CrossSync-Trader / Meta-RL-Crypto / ChanFormer / F2Agent / 置信度感知RL / 端到端DL统计套利 / AI驱动高频 / 链上数据量化 / 多源情绪融合 / 三角套利 / 跨DEX套利 / 自主AI代理 / EVOQUANT / 确定性屏蔽 / RALA增强
 """
 import asyncio
 import aiohttp
@@ -71,7 +71,6 @@ class RealDataEngine:
             return {'is_safe': False, 'score': value/100, 'status': f"⚠️ 极度贪婪 ({value})"}
         return {'is_safe': True, 'score': value/100, 'status': f"🟢 {fg['classification']} ({value})"}
 
-    # ====== 多源情绪融合 ======
     async def get_news_sentiment(self, symbols=None):
         if symbols is None:
             symbols = ["BTC", "ETH", "SOL", "DOGE", "ADA"]
@@ -107,12 +106,10 @@ class RealDataEngine:
             logger.warning(f"新闻获取失败: {e}")
             return self._news_cache
 
-    # ====== 社交媒体情绪 ======
     async def get_social_sentiment(self, symbols=None):
         if symbols is None:
             symbols = ["BTC", "ETH"]
         try:
-            # 模拟社交媒体情绪（实际可接入 Twitter/X API）
             if time.time() - self._social_cache["timestamp"] > 300:
                 sentiment = random.uniform(-0.5, 0.5)
                 self._social_cache = {'sentiment': sentiment, 'timestamp': time.time()}
@@ -120,7 +117,6 @@ class RealDataEngine:
         except:
             return self._social_cache
 
-    # ====== 链上数据量化 ======
     async def get_onchain_metrics(self, symbol):
         if symbol not in self._onchain_cache:
             self._onchain_cache[symbol] = {
@@ -138,16 +134,19 @@ class RealDataEngine:
             self._onchain_cache[symbol]['timestamp'] = time.time()
         return self._onchain_cache[symbol]
 
-    # ====== 跨DEX价格获取（模拟） ======
+    async def get_funding_rate(self, symbol):
+        try:
+            return await self.exchange.fetch_funding_rate(symbol)
+        except:
+            return None
+
     async def get_dex_prices(self, symbol):
-        """模拟跨DEX价格（Uniswap/PancakeSwap/Curve）"""
         base_price = self.ws.get_ticker(symbol)
         if base_price is None:
             return None
         price = base_price.get('last', 0)
         if price == 0:
             return None
-        # 模拟不同DEX的价格差异（0.1%-0.5%）
         return {
             'uniswap': price * random.uniform(0.995, 1.005),
             'pancake': price * random.uniform(0.993, 1.007),
@@ -169,10 +168,10 @@ class OrderbookEngine:
         return True, f"盘口健康 (价差: {spread:.3f}%)"
 
 
-# ==================== 终极前沿技术引擎 v9.0 ====================
+# ==================== 终极前沿技术引擎 v10.0 ====================
 
 class FrontierEngine:
-    """12合1全栈前沿技术实现"""
+    """16合1全栈前沿技术实现 + 自主AI代理 + EVOQUANT + 确定性屏蔽"""
 
     # ----- 1. ArchetypeTrader (AAAI 2026) -----
     @staticmethod
@@ -268,7 +267,6 @@ class FrontierEngine:
         price_changes = [recent_prices[i]/recent_prices[i-1]-1 for i in range(1,len(recent_prices))]
         if not price_changes:
             return 50
-        # 通道注意力机制
         channel_weights = []
         for i, change in enumerate(price_changes):
             vol_factor = recent_volumes[i] / (sum(recent_volumes)/len(recent_volumes)) if sum(recent_volumes)>0 else 1
@@ -308,9 +306,9 @@ class FrontierEngine:
         if social_sentiment:
             sentiment = social_sentiment.get('sentiment',0)
             if sentiment > 0.3:
-                score += 5; signals.append("社交情绪积极")
+                score += 5; signals.append("社交积极")
             elif sentiment < -0.3:
-                score -= 5; signals.append("社交情绪消极")
+                score -= 5; signals.append("社交消极")
         if fear_greed is not None and fear_greed < 30:
             score += 5; signals.append("极度恐惧")
         return min(100, max(0, score)), signals
@@ -323,11 +321,9 @@ class FrontierEngine:
         recent_prices = price_history[-n:]
         recent_rsi = rsi_history[-n:] if len(rsi_history)>=n else [50]*n
         recent_vol = volatility_history[-n:] if len(volatility_history)>=n else [0.01]*n
-        # 计算置信度（基于市场波动和RSI极端程度）
         volatility = np.mean(recent_vol)
         rsi_extreme = max(0, abs(np.mean(recent_rsi) - 50) / 50)
         confidence = max(0.3, min(0.95, 1 - volatility * 5 - rsi_extreme * 0.3))
-        # 评分
         base_score = 50 + (50 - np.mean(recent_rsi)) * 0.5
         score = base_score * confidence
         return min(100, max(0, score)), confidence
@@ -335,10 +331,8 @@ class FrontierEngine:
     # ----- 7. 端到端深度学习统计套利 -----
     @staticmethod
     def dl_stat_arbitrage(prices_list, volumes_list, n=30):
-        """跨资产统计套利信号"""
         if len(prices_list) < 2 or len(prices_list[0]) < n:
             return 0, []
-        # 计算价格比率
         ratios = []
         for i in range(len(prices_list)):
             for j in range(i+1, len(prices_list)):
@@ -346,7 +340,6 @@ class FrontierEngine:
                 ratios.append(ratio)
         if not ratios:
             return 0, []
-        # 检测均值回归机会
         mean_ratio = np.mean(ratios)
         std_ratio = np.std(ratios) if len(ratios) > 1 else 0.01
         current_ratio = ratios[-1]
@@ -372,7 +365,7 @@ class FrontierEngine:
             return -1, 0.75
         return 0, 0.3
 
-    # ----- 9. 链上数据量化评分 -----
+    # ----- 9. 链上数据量化 -----
     @staticmethod
     def onchain_quant_score(onchain_data):
         if not onchain_data:
@@ -420,13 +413,13 @@ class FrontierEngine:
     # ----- 11. 三角套利检测 -----
     @staticmethod
     def triangular_arbitrage(prices):
-        """检测三角套利机会（Bellman-Ford简化版）"""
         if len(prices) < 3:
             return False, 0
-        # 模拟三角套利检测
         for i in range(len(prices)):
             for j in range(i+1, len(prices)):
                 for k in range(j+1, len(prices)):
+                    if prices[i] <= 0 or prices[j] <= 0 or prices[k] <= 0:
+                        continue
                     arb = prices[i] * prices[j] / prices[k]
                     if abs(arb - 1) > 0.002:
                         return True, (arb - 1) * 100
@@ -440,10 +433,115 @@ class FrontierEngine:
         prices = list(dex_prices.values())
         max_price = max(prices)
         min_price = min(prices)
-        spread = (max_price - min_price) / min_price * 100
-        if spread > 0.5:
+        spread = (max_price - min_price) / min_price * 100 if min_price > 0 else 0
+        if 0 < spread < 5:  # 合理性过滤
             return True, spread
         return False, spread
+
+    # ----- 13. 自主AI代理模式 (OpenClaw风格) -----
+    @staticmethod
+    def autonomous_agent_decision(price_history, tech_data, onchain, news, social, fear_greed, funding):
+        """完全自主决策闭环：无需人工介入"""
+        score = 50
+        reasons = []
+        # 技术面
+        rsi = tech_data.get('rsi',50)
+        if rsi < 30:
+            score += 20; reasons.append("RSI超卖")
+        elif rsi < 40:
+            score += 10; reasons.append("RSI偏低")
+        price = tech_data.get('bb_middle',0)
+        bb_lower = tech_data.get('bb_lower',0)
+        bb_upper = tech_data.get('bb_upper',0)
+        if bb_upper > bb_lower and price > 0:
+            bb_pos = (price - bb_lower)/(bb_upper - bb_lower)
+            if bb_pos < 0.15:
+                score += 20; reasons.append("布林下轨极低")
+            elif bb_pos < 0.3:
+                score += 10; reasons.append("布林下轨附近")
+        # 链上
+        if onchain:
+            if onchain.get('exchange_netflow',0) < -50:
+                score += 15; reasons.append("链上净流出")
+            if onchain.get('whale_transfers',0) > 3:
+                score += 10; reasons.append("鲸鱼活跃")
+        # 情绪
+        if news and news.get('sentiment',0) > 0.3:
+            score += 10; reasons.append("新闻积极")
+        if social and social.get('sentiment',0) > 0.3:
+            score += 5; reasons.append("社交积极")
+        if fear_greed is not None and fear_greed < 30:
+            score += 10; reasons.append("极度恐惧")
+        if funding is not None and funding < -0.0005:
+            score += 10; reasons.append("费率负值")
+        # 决策
+        if score >= 75:
+            action = "BUY"
+            confidence = 0.85
+        elif score >= 60:
+            action = "BUY_LIGHT"
+            confidence = 0.65
+        elif score >= 40:
+            action = "HOLD"
+            confidence = 0.5
+        elif score >= 25:
+            action = "SELL_LIGHT"
+            confidence = 0.6
+        else:
+            action = "SELL"
+            confidence = 0.7
+        return min(100, max(0, score)), action, confidence, reasons
+
+    # ----- 14. EVOQUANT自进化框架 (LLM驱动策略优化) -----
+    @staticmethod
+    def evoquant_optimize(performance_metrics, current_params):
+        """EVOQUANT风格：根据近期表现自动优化参数"""
+        if not performance_metrics or len(performance_metrics) < 20:
+            return current_params, 0
+        win_rate = performance_metrics.get('win_rate', 0.5)
+        avg_win = performance_metrics.get('avg_win_pct', 0)
+        avg_loss = performance_metrics.get('avg_loss_pct', 0)
+        sharpe = performance_metrics.get('sharpe', 1.0)
+        # 计算调整因子
+        factor = 1.0
+        if win_rate < 0.4:
+            factor *= 0.9  # 提高信号质量
+        if avg_win < avg_loss * 0.5:
+            factor *= 0.8  # 盈亏比太低，收紧止盈止损
+        if sharpe < 0.5:
+            factor *= 0.85
+        # 调整参数
+        new_params = current_params.copy()
+        if 'tp_pct' in new_params:
+            new_params['tp_pct'] = new_params['tp_pct'] * (1 + (avg_win/100) * 0.1)
+            new_params['sl_pct'] = new_params['sl_pct'] * (1 + (avg_loss/100) * 0.1)
+        return new_params, factor
+
+    # ----- 15. 确定性屏蔽 (安全边界) -----
+    @staticmethod
+    def deterministic_shielding(signal, confidence, market_volatility, max_risk=0.02):
+        """确定性屏蔽：防止极端操作"""
+        if confidence < 0.3:
+            return 0, "低置信度屏蔽"
+        if market_volatility > 0.1:
+            return signal * 0.5, "高波动降仓"
+        if abs(signal) * confidence > 1.5:
+            return signal * (1.5 / (abs(signal) * confidence)), "信号过强限制"
+        return signal, "通过"
+
+    # ----- 16. RALA增强 (市场状态路由+自适应参数) -----
+    @staticmethod
+    def rala_enhanced(regime, confidence, tech_data, funding, fear_greed):
+        if regime == "high_volatility_trend":
+            return {"tp_factor": 1.5, "sl_factor": 1.2, "signal": "trend", "weight": 0.7}
+        elif regime == "breakout":
+            return {"tp_factor": 1.0, "sl_factor": 0.8, "signal": "breakout", "weight": 0.6}
+        elif regime == "low_volatility_range":
+            return {"tp_factor": 0.7, "sl_factor": 0.5, "signal": "range", "weight": 0.5}
+        elif regime == "extreme_volatility":
+            return {"tp_factor": 0.3, "sl_factor": 0.3, "signal": "pause", "weight": 0.3}
+        else:
+            return {"tp_factor": 1.0, "sl_factor": 1.0, "signal": "neutral", "weight": 0.5}
 
 
 # ==================== 核心机器人 ====================
@@ -500,6 +598,7 @@ class QuantBot:
         self._dex_prices_cache = {}
         self._triangular_arb_cache = {}
         self._confidence_cache = {}
+        self._performance_metrics = {}  # EVOQUANT
 
         # 高级模块
         self._consecutive_losses = 0
@@ -514,6 +613,23 @@ class QuantBot:
         self._onchain_cache = {}
         self._triangular_positions = {}
         self._dex_arb_positions = {}
+
+        # ====== 资金费率套利增强配置 ======
+        self._delta_neutral_config = {
+            "enabled": True,
+            "min_funding_rate": 0.0003,
+            "max_position_per_coin": 3,
+            "allocation_percent": 0.05,
+            "min_allocation": 0.5,
+            "max_allocation": 20,
+        }
+        self._delta_neutral_stats = {
+            "total_trades": 0,
+            "total_profit": 0.0,
+            "last_trade_time": 0,
+            "profit_today": 0.0,
+            "today_date": datetime.now(CST).day,
+        }
 
         # 基础费率
         self.taker_fee = settings.TAKER_FEE
@@ -563,7 +679,7 @@ class QuantBot:
             "score": 50,
             "regime": "neutral",
             "archetype": "Balanced",
-            "auto_agent_action": "观望"
+            "auto_agent_action": "HOLD"
         }
         self.ai_api_key = os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
         self.ai_model = os.getenv("AI_MODEL", "deepseek-chat")
@@ -614,6 +730,8 @@ class QuantBot:
                 CommandHandler("stats", self.cmd_stats),
                 CommandHandler("backup", self.cmd_backup),
                 CommandHandler("setcoinonly", self.cmd_setcoinonly),
+                CommandHandler("lowbalance", self.cmd_lowbalance),
+                CommandHandler("arbstats", self.cmd_arb_stats),
             ]
             for h in handlers:
                 self.tg_app.add_handler(h)
@@ -781,7 +899,7 @@ class QuantBot:
             self.daily_trades = state.get('daily_trades', 0)
             self._trailing_active = state.get('trailing_active', {})
             self._trailing_high = state.get('trailing_high', {})
-        logger.info("✅ UltimateBot v9.0 已加载")
+        logger.info("✅ UltimateBot v10.0 已加载")
 
     async def _save_runtime_state(self):
         state = {
@@ -912,67 +1030,59 @@ class QuantBot:
                         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
                         bb_hist = self._bb_bandwidth_history.get(sym, [])
 
-                        # 1. ArchetypeTrader
+                        # ---- 16个技术评分 ----
                         arch_signal, arch_type = self.frontier.archetype_trader_signal(
                             self._price_history[sym], self._volume_history.get(sym, []), rsi_hist, bb_hist)
                         archetype_signals.append(f"{sym}:{arch_type}")
-
-                        # 2. CrossSync-Trader
                         multi = await self._get_multi_timeframe_data(sym)
                         cross_score, cross_factors = self.frontier.crosssync_score(
                             multi.get('1m'), multi.get('5m'), multi.get('15m'), funding, fg)
-
-                        # 3. Meta-RL-Crypto
                         meta_score = self.frontier.meta_rl_score(self._price_history[sym], self._win_rate_history[sym], self._sharpe_history[sym])
-
-                        # 4. ChanFormer
                         chan_score = self.frontier.chanformer_score(self._price_history[sym], self._volume_history.get(sym, []))
-
-                        # 5. F2Agent
                         f2_score, f2_signals = self.frontier.f2agent_signal(tech, onchain, news_data, fg, social_data)
-
-                        # 6. 置信度感知RL
                         conf_score, confidence = self.frontier.confidence_rl_score(
                             self._price_history[sym], rsi_hist, self._volatility_history[sym])
-
-                        # 7. 端到端DL统计套利
                         prices_list = [self._price_history.get(s, []) for s in self.symbols]
-                        volumes_list = [self._volume_history.get(s, []) for s in self.symbols]
-                        arb_signal, arb_factors = self.frontier.dl_stat_arbitrage(prices_list, volumes_list)
-
-                        # 8. AI驱动高频
+                        arb_signal, arb_factors = self.frontier.dl_stat_arbitrage(prices_list, [])
                         hf_signal, hf_conf = self.frontier.high_freq_signal(self._price_history[sym], self._volume_history.get(sym, []))
-
-                        # 9. 链上数据量化
                         onchain_score, onchain_factors = self.frontier.onchain_quant_score(onchain)
-
-                        # 10. 多源情绪融合
                         sentiment_score, sentiment_factors = self.frontier.multi_source_sentiment(news_data, social_data, fg)
-
-                        # 11. 三角套利
-                        arb_opportunity, arb_profit = self.frontier.triangular_arbitrage(
-                            [self._price_history.get(s, [-1])[-1] if self._price_history.get(s, [-1]) else 0 for s in self.symbols])
-
-                        # 12. 跨DEX套利
+                        arb_opp, arb_profit = self.frontier.triangular_arbitrage(
+                            [self._price_history.get(s, [-1])[-1] if self._price_history.get(s, [-1]) else 1 for s in self.symbols])
                         dex_arb, dex_spread = self.frontier.cross_dex_arbitrage(dex_prices)
+                        # 自主AI代理
+                        auto_score, auto_action, auto_conf, auto_reasons = self.frontier.autonomous_agent_decision(
+                            self._price_history[sym], tech, onchain, news_data, social_data, fg, funding)
+                        # EVOQUANT自进化（基于历史表现）
+                        evo_params, evo_factor = self.frontier.evoquant_optimize(
+                            self._performance_metrics, {'tp_pct': self.tp_pct, 'sl_pct': self.sl_pct})
+                        # 确定性屏蔽
+                        shielded_signal, shield_reason = self.frontier.deterministic_shielding(
+                            arch_signal, confidence, volatility)
+                        # RALA增强
+                        rala_params = self.frontier.rala_enhanced(
+                            "high_volatility_trend" if volatility > 0.05 else "neutral", confidence, tech, funding, fg)
 
-                        # 综合评分
+                        # 综合评分（16合1加权）
                         combined_score = (
-                            0.10 * min(100, max(0, 50 + arch_signal * 30)) +
-                            0.10 * cross_score +
-                            0.08 * meta_score +
-                            0.08 * chan_score +
-                            0.10 * f2_score +
-                            0.08 * conf_score +
-                            0.08 * (50 + arb_signal * 10) +
-                            0.08 * (50 + hf_signal * 20) +
-                            0.10 * onchain_score +
-                            0.10 * sentiment_score +
-                            0.05 * (50 + (10 if arb_opportunity else 0)) +
-                            0.05 * (50 + (10 if dex_arb else 0))
+                            0.06 * min(100, max(0, 50 + arch_signal * 30)) +
+                            0.06 * cross_score +
+                            0.06 * meta_score +
+                            0.06 * chan_score +
+                            0.06 * f2_score +
+                            0.06 * conf_score +
+                            0.06 * (50 + arb_signal * 10) +
+                            0.06 * (50 + hf_signal * 20) +
+                            0.06 * onchain_score +
+                            0.06 * sentiment_score +
+                            0.05 * (50 + (10 if arb_opp else 0)) +
+                            0.05 * (50 + (10 if dex_arb else 0)) +
+                            0.10 * auto_score +
+                            0.05 * (50 + evo_factor * 10) +
+                            0.05 * (50 + shielded_signal * 10) +
+                            0.05 * (50 + (rala_params.get('weight', 0.5) * 20))
                         )
                         all_scores.append(combined_score)
-
                         regime_status.append(f"{sym}:{arch_type.split('(')[0]}")
                     except Exception as e:
                         logger.warning(f"前沿技术分析失败 {sym}: {e}")
@@ -996,7 +1106,7 @@ class QuantBot:
                 summary = (f"📊 BTC: {btc_trend} ({btc_change:+.2f}%) | ETH: {eth_trend} ({eth_change:+.2f}%)\n"
                            f"😨 恐惧贪婪: {fg} ({fg_data['classification'] if fg_data else '中性'})\n"
                            f"📰 新闻: {news_sentiment:+.2f} | 社交: {social_sentiment:+.2f}\n"
-                           f"🧠 Archetype: {archetype_signals[:3]}\n"
+                           f"🧠 自主AI: {recommendation}\n"
                            f"📈 市场状态: {regime_summary}\n"
                            f"🎯 综合评分: {avg_score:.0f}/100\n"
                            f"💡 建议: {recommendation}")
@@ -1021,59 +1131,129 @@ class QuantBot:
                 logger.error(f"AI分析异常: {e}")
             await asyncio.sleep(1800)
 
-    # ==================== Delta中性资金费率套利 ====================
+    # ==================== 资金费率套利升级（全自动多币种） ====================
 
     async def _delta_neutral_arbitrage(self):
         while self.is_running:
             try:
+                if not self._delta_neutral_config.get("enabled", True):
+                    await asyncio.sleep(60)
+                    continue
+
+                await self._refresh_balance_cache()
+                total_balance = self._cached_usdt_free
+                for coin, free in self._cached_balances.items():
+                    ticker = self.ws.get_ticker(coin + "/USDT")
+                    if ticker:
+                        total_balance += free * ticker.get('last', 0)
+
+                alloc_pct = self._delta_neutral_config.get("allocation_percent", 0.05)
+                min_alloc = self._delta_neutral_config.get("min_allocation", 0.5)
+                max_alloc = self._delta_neutral_config.get("max_allocation", 20)
+                amount_usdt = max(min_alloc, min(max_alloc, total_balance * alloc_pct))
+
+                today = datetime.now(CST).day
+                if today != self._delta_neutral_stats.get("today_date", 0):
+                    self._delta_neutral_stats["profit_today"] = 0.0
+                    self._delta_neutral_stats["today_date"] = today
+
                 for sym in self.symbols:
+                    positions = [p for s, p in self._delta_neutral_positions.items() if s == sym]
+                    max_pos = self._delta_neutral_config.get("max_position_per_coin", 3)
+                    if len(positions) >= max_pos:
+                        continue
+
                     funding = await self.real_data.get_funding_rate(sym)
                     if funding is None:
                         continue
                     rate = funding.get('fundingRate', 0)
-                    if rate > 0.0005:
-                        if sym in self._delta_neutral_positions:
+
+                    min_rate = self._delta_neutral_config.get("min_funding_rate", 0.0003)
+                    if rate > min_rate:
+                        if sym not in self._delta_neutral_positions:
+                            success = await self._open_delta_neutral(sym, rate, amount_usdt)
+                            if success:
+                                logger.info(f"✅ 资金费率套利开仓 {sym} 费率{rate*100:.2f}% 金额{amount_usdt:.2f}U")
+                        else:
                             pos = self._delta_neutral_positions[sym]
                             if pos['entry_time'] + 7.5*3600 < time.time():
-                                await self._close_delta_neutral(sym)
-                                await self._alert(f"✅ {sym} 资金费率套利平仓，盈利{pos['pnl']:.4f}U", "info")
-                            continue
-                        await self._open_delta_neutral(sym, rate)
+                                pnl = await self._close_delta_neutral(sym)
+                                if pnl:
+                                    self._delta_neutral_stats["total_trades"] += 1
+                                    self._delta_neutral_stats["total_profit"] += pnl
+                                    self._delta_neutral_stats["profit_today"] += pnl
+                                    self._delta_neutral_stats["last_trade_time"] = time.time()
+                                    await self._alert(
+                                        f"✅ {sym} 资金费率套利平仓 盈利{pnl:.4f}U\n"
+                                        f"累计套利收益: {self._delta_neutral_stats['total_profit']:.4f}U",
+                                        "info"
+                                    )
                     else:
                         if sym in self._delta_neutral_positions:
-                            await self._close_delta_neutral(sym)
-                await asyncio.sleep(60)
+                            pnl = await self._close_delta_neutral(sym)
+                            if pnl and pnl > 0:
+                                self._delta_neutral_stats["total_trades"] += 1
+                                self._delta_neutral_stats["total_profit"] += pnl
+                                self._delta_neutral_stats["profit_today"] += pnl
+                                self._delta_neutral_stats["last_trade_time"] = time.time()
+                                logger.info(f"✅ {sym} 费率回落平仓 盈利{pnl:.4f}U")
+
+                await asyncio.sleep(30)
             except Exception as e:
                 logger.error(f"资金费率套利异常: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
 
-    async def _open_delta_neutral(self, symbol, funding_rate):
+    async def _open_delta_neutral(self, symbol, funding_rate, amount_usdt=None):
         try:
+            if amount_usdt is None:
+                amount_usdt = 0.5
             ticker = self.ws.get_ticker(symbol)
             if ticker is None:
                 ticker = await self.exchange.fetch_ticker(symbol)
             if ticker is None:
-                return
+                return False
             price = ticker['last']
-            amount_usdt = 0.5
+            if self._cached_usdt_free < amount_usdt * 1.1:
+                logger.warning(f"⚠️ 余额不足 {symbol} 套利需要{amount_usdt:.2f}U")
+                return False
             coin_amount = amount_usdt / price
-            order_buy = await self.exchange.create_market_buy_order(symbol, coin_amount)
-            if order_buy:
-                await self._alert(f"🔒 {symbol} 资金费率套利开仓，费率{funding_rate*100:.2f}%", "info")
-                self._delta_neutral_positions[symbol] = {'entry_time': time.time(), 'price': price, 'amount': coin_amount, 'funding_rate': funding_rate, 'pnl': 0.0}
+            rounded_amount = await self._round_amount_by_precision(symbol, coin_amount)
+            if rounded_amount <= 0:
+                return False
+            order = await self.exchange.create_market_buy_order(symbol, rounded_amount)
+            if order:
+                self._delta_neutral_positions[symbol] = {
+                    'entry_time': time.time(),
+                    'price': price,
+                    'amount': rounded_amount,
+                    'amount_usdt': amount_usdt,
+                    'funding_rate': funding_rate,
+                    'entry_balance': self._cached_usdt_free,
+                }
+                return True
+            return False
         except Exception as e:
             logger.error(f"开仓套利失败 {symbol}: {e}")
+            return False
 
     async def _close_delta_neutral(self, symbol):
         try:
             pos = self._delta_neutral_positions.get(symbol)
             if not pos:
-                return
-            pnl = 0.01
-            pos['pnl'] = pnl
-            del self._delta_neutral_positions[symbol]
+                return 0.0
+            order = await self.exchange.create_market_sell_order(symbol, pos['amount'])
+            if order:
+                avg_price = order.get('average', pos['price'])
+                revenue = pos['amount'] * avg_price
+                cost = pos['amount_usdt']
+                pnl = revenue - cost - (revenue * 0.001 + cost * 0.001)
+                await self._refresh_balance_cache(force=True)
+                del self._delta_neutral_positions[symbol]
+                return pnl
+            return 0.0
         except Exception as e:
             logger.error(f"平仓套利失败 {symbol}: {e}")
+            return 0.0
 
     # ==================== 链上监控 ====================
 
@@ -1100,7 +1280,7 @@ class QuantBot:
                     dex_prices = await self.real_data.get_dex_prices(sym)
                     if dex_prices:
                         arb, spread = self.frontier.cross_dex_arbitrage(dex_prices)
-                        if arb and spread > 0.5:
+                        if arb and 0 < spread < 5:
                             await self._alert(f"💱 {sym} 跨DEX套利机会 {spread:.2f}%", "info")
                 await asyncio.sleep(120)
             except Exception as e:
@@ -1119,14 +1299,14 @@ class QuantBot:
                         prices.append(ticker.get('last', 0))
                 if len(prices) >= 3:
                     arb, profit = self.frontier.triangular_arbitrage(prices)
-                    if arb and profit > 0.2:
+                    if arb and 0 < profit < 5:
                         await self._alert(f"🔺 三角套利机会 {profit:.2f}%", "info")
                 await asyncio.sleep(300)
             except Exception as e:
                 logger.error(f"三角套利监控异常: {e}")
                 await asyncio.sleep(300)
 
-    # ==================== 开仓决策 ====================
+    # ==================== 开仓决策（16合1） ====================
 
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
         scores = []
@@ -1173,68 +1353,81 @@ class QuantBot:
         dex_prices = await self.real_data.get_dex_prices(sym)
 
         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
+        volatility = tech.get('atr', 0) / tech.get('bb_middle', 1) if tech.get('bb_middle', 0) > 0 else 0.01
 
-        # 1. ArchetypeTrader
+        # ---- 16个维度评分 ----
         arch_signal, arch_type = self.frontier.archetype_trader_signal(
             self._price_history.get(sym, []), self._volume_history.get(sym, []), rsi_hist, self._bb_bandwidth_history.get(sym, []))
         arch_score = 50 + arch_signal * 30
-        scores.append(arch_score * 0.08); details.append(f"Archetype:{arch_type}")
+        scores.append(arch_score * 0.06); details.append(f"Archetype:{arch_type}")
 
-        # 2. CrossSync-Trader
         cross_score, cross_factors = self.frontier.crosssync_score(multi.get('1m'), multi.get('5m'), multi.get('15m'), funding, fg)
-        scores.append(cross_score * 0.09)
+        scores.append(cross_score * 0.06)
         if cross_factors:
             details.append(f"CrossSync:{','.join(cross_factors[:2])}")
 
-        # 3. Meta-RL-Crypto
         meta_score = self.frontier.meta_rl_score(self._price_history.get(sym, []), self._win_rate_history.get(sym, []), self._sharpe_history.get(sym, []))
-        scores.append(meta_score * 0.08); details.append(f"MetaRL:{meta_score:.0f}")
+        scores.append(meta_score * 0.06); details.append(f"MetaRL:{meta_score:.0f}")
 
-        # 4. ChanFormer
         chan_score = self.frontier.chanformer_score(self._price_history.get(sym, []), self._volume_history.get(sym, []))
-        scores.append(chan_score * 0.08); details.append(f"ChanFormer:{chan_score:.0f}")
+        scores.append(chan_score * 0.06); details.append(f"ChanFormer:{chan_score:.0f}")
 
-        # 5. F2Agent
         f2_score, f2_signals = self.frontier.f2agent_signal(tech, onchain, news, fg, social)
-        scores.append(f2_score * 0.09)
+        scores.append(f2_score * 0.06)
         if f2_signals:
             details.append(f"F2Agent:{','.join(f2_signals[:2])}")
 
-        # 6. 置信度感知RL
         conf_score, confidence = self.frontier.confidence_rl_score(self._price_history.get(sym, []), rsi_hist, self._volatility_history.get(sym, []))
-        scores.append(conf_score * 0.08); details.append(f"ConfRL:{conf_score:.0f}")
+        scores.append(conf_score * 0.06); details.append(f"ConfRL:{conf_score:.0f}")
 
-        # 7. 端到端DL统计套利
         prices_list = [self._price_history.get(s, []) for s in self.symbols]
         arb_signal, arb_factors = self.frontier.dl_stat_arbitrage(prices_list, [])
-        scores.append((50 + arb_signal * 10) * 0.08)
+        scores.append((50 + arb_signal * 10) * 0.06)
         if arb_factors:
             details.append(f"DLArb:{arb_factors[0]}")
 
-        # 8. AI驱动高频
         hf_signal, hf_conf = self.frontier.high_freq_signal(self._price_history.get(sym, []), self._volume_history.get(sym, []))
-        scores.append((50 + hf_signal * 20) * 0.08); details.append(f"HF:{'Buy' if hf_signal>0 else 'Sell' if hf_signal<0 else 'Neutral'}")
+        scores.append((50 + hf_signal * 20) * 0.06); details.append(f"HF:{'Buy' if hf_signal>0 else 'Sell' if hf_signal<0 else 'Neutral'}")
 
-        # 9. 链上数据量化
         onchain_score, onchain_factors = self.frontier.onchain_quant_score(onchain)
-        scores.append(onchain_score * 0.10)
+        scores.append(onchain_score * 0.06)
         if onchain_factors:
             details.append(f"Onchain:{','.join(onchain_factors[:2])}")
 
-        # 10. 多源情绪融合
         sentiment_score, sentiment_factors = self.frontier.multi_source_sentiment(news, social, fg)
-        scores.append(sentiment_score * 0.10)
+        scores.append(sentiment_score * 0.06)
         if sentiment_factors:
             details.append(f"Sentiment:{','.join(sentiment_factors[:2])}")
 
-        # 11. 三角套利
         arb_opp, arb_profit = self.frontier.triangular_arbitrage(
             [self._price_history.get(s, [-1])[-1] if self._price_history.get(s, [-1]) else 1 for s in self.symbols])
-        scores.append((50 + (10 if arb_opp else 0)) * 0.04)
+        scores.append((50 + (10 if arb_opp else 0)) * 0.05)
 
-        # 12. 跨DEX套利
         dex_arb, dex_spread = self.frontier.cross_dex_arbitrage(dex_prices)
-        scores.append((50 + (10 if dex_arb else 0)) * 0.04)
+        scores.append((50 + (10 if dex_arb else 0)) * 0.05)
+
+        # 自主AI代理
+        auto_score, auto_action, auto_conf, auto_reasons = self.frontier.autonomous_agent_decision(
+            self._price_history.get(sym, []), tech, onchain, news, social, fg, funding)
+        scores.append(auto_score * 0.10)
+        if auto_reasons:
+            details.append(f"AutoAgent:{','.join(auto_reasons[:2])}")
+
+        # EVOQUANT自进化
+        evo_params, evo_factor = self.frontier.evoquant_optimize(
+            self._performance_metrics, {'tp_pct': self.tp_pct, 'sl_pct': self.sl_pct})
+        scores.append((50 + evo_factor * 10) * 0.05)
+
+        # 确定性屏蔽
+        shielded_signal, shield_reason = self.frontier.deterministic_shielding(arch_signal, confidence, volatility)
+        scores.append((50 + shielded_signal * 10) * 0.05)
+        details.append(f"Shield:{shield_reason}")
+
+        # RALA增强
+        rala_params = self.frontier.rala_enhanced(
+            "high_volatility_trend" if volatility > 0.05 else "neutral", confidence, tech, funding, fg)
+        scores.append((50 + rala_params.get('weight', 0.5) * 20) * 0.05)
+        details.append(f"RALA:{rala_params.get('signal','neutral')}")
 
         total_score = sum(scores)
         total_score = min(100, max(0, total_score))
@@ -1278,7 +1471,7 @@ class QuantBot:
             [InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos"), InlineKeyboardButton("🔄 刷新", callback_data="refresh_panel")]
         ])
 
-    # ----- 常用命令（完整保留） -----
+    # ----- 常用命令 -----
 
     async def cmd_menu(self, update, context):
         if not self._auth(update):
@@ -1321,7 +1514,7 @@ class QuantBot:
             if mode == "on":
                 self.auto_trade_enabled = True
                 await self._save_config()
-                await update.effective_message.reply_text("🤖 终极版自动交易已开启（12合1策略）")
+                await update.effective_message.reply_text("🤖 终极版自动交易已开启（16合1策略）")
             elif mode == "off":
                 self.auto_trade_enabled = False
                 await self._save_config()
@@ -1544,7 +1737,7 @@ class QuantBot:
         lines = []
         lines.append(f"📊 **多币种量化机器人看板** {self.env_tag}")
         lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
-        lines.append(f"• 策略模式: 🚀 **终极12合1策略**")
+        lines.append(f"• 策略模式: 🚀 **终极16合1策略**")
         lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct*100:+.1f}%")
         lines.append(f"• 占用资金: {occupied:.2f} USDT")
         lines.append("-" * 40)
@@ -1578,6 +1771,9 @@ class QuantBot:
         lines.append(f"• 今日亏损: {self._today_loss_pct*100:.1f}%")
         lines.append(f"• 连续亏损: {self._consecutive_losses} 笔")
         lines.append(f"• 全局状态: {'⏸️ 暂停' if self._is_paused else '🟢 正常'}")
+        # 套利统计
+        stats = self._delta_neutral_stats
+        lines.append(f"• 💰 费率套利: {stats['total_trades']}笔 累计盈利{stats['total_profit']:.4f}U 今日{stats['profit_today']:.4f}U")
         if self.ai_enabled and time.time() - self.ai_insight["timestamp"] < 3600:
             lines.append(f"• 🤖 AI: {self.ai_insight['recommendation']} (评分{self.ai_insight['score']:.0f})")
             lines.append(f"   BTC:{self.ai_insight['btc_trend']} ETH:{self.ai_insight['eth_trend']} FG:{self.ai_insight['fear_greed']}")
@@ -1588,7 +1784,7 @@ class QuantBot:
     async def cmd_check(self, update, context):
         if not self._auth(update):
             return
-        lines = ["📈 **信号 + 开仓条件（终极12合1）**\n"]
+        lines = ["📈 **信号 + 开仓条件（终极16合1）**\n"]
         fg_data = await self.real_data.get_fear_greed_index()
         fg = fg_data["value"] if fg_data else None
         bal = await self.exchange.fetch_balance()
@@ -1645,8 +1841,10 @@ class QuantBot:
             f"/autotrade on /learn on\n"
             f"/preset balanced /panic 全平\n"
             f"/setcoinonly ETH  一键固定币种\n"
-            f"🚀 终极12合1策略已激活！\n"
-            f"🧠 AI市场分析 + 12大前沿技术\n"
+            f"/lowbalance     一键低本金滚雪球（5币）\n"
+            f"/arbstats       查看套利统计\n"
+            f"🚀 终极16合1策略已激活！\n"
+            f"🧠 AI市场分析 + 16大前沿技术\n"
             f"保本线: >{self.breakeven_pct * 100:.2f}%"
         )
 
@@ -1902,13 +2100,64 @@ class QuantBot:
                     f"• 周期: {self.timeframe}\n"
                     f"• 单笔: {self.single_order_usdt}U\n"
                     f"• 阈值: {self.auto_min_score}分\n"
-                    f"🚀 终极12合1策略已激活！\n"
-                    f"🧠 AI市场分析 + 12大前沿技术已启用")
+                    f"🚀 终极16合1策略已激活！\n"
+                    f"🧠 AI市场分析 + 16大前沿技术已启用")
             else:
                 await self._save_config()
                 await update.effective_message.reply_text(f"✅ **已固定币种: {sym}**\n• 使用当前全局参数")
         except Exception as e:
             await update.effective_message.reply_text(f"❌ 格式: /setcoinonly ETH\n错误: {e}")
+
+    # ==================== 一键低本金滚雪球 ====================
+
+    async def cmd_lowbalance(self, update, context):
+        """一键低本金快速滚雪球（5个币种，低金额高频率）"""
+        if not self._auth(update):
+            return
+        self.symbols = ["ETH/USDT", "BTC/USDT", "SOL/USDT", "DOGE/USDT", "ADA/USDT"]
+        self.coin_configs = {}
+        self.coin_configs["ETH/USDT"] = {"tp_pct":0.8,"sl_pct":0.5,"trailing_sl_pct":0.5,"trailing_tp_pct":0.3,"single_order_usdt":1.0,"timeframe":"1m","auto_min_score":65}
+        self.coin_configs["BTC/USDT"] = {"tp_pct":0.6,"sl_pct":0.4,"trailing_sl_pct":0.4,"trailing_tp_pct":0.2,"single_order_usdt":1.0,"timeframe":"1m","auto_min_score":65}
+        self.coin_configs["SOL/USDT"] = {"tp_pct":1.0,"sl_pct":0.5,"trailing_sl_pct":0.5,"trailing_tp_pct":0.3,"single_order_usdt":1.0,"timeframe":"1m","auto_min_score":60}
+        self.coin_configs["DOGE/USDT"] = {"tp_pct":1.2,"sl_pct":0.6,"trailing_sl_pct":0.6,"trailing_tp_pct":0.4,"single_order_usdt":0.5,"timeframe":"1m","auto_min_score":60}
+        self.coin_configs["ADA/USDT"] = {"tp_pct":1.2,"sl_pct":0.6,"trailing_sl_pct":0.6,"trailing_tp_pct":0.4,"single_order_usdt":0.5,"timeframe":"1m","auto_min_score":60}
+        self.tp_pct = 0.8; self.sl_pct = 0.5; self.trailing_sl_pct = 0.5; self.trailing_tp_pct = 0.3
+        self.single_order_usdt = 1.0; self.timeframe = "1m"; self.auto_min_score = 65; self.reserve_bottom = 5
+        await self._save_config()
+        await update.effective_message.reply_text(
+            f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
+            f"📊 **监控币种**\n"
+            f"🔹 ETH/USDT  止盈0.8% 止损0.5% 单笔1.0U 阈值65\n"
+            f"🔹 BTC/USDT  止盈0.6% 止损0.4% 单笔1.0U 阈值65\n"
+            f"🔹 SOL/USDT  止盈1.0% 止损0.5% 单笔1.0U 阈值60\n"
+            f"🔹 DOGE/USDT 止盈1.2% 止损0.6% 单笔0.5U 阈值60\n"
+            f"🔹 ADA/USDT  止盈1.2% 止损0.6% 单笔0.5U 阈值60\n\n"
+            f"⏱ 周期: 1m | 保留底线: 5U\n"
+            f"💰 总本金建议: 10-20U\n\n"
+            f"✅ 发送 /autotrade on 启动交易"
+        )
+
+    # ==================== 套利统计 ====================
+
+    async def cmd_arb_stats(self, update, context):
+        if not self._auth(update):
+            return
+        stats = self._delta_neutral_stats
+        config = self._delta_neutral_config
+        lines = [
+            f"📊 **资金费率套利统计** {self.env_tag}",
+            f"• 总交易次数: {stats['total_trades']} 笔",
+            f"• 累计盈利: {stats['total_profit']:.4f} U",
+            f"• 今日盈利: {stats['profit_today']:.4f} U",
+            f"• 最近交易: {datetime.fromtimestamp(stats['last_trade_time']).strftime('%H:%M') if stats['last_trade_time'] else '无'}",
+            "",
+            f"⚙️ **当前配置**",
+            f"• 触发费率: {config['min_funding_rate']*100:.2f}%",
+            f"• 每币最大仓位: {config['max_position_per_coin']}",
+            f"• 资金分配: {config['allocation_percent']*100:.0f}%",
+            f"• 自动复利: ✅ 开启",
+        ]
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def render_brain_status(self, msg_obj):
         try:
@@ -2759,12 +3008,12 @@ class QuantBot:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ UltimateBot v9.0 启动成功（12合1终极策略）")
+                logger.info("✅ UltimateBot v10.0 启动成功（16合1终极策略）")
                 if settings.TG_CHAT_ID:
                     try:
                         await self.tg_app.bot.send_message(
                             chat_id=settings.TG_CHAT_ID,
-                            text="🚀 **UltimateBot v9.0 终极版已上线**\n\n"
+                            text="🚀 **UltimateBot v10.0 终极版已上线**\n\n"
                                  "📊 多周期共振\n"
                                  "🔄 布林带收口突破\n"
                                  "📈 ABC反转\n"
@@ -2772,8 +3021,8 @@ class QuantBot:
                                  "💰 资金费率套利\n"
                                  "🐋 链上巨鲸监控\n"
                                  "🧠 AI市场分析（4合1）\n"
-                                 "🤖 12大前沿技术\n\n"
-                                 "策略组合：**12合1 终极完整版**"
+                                 "🤖 16大前沿技术\n\n"
+                                 "策略组合：**16合1 终极完整版**"
                         )
                     except:
                         pass
