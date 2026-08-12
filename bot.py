@@ -2133,7 +2133,7 @@ class QuantBot:
         except Exception as e:
             await update.effective_message.reply_text(f"❌ 格式: /setcoinonly ETH\n错误: {e}")
 
-    # ==================== 一键低本金滚雪球 ====================
+    # ==================== 一键低本金滚雪球（已修复） ====================
 
     async def cmd_lowbalance(self, update, context):
         """一键低本金快速滚雪球（5个币种，低金额高频率）"""
@@ -2219,18 +2219,6 @@ class QuantBot:
 
         await self._save_config()
 
-        await update.effective_message.reply_text(
-            f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
-            f"📊 **监控币种**\n"
-            f"🔹 ETH/USDT  止盈{self.coin_configs['ETH/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ETH/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ETH/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ETH/USDT']['auto_min_score']}\n"
-            f"🔹 BTC/USDT  止盈{self.coin_configs['BTC/USDT']['tp_pct']:.1%} 止损{self.coin_configs['BTC/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['BTC/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['BTC/USDT']['auto_min_score']}\n"
-            f"🔹 SOL/USDT  止盈{self.coin_configs['SOL/USDT']['tp_pct']:.1%} 止损{self.coin_configs['SOL/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['SOL/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['SOL/USDT']['auto_min_score']}\n"
-            f"🔹 DOGE/USDT 止盈{self.coin_configs['DOGE/USDT']['tp_pct']:.1%} 止损{self.coin_configs['DOGE/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['DOGE/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['DOGE/USDT']['auto_min_score']}\n"
-            f"🔹 ADA/USDT  止盈{self.coin_configs['ADA/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ADA/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ADA/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ADA/USDT']['auto_min_score']}\n\n"
-            f"⏱ 周期: 1m | 保留底线: {self.reserve_bottom}U\n"
-            f"💰 总本金建议: 10-20U\n\n"
-            f"✅ 发送 /autotrade on 启动交易"
-        )
         await update.effective_message.reply_text(
             f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
             f"📊 **监控币种**\n"
