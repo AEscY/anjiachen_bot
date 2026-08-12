@@ -1,5 +1,5 @@
 """
-UltimateBot v10.0 - 终极完整版（16合1全栈策略 + 自主AI代理 + EVOQUANT自进化 + 确定性屏蔽）
+UltimateBot v10.0 - 终极完整版（16合1全栈策略 + 自主AI代理 + EVOQUANT + 确定性屏蔽）
 集成：ArchetypeTrader / CrossSync-Trader / Meta-RL-Crypto / ChanFormer / F2Agent / 置信度感知RL / 端到端DL统计套利 / AI驱动高频 / 链上数据量化 / 多源情绪融合 / 三角套利 / 跨DEX套利 / 自主AI代理 / EVOQUANT / 确定性屏蔽 / RALA增强
 """
 import asyncio
@@ -434,7 +434,7 @@ class FrontierEngine:
         max_price = max(prices)
         min_price = min(prices)
         spread = (max_price - min_price) / min_price * 100 if min_price > 0 else 0
-        if 0 < spread < 5:  # 合理性过滤
+        if 0 < spread < 5:
             return True, spread
         return False, spread
 
@@ -502,15 +502,13 @@ class FrontierEngine:
         avg_win = performance_metrics.get('avg_win_pct', 0)
         avg_loss = performance_metrics.get('avg_loss_pct', 0)
         sharpe = performance_metrics.get('sharpe', 1.0)
-        # 计算调整因子
         factor = 1.0
         if win_rate < 0.4:
-            factor *= 0.9  # 提高信号质量
+            factor *= 0.9
         if avg_win < avg_loss * 0.5:
-            factor *= 0.8  # 盈亏比太低，收紧止盈止损
+            factor *= 0.8
         if sharpe < 0.5:
             factor *= 0.85
-        # 调整参数
         new_params = current_params.copy()
         if 'tp_pct' in new_params:
             new_params['tp_pct'] = new_params['tp_pct'] * (1 + (avg_win/100) * 0.1)
@@ -520,7 +518,6 @@ class FrontierEngine:
     # ----- 15. 确定性屏蔽 (安全边界) -----
     @staticmethod
     def deterministic_shielding(signal, confidence, market_volatility, max_risk=0.02):
-        """确定性屏蔽：防止极端操作"""
         if confidence < 0.3:
             return 0, "低置信度屏蔽"
         if market_volatility > 0.1:
@@ -868,26 +865,32 @@ class QuantBot:
         self.max_drawdown_pct = cfg.get('max_drawdown_pct', 0.15)
         self.max_positions_per_coin = cfg.get('max_positions_per_coin', 18)
 
+        # ========== 修复 coin_configs 加载 ==========
         coin_cfg_raw = cfg.get('coin_configs', '{}')
-        if isinstance(coin_cfg_raw, dict):
-            self.coin_configs = coin_cfg_raw
-        elif isinstance(coin_cfg_raw, str):
-            try:
-                self.coin_configs = json.loads(coin_cfg_raw)
-            except:
+        try:
+            if isinstance(coin_cfg_raw, str):
+                self.coin_configs = json.loads(coin_cfg_raw) if coin_cfg_raw else {}
+            elif isinstance(coin_cfg_raw, dict):
+                self.coin_configs = coin_cfg_raw
+            else:
                 self.coin_configs = {}
-        else:
+        except json.JSONDecodeError as e:
+            logger.warning(f"coin_configs JSON 解析失败，重置为空: {e}")
             self.coin_configs = {}
+        if not isinstance(self.coin_configs, dict):
+            self.coin_configs = {}
+        logger.info(f"✅ 加载 coin_configs: {self.coin_configs}")
+        # ========== 修复结束 ==========
 
         grid_cfg_raw = cfg.get('grid_configs', '{}')
-        if isinstance(grid_cfg_raw, dict):
-            self.grid_configs = grid_cfg_raw
-        elif isinstance(grid_cfg_raw, str):
-            try:
-                self.grid_configs = json.loads(grid_cfg_raw)
-            except:
+        try:
+            if isinstance(grid_cfg_raw, str):
+                self.grid_configs = json.loads(grid_cfg_raw) if grid_cfg_raw else {}
+            elif isinstance(grid_cfg_raw, dict):
+                self.grid_configs = grid_cfg_raw
+            else:
                 self.grid_configs = {}
-        else:
+        except:
             self.grid_configs = {}
 
         self.trades = await load_trades()
@@ -899,7 +902,7 @@ class QuantBot:
             self.daily_trades = state.get('daily_trades', 0)
             self._trailing_active = state.get('trailing_active', {})
             self._trailing_high = state.get('trailing_high', {})
-        logger.info("✅ UltimateBot v10.0 已加载")
+        logger.info("✅ 运行时状态（含移动止损）已恢复")
 
     async def _save_runtime_state(self):
         state = {
@@ -932,7 +935,7 @@ class QuantBot:
             'max_total_allocated_pct': self.max_total_allocated_pct,
             'max_drawdown_pct': self.max_drawdown_pct,
             'max_positions_per_coin': self.max_positions_per_coin,
-            'coin_configs': json.dumps(self.coin_configs),  # ✅ 确保序列化为 JSON
+            'coin_configs': json.dumps(self.coin_configs),
             'grid_configs': json.dumps(self.grid_configs)
         }
         await save_config(cfg)
@@ -1030,7 +1033,6 @@ class QuantBot:
                         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
                         bb_hist = self._bb_bandwidth_history.get(sym, [])
 
-                        # ---- 16个技术评分 ----
                         arch_signal, arch_type = self.frontier.archetype_trader_signal(
                             self._price_history[sym], self._volume_history.get(sym, []), rsi_hist, bb_hist)
                         archetype_signals.append(f"{sym}:{arch_type}")
@@ -1050,20 +1052,15 @@ class QuantBot:
                         arb_opp, arb_profit = self.frontier.triangular_arbitrage(
                             [self._price_history.get(s, [-1])[-1] if self._price_history.get(s, [-1]) else 1 for s in self.symbols])
                         dex_arb, dex_spread = self.frontier.cross_dex_arbitrage(dex_prices)
-                        # 自主AI代理
                         auto_score, auto_action, auto_conf, auto_reasons = self.frontier.autonomous_agent_decision(
                             self._price_history[sym], tech, onchain, news_data, social_data, fg, funding)
-                        # EVOQUANT自进化（基于历史表现）
                         evo_params, evo_factor = self.frontier.evoquant_optimize(
                             self._performance_metrics, {'tp_pct': self.tp_pct, 'sl_pct': self.sl_pct})
-                        # 确定性屏蔽
                         shielded_signal, shield_reason = self.frontier.deterministic_shielding(
                             arch_signal, confidence, volatility)
-                        # RALA增强
                         rala_params = self.frontier.rala_enhanced(
                             "high_volatility_trend" if volatility > 0.05 else "neutral", confidence, tech, funding, fg)
 
-                        # 综合评分（16合1加权）
                         combined_score = (
                             0.06 * min(100, max(0, 50 + arch_signal * 30)) +
                             0.06 * cross_score +
@@ -1131,7 +1128,7 @@ class QuantBot:
                 logger.error(f"AI分析异常: {e}")
             await asyncio.sleep(1800)
 
-    # ==================== 资金费率套利升级（全自动多币种） ====================
+    # ==================== 资金费率套利升级 ====================
 
     async def _delta_neutral_arbitrage(self):
         while self.is_running:
@@ -1306,7 +1303,7 @@ class QuantBot:
                 logger.error(f"三角套利监控异常: {e}")
                 await asyncio.sleep(300)
 
-    # ==================== 开仓决策（16合1） ====================
+    # ==================== 开仓决策 ====================
 
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
         scores = []
@@ -1355,7 +1352,6 @@ class QuantBot:
         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
         volatility = tech.get('atr', 0) / tech.get('bb_middle', 1) if tech.get('bb_middle', 0) > 0 else 0.01
 
-        # ---- 16个维度评分 ----
         arch_signal, arch_type = self.frontier.archetype_trader_signal(
             self._price_history.get(sym, []), self._volume_history.get(sym, []), rsi_hist, self._bb_bandwidth_history.get(sym, []))
         arch_score = 50 + arch_signal * 30
@@ -1406,24 +1402,20 @@ class QuantBot:
         dex_arb, dex_spread = self.frontier.cross_dex_arbitrage(dex_prices)
         scores.append((50 + (10 if dex_arb else 0)) * 0.05)
 
-        # 自主AI代理
         auto_score, auto_action, auto_conf, auto_reasons = self.frontier.autonomous_agent_decision(
             self._price_history.get(sym, []), tech, onchain, news, social, fg, funding)
         scores.append(auto_score * 0.10)
         if auto_reasons:
             details.append(f"AutoAgent:{','.join(auto_reasons[:2])}")
 
-        # EVOQUANT自进化
         evo_params, evo_factor = self.frontier.evoquant_optimize(
             self._performance_metrics, {'tp_pct': self.tp_pct, 'sl_pct': self.sl_pct})
         scores.append((50 + evo_factor * 10) * 0.05)
 
-        # 确定性屏蔽
         shielded_signal, shield_reason = self.frontier.deterministic_shielding(arch_signal, confidence, volatility)
         scores.append((50 + shielded_signal * 10) * 0.05)
         details.append(f"Shield:{shield_reason}")
 
-        # RALA增强
         rala_params = self.frontier.rala_enhanced(
             "high_volatility_trend" if volatility > 0.05 else "neutral", confidence, tech, funding, fg)
         scores.append((50 + rala_params.get('weight', 0.5) * 20) * 0.05)
@@ -1471,7 +1463,7 @@ class QuantBot:
             [InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos"), InlineKeyboardButton("🔄 刷新", callback_data="refresh_panel")]
         ])
 
-    # ----- 常用命令 -----
+    # ----- 常用命令（修复所有百分比显示） -----
 
     async def cmd_menu(self, update, context):
         if not self._auth(update):
@@ -1695,7 +1687,7 @@ class QuantBot:
             if "score" in p: self.auto_min_score = p["score"]
             await self._save_config()
             names = {"conservative":"保守","balanced":"平衡","aggressive":"激进","ETH滚雪球":"ETH滚雪球","BTC滚雪球":"BTC滚雪球","SOL滚雪球":"SOL滚雪球","DOGE滚雪球":"DOGE滚雪球","ADA滚雪球":"ADA滚雪球"}
-            await update.effective_message.reply_text(f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct*100:.1f}% 止损{self.sl_pct*100:.1f}%")
+            await update.effective_message.reply_text(f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct:.1%} 止损{self.sl_pct:.1%}")
         except:
             pass
 
@@ -1752,7 +1744,7 @@ class QuantBot:
         lines.append(f"📊 **多币种量化机器人看板** {self.env_tag}")
         lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
         lines.append(f"• 策略模式: 🚀 **终极16合1策略**")
-        # ✅ 修复：止盈显示为百分比
+        # ✅ 修复：止盈显示为百分比（0.8%）
         lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct:.1%}")
         lines.append(f"• 占用资金: {occupied:.2f} USDT")
         lines.append("-" * 40)
@@ -1805,6 +1797,7 @@ class QuantBot:
             lines.append("• 🤖 AI: 分析中...")
 
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
     async def cmd_check(self, update, context):
         if not self._auth(update):
             return
@@ -1885,7 +1878,7 @@ class QuantBot:
                 return
             self.tp_pct = val
             await self._save_config()
-            await update.effective_message.reply_text(f"✅ 止盈: {self.tp_pct*100:.2f}%")
+            await update.effective_message.reply_text(f"✅ 止盈: {self.tp_pct:.1%}")
         except:
             pass
 
@@ -1899,7 +1892,7 @@ class QuantBot:
                 return
             self.sl_pct = val
             await self._save_config()
-            await update.effective_message.reply_text("✅")
+            await update.effective_message.reply_text(f"✅ 止损: {self.sl_pct:.1%}")
         except:
             pass
 
@@ -1909,7 +1902,7 @@ class QuantBot:
         try:
             self.trailing_sl_pct = self._parse_pct(float(context.args[0]))
             await self._save_config()
-            await update.effective_message.reply_text("✅")
+            await update.effective_message.reply_text(f"✅ 移动止损: {self.trailing_sl_pct:.1%}")
         except:
             pass
 
@@ -1920,7 +1913,7 @@ class QuantBot:
             val = self._parse_pct(float(context.args[0]))
             self.trailing_tp_pct = val
             await self._save_config()
-            await update.effective_message.reply_text(f"✅ 移动止盈: {self.trailing_tp_pct*100:.2f}%")
+            await update.effective_message.reply_text(f"✅ 移动止盈: {self.trailing_tp_pct:.1%}")
         except:
             pass
 
@@ -2033,7 +2026,11 @@ class QuantBot:
             name_map = {'tp_pct':'止盈','sl_pct':'止损','trailing_sl_pct':'移动止损','trailing_tp_pct':'移动止盈','single_order_usdt':'单笔额度','auto_min_score':'信号阈值'}
             display = val*100 if attr in ('tp_pct','sl_pct','trailing_sl_pct','trailing_tp_pct') else val
             unit = '%' if attr in ('tp_pct','sl_pct','trailing_sl_pct','trailing_tp_pct') else 'U' if attr=='single_order_usdt' else '分'
-            await update.effective_message.reply_text(f"✅ {sym} {name_map[attr]}: {display:.1f}{unit}")
+            # ✅ 修复：显示百分比时直接使用百分比格式
+            if attr in ('tp_pct','sl_pct','trailing_sl_pct','trailing_tp_pct'):
+                await update.effective_message.reply_text(f"✅ {sym} {name_map[attr]}: {val:.1%}")
+            else:
+                await update.effective_message.reply_text(f"✅ {sym} {name_map[attr]}: {display:.1f}{unit}")
         except:
             await update.effective_message.reply_text("❌ 格式: /setcoin DOGE tp 1")
 
@@ -2090,11 +2087,14 @@ class QuantBot:
             except:
                 pass
             extra = "🔸独立" if sym in self.coin_configs else "🌐全局"
-            lines.append(f"{extra} **{sym}**\n"
-                         f"  止盈{tp*100:.1f}% 止损{sl*100:.1f}% 移盈{tmpt*100:.1f}% 移损{tsl*100:.1f}%\n"
-                         f"  单笔{amount}U 阈值{score}分 仓位{count}/{self.max_positions_per_coin}\n"
-                         f"  持仓{free:.4f} 现价{p:.2f} 价值{val:.2f}U{pnl_str}\n"
-                         f"  累计净盈亏: {total_net_pnl:+.4f}U")
+            # ✅ 修复：显示百分比使用 .1%
+            lines.append(
+                f"{extra} **{sym}**\n"
+                f"  止盈{tp:.1%} 止损{sl:.1%} 移盈{tmpt:.1%} 移损{tsl:.1%}\n"
+                f"  单笔{amount:.1f}U 阈值{score}分 仓位{count}/{self.max_positions_per_coin}\n"
+                f"  持仓{free:.4f} 现价{p:.2f} 价值{val:.2f}U{pnl_str}\n"
+                f"  累计净盈亏: {total_net_pnl:+.4f}U"
+            )
         lines.append("💡 /setcoin 修改独立参数 | /resetcoin 重置为全局")
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -2119,13 +2119,14 @@ class QuantBot:
                 await self._save_config()
                 await update.effective_message.reply_text(
                     f"✅ **已固定币种: {sym}**\n"
-                    f"• 止盈: {self.tp_pct*100:.1f}%\n"
-                    f"• 止损: {self.sl_pct*100:.1f}%\n"
+                    f"• 止盈: {self.tp_pct:.1%}\n"
+                    f"• 止损: {self.sl_pct:.1%}\n"
                     f"• 周期: {self.timeframe}\n"
-                    f"• 单笔: {self.single_order_usdt}U\n"
+                    f"• 单笔: {self.single_order_usdt:.1f}U\n"
                     f"• 阈值: {self.auto_min_score}分\n"
                     f"🚀 终极16合1策略已激活！\n"
-                    f"🧠 AI市场分析 + 16大前沿技术已启用")
+                    f"🧠 AI市场分析 + 16大前沿技术已启用"
+                )
             else:
                 await self._save_config()
                 await update.effective_message.reply_text(f"✅ **已固定币种: {sym}**\n• 使用当前全局参数")
@@ -2135,7 +2136,6 @@ class QuantBot:
     # ==================== 一键低本金滚雪球 ====================
 
     async def cmd_lowbalance(self, update, context):
-        """一键低本金快速滚雪球（5个币种，低金额高频率）"""
         if not self._auth(update):
             return
         self.symbols = ["ETH/USDT", "BTC/USDT", "SOL/USDT", "DOGE/USDT", "ADA/USDT"]
@@ -2151,12 +2151,12 @@ class QuantBot:
         await update.effective_message.reply_text(
             f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
             f"📊 **监控币种**\n"
-            f"🔹 ETH/USDT  止盈0.8% 止损0.5% 单笔1.0U 阈值65\n"
-            f"🔹 BTC/USDT  止盈0.6% 止损0.4% 单笔1.0U 阈值65\n"
-            f"🔹 SOL/USDT  止盈1.0% 止损0.5% 单笔1.0U 阈值60\n"
-            f"🔹 DOGE/USDT 止盈1.2% 止损0.6% 单笔0.5U 阈值60\n"
-            f"🔹 ADA/USDT  止盈1.2% 止损0.6% 单笔0.5U 阈值60\n\n"
-            f"⏱ 周期: 1m | 保留底线: 5U\n"
+            f"🔹 ETH/USDT  止盈{self.coin_configs['ETH/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ETH/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ETH/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ETH/USDT']['auto_min_score']}\n"
+            f"🔹 BTC/USDT  止盈{self.coin_configs['BTC/USDT']['tp_pct']:.1%} 止损{self.coin_configs['BTC/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['BTC/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['BTC/USDT']['auto_min_score']}\n"
+            f"🔹 SOL/USDT  止盈{self.coin_configs['SOL/USDT']['tp_pct']:.1%} 止损{self.coin_configs['SOL/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['SOL/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['SOL/USDT']['auto_min_score']}\n"
+            f"🔹 DOGE/USDT 止盈{self.coin_configs['DOGE/USDT']['tp_pct']:.1%} 止损{self.coin_configs['DOGE/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['DOGE/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['DOGE/USDT']['auto_min_score']}\n"
+            f"🔹 ADA/USDT  止盈{self.coin_configs['ADA/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ADA/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ADA/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ADA/USDT']['auto_min_score']}\n\n"
+            f"⏱ 周期: 1m | 保留底线: {self.reserve_bottom}U\n"
             f"💰 总本金建议: 10-20U\n\n"
             f"✅ 发送 /autotrade on 启动交易"
         )
@@ -2325,8 +2325,8 @@ class QuantBot:
                 await self.render_gap_analysis(query.message); await query.answer()
             elif data == "dashboard":
                 auto_state = "开启" if self.auto_trade_enabled else "关闭"
-                msg = (f"📊 看板\n止盈{self.tp_pct*100:.2f}% 止损{self.sl_pct*100:.2f}%\n"
-                       f"移损{self.trailing_sl_pct*100:.2f}% 移盈{self.trailing_tp_pct*100:.2f}%\n"
+                msg = (f"📊 看板\n止盈{self.tp_pct:.1%} 止损{self.sl_pct:.1%}\n"
+                       f"移损{self.trailing_sl_pct:.1%} 移盈{self.trailing_tp_pct:.1%}\n"
                        f"额度{self.single_order_usdt}U 周期{self.timeframe} 底线{self.reserve_bottom}U\n"
                        f"自动交易: {auto_state} 阈值: {self.auto_min_score}分\n"
                        f"仓位上限: {self.max_positions_per_coin}个\n"
@@ -2377,26 +2377,26 @@ class QuantBot:
                 opts = [("3次","3"),("5次","5"),("10次","10"),("无限","0")]
                 await query.edit_message_text("🔢 上限", reply_markup=self._build_option_keyboard(opts,"cfg_trades","settrades")); await query.answer()
             elif data == "menu_set_tp":
-                opts = [("3%","0.03"),("5%","0.05"),("8%","0.08")]
-                await query.edit_message_text("🎯", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp")); await query.answer()
+                opts = [("0.8%","0.008"),("1.5%","0.015"),("2.5%","0.025")]
+                await query.edit_message_text("🎯 止盈", reply_markup=self._build_option_keyboard(opts,"cfg_tp","settp")); await query.answer()
             elif data == "menu_set_sl":
-                opts = [("1%","0.01"),("2%","0.02"),("3%","0.03")]
-                await query.edit_message_text("🛡️", reply_markup=self._build_option_keyboard(opts,"cfg_sl","setsl")); await query.answer()
+                opts = [("0.5%","0.005"),("1.0%","0.010"),("1.5%","0.015")]
+                await query.edit_message_text("🛡️ 止损", reply_markup=self._build_option_keyboard(opts,"cfg_sl","setsl")); await query.answer()
             elif data == "menu_set_tsl":
-                opts = [("0.5%","0.005"),("1%","0.01"),("1.5%","0.015")]
-                await query.edit_message_text("📉", reply_markup=self._build_option_keyboard(opts,"cfg_tsl","settsl")); await query.answer()
+                opts = [("0.5%","0.005"),("1.0%","0.010"),("1.5%","0.015")]
+                await query.edit_message_text("📉 移动止损", reply_markup=self._build_option_keyboard(opts,"cfg_tsl","settsl")); await query.answer()
             elif data == "menu_set_tmpt":
-                opts = [("0.5%","0.005"),("1%","0.01"),("1.5%","0.015")]
-                await query.edit_message_text("🏹", reply_markup=self._build_option_keyboard(opts,"cfg_tmpt","settmpt")); await query.answer()
+                opts = [("0.3%","0.003"),("0.5%","0.005"),("1.0%","0.010")]
+                await query.edit_message_text("🏹 移动止盈", reply_markup=self._build_option_keyboard(opts,"cfg_tmpt","settmpt")); await query.answer()
             elif data == "menu_set_amount":
-                opts = [("1U","1"),("2U","2"),("5U","5")]
-                await query.edit_message_text("💵", reply_markup=self._build_option_keyboard(opts,"cfg_amt","setamount")); await query.answer()
+                opts = [("0.5U","0.5"),("1U","1"),("2U","2")]
+                await query.edit_message_text("💵 单笔额度", reply_markup=self._build_option_keyboard(opts,"cfg_amt","setamount")); await query.answer()
             elif data == "menu_set_tf":
-                opts = [("1m","1m"),("5m","5m"),("15m","15m"),("1h","1h")]
-                await query.edit_message_text("⏱", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf")); await query.answer()
+                opts = [("1m","1m"),("3m","3m"),("5m","5m"),("15m","15m")]
+                await query.edit_message_text("⏱ 周期", reply_markup=self._build_option_keyboard(opts,"cfg_tf","settf")); await query.answer()
             elif data == "menu_set_reserve":
-                opts = [("0.5U","0.5"),("1U","1"),("2U","2"),("5U","5")]
-                await query.edit_message_text("🔒", reply_markup=self._build_option_keyboard(opts,"cfg_res","setreserve")); await query.answer()
+                opts = [("0.5U","0.5"),("1U","1"),("2U","2")]
+                await query.edit_message_text("🔒 底线", reply_markup=self._build_option_keyboard(opts,"cfg_res","setreserve")); await query.answer()
             elif data == "menu_add_symbol":
                 opts = [("BTC/USDT","BTC/USDT"),("SOL/USDT","SOL/USDT"),("DOGE/USDT","DOGE/USDT"),("ADA/USDT","ADA/USDT")]
                 await query.edit_message_text("➕", reply_markup=self._build_option_keyboard(opts,"cfg_add","addsymbol")); await query.answer()
@@ -2408,7 +2408,7 @@ class QuantBot:
                 if prefix == "cfg_tp":
                     val_f = float(val_str)
                     if val_f < self.breakeven_pct:
-                        await query.answer(f"❌ 低于保本线", show_alert=True); return
+                        await query.answer(f"❌ 低于保本线 {self.breakeven_pct:.1%}", show_alert=True); return
                     if self.sl_pct > 0 and val_f / self.sl_pct < 1.2:
                         await query.answer("❌ 盈亏比不足", show_alert=True); return
                     self.tp_pct = val_f
@@ -2446,7 +2446,7 @@ class QuantBot:
             elif data.startswith("prompt_manual:"):
                 key = data.split(":")[1]
                 context.user_data['pending_setting'] = key
-                prompts = {"settp":"✍️ 止盈率（例：6.5%）：","setsl":"✍️ 硬止损率（例：2.5%）：","settsl":"✍️ 移动止损回调（例：1.5%）：","settmpt":"✍️ 移动止盈回调（例：1%）：","setamount":"✍️ 单笔 USDT（例：150）：","settf":"✍️ K线周期（例：15m）：","setreserve":"✍️ 安全底线（例：100）：","addsymbol":"✍️ 币种（例：DOGE/USDT）：","delsymbol":"✍️ 要删除的币种：","autoscore":"✍️ 信号阈值（50-95）：","settrades":"✍️ 单日最大交易次数：","setmaxcoin":"✍️ 单币最大持仓U：","setmaxloss":"✍️ 日熔断百分比（例：5）：","setmaxpos":"✍️ 每币最大仓位数量：","setmaxalloc":"✍️ 总仓位上限%（例：80）："}
+                prompts = {"settp":"✍️ 止盈率（例：0.8）：","setsl":"✍️ 止损率（例：0.5）：","settsl":"✍️ 移动止损（例：0.5）：","settmpt":"✍️ 移动止盈（例：0.3）：","setamount":"✍️ 单笔 USDT（例：1）：","settf":"✍️ 周期（例：1m）：","setreserve":"✍️ 底线（例：1）：","addsymbol":"✍️ 币种（例：DOGE/USDT）：","delsymbol":"✍️ 要删除的币种：","autoscore":"✍️ 阈值（50-95）：","settrades":"✍️ 日交易次数：","setmaxcoin":"✍️ 单币最大持仓U：","setmaxloss":"✍️ 日熔断%（例：5）：","setmaxpos":"✍️ 最大仓位数：","setmaxalloc":"✍️ 总仓位上限%（例：80）："}
                 await query.message.reply_text(prompts.get(key, "✍️ 请输入数值："), reply_markup=ForceReply(selective=True)); await query.answer()
             elif data == "panic_confirm":
                 await query.answer("🚨 请发送 /panic 确认", show_alert=True)
@@ -3003,7 +3003,7 @@ class QuantBot:
                 self.tp_pct = new_tp
                 self.sl_pct = new_sl
                 await self._save_config()
-                await self._alert(f"🤖 AI 动态优化完成\n止盈: {self.tp_pct*100:.1f}%\n止损: {self.sl_pct*100:.1f}%")
+                await self._alert(f"🤖 AI 动态优化完成\n止盈: {self.tp_pct:.1%}\n止损: {self.sl_pct:.1%}")
 
     # ==================== 启动入口 ====================
 
