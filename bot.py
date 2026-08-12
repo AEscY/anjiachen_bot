@@ -932,7 +932,7 @@ class QuantBot:
             'max_total_allocated_pct': self.max_total_allocated_pct,
             'max_drawdown_pct': self.max_drawdown_pct,
             'max_positions_per_coin': self.max_positions_per_coin,
-            'coin_configs': json.dumps(self.coin_configs),
+            'coin_configs': json.dumps(self.coin_configs),  # ✅ 确保序列化为 JSON
             'grid_configs': json.dumps(self.grid_configs)
         }
         await save_config(cfg)
