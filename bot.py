@@ -2136,18 +2136,101 @@ class QuantBot:
     # ==================== 一键低本金滚雪球 ====================
 
     async def cmd_lowbalance(self, update, context):
+        """一键低本金快速滚雪球（5个币种，低金额高频率）"""
         if not self._auth(update):
             return
-        self.symbols = ["ETH/USDT", "BTC/USDT", "SOL/USDT", "DOGE/USDT", "ADA/USDT"]
+
+        # 清空并设置5个币种
+        self.symbols = [
+            "ETH/USDT",
+            "BTC/USDT",
+            "SOL/USDT",
+            "DOGE/USDT",
+            "ADA/USDT"
+        ]
+
+        # 清空旧的 coin_configs，重新设置
         self.coin_configs = {}
-        self.coin_configs["ETH/USDT"] = {"tp_pct":0.8,"sl_pct":0.5,"trailing_sl_pct":0.5,"trailing_tp_pct":0.3,"single_order_usdt":1.0,"timeframe":"1m","auto_min_score":65}
-        self.coin_configs["BTC/USDT"] = {"tp_pct":0.6,"sl_pct":0.4,"trailing_sl_pct":0.4,"trailing_tp_pct":0.2,"single_order_usdt":1.0,"timeframe":"1m","auto_min_score":65}
-        self.coin_configs["SOL/USDT"] = {"tp_pct":1.0,"sl_pct":0.5,"trailing_sl_pct":0.5,"trailing_tp_pct":0.3,"single_order_usdt":1.0,"timeframe":"1m","auto_min_score":60}
-        self.coin_configs["DOGE/USDT"] = {"tp_pct":1.2,"sl_pct":0.6,"trailing_sl_pct":0.6,"trailing_tp_pct":0.4,"single_order_usdt":0.5,"timeframe":"1m","auto_min_score":60}
-        self.coin_configs["ADA/USDT"] = {"tp_pct":1.2,"sl_pct":0.6,"trailing_sl_pct":0.6,"trailing_tp_pct":0.4,"single_order_usdt":0.5,"timeframe":"1m","auto_min_score":60}
-        self.tp_pct = 0.8; self.sl_pct = 0.5; self.trailing_sl_pct = 0.5; self.trailing_tp_pct = 0.3
-        self.single_order_usdt = 1.0; self.timeframe = "1m"; self.auto_min_score = 65; self.reserve_bottom = 5
+
+        # ETH 参数
+        self.coin_configs["ETH/USDT"] = {
+            "tp_pct": 0.8,
+            "sl_pct": 0.5,
+            "trailing_sl_pct": 0.5,
+            "trailing_tp_pct": 0.3,
+            "single_order_usdt": 1.0,
+            "timeframe": "1m",
+            "auto_min_score": 65
+        }
+
+        # BTC 参数
+        self.coin_configs["BTC/USDT"] = {
+            "tp_pct": 0.6,
+            "sl_pct": 0.4,
+            "trailing_sl_pct": 0.4,
+            "trailing_tp_pct": 0.2,
+            "single_order_usdt": 1.0,
+            "timeframe": "1m",
+            "auto_min_score": 65
+        }
+
+        # SOL 参数
+        self.coin_configs["SOL/USDT"] = {
+            "tp_pct": 1.0,
+            "sl_pct": 0.5,
+            "trailing_sl_pct": 0.5,
+            "trailing_tp_pct": 0.3,
+            "single_order_usdt": 1.0,
+            "timeframe": "1m",
+            "auto_min_score": 60
+        }
+
+        # DOGE 参数
+        self.coin_configs["DOGE/USDT"] = {
+            "tp_pct": 1.2,
+            "sl_pct": 0.6,
+            "trailing_sl_pct": 0.6,
+            "trailing_tp_pct": 0.4,
+            "single_order_usdt": 0.5,
+            "timeframe": "1m",
+            "auto_min_score": 60
+        }
+
+        # ADA 参数
+        self.coin_configs["ADA/USDT"] = {
+            "tp_pct": 1.2,
+            "sl_pct": 0.6,
+            "trailing_sl_pct": 0.6,
+            "trailing_tp_pct": 0.4,
+            "single_order_usdt": 0.5,
+            "timeframe": "1m",
+            "auto_min_score": 60
+        }
+
+        # 同时更新全局默认参数（为新增币种提供 fallback）
+        self.tp_pct = 0.8
+        self.sl_pct = 0.5
+        self.trailing_sl_pct = 0.5
+        self.trailing_tp_pct = 0.3
+        self.single_order_usdt = 1.0
+        self.timeframe = "1m"
+        self.auto_min_score = 65
+        self.reserve_bottom = 5
+
         await self._save_config()
+
+        await update.effective_message.reply_text(
+            f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
+            f"📊 **监控币种**\n"
+            f"🔹 ETH/USDT  止盈{self.coin_configs['ETH/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ETH/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ETH/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ETH/USDT']['auto_min_score']}\n"
+            f"🔹 BTC/USDT  止盈{self.coin_configs['BTC/USDT']['tp_pct']:.1%} 止损{self.coin_configs['BTC/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['BTC/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['BTC/USDT']['auto_min_score']}\n"
+            f"🔹 SOL/USDT  止盈{self.coin_configs['SOL/USDT']['tp_pct']:.1%} 止损{self.coin_configs['SOL/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['SOL/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['SOL/USDT']['auto_min_score']}\n"
+            f"🔹 DOGE/USDT 止盈{self.coin_configs['DOGE/USDT']['tp_pct']:.1%} 止损{self.coin_configs['DOGE/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['DOGE/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['DOGE/USDT']['auto_min_score']}\n"
+            f"🔹 ADA/USDT  止盈{self.coin_configs['ADA/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ADA/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ADA/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ADA/USDT']['auto_min_score']}\n\n"
+            f"⏱ 周期: 1m | 保留底线: {self.reserve_bottom}U\n"
+            f"💰 总本金建议: 10-20U\n\n"
+            f"✅ 发送 /autotrade on 启动交易"
+        )
         await update.effective_message.reply_text(
             f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
             f"📊 **监控币种**\n"
