@@ -1738,7 +1738,7 @@ class QuantBot:
         lines.append(f"📊 **多币种量化机器人看板** {self.env_tag}")
         lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
         lines.append(f"• 策略模式: 🚀 **终极16合1策略**")
-        lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct*100:+.1f}%")
+        lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct:.1%}")
         lines.append(f"• 占用资金: {occupied:.2f} USDT")
         lines.append("-" * 40)
         has_position = False
