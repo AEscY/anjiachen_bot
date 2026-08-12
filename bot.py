@@ -1715,10 +1715,13 @@ class QuantBot:
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_status(self, update, context):
+        """📊 多币种量化机器人看板"""
         if not self._auth(update):
             return
+
         bal = await self.exchange.fetch_balance()
         usdt_free = self._get_usdt_free(bal)
+
         total_value = usdt_free
         for sym in self.symbols:
             coin = sym.split('/')[0]
@@ -1728,59 +1731,80 @@ class QuantBot:
                 ticker = await self.exchange.fetch_ticker(sym)
             if ticker and ticker.get('last'):
                 total_value += free * ticker['last']
+
         occupied = total_value - usdt_free
+
+        today_stats = await get_today_trades()
+        total_fees = await get_total_fees()
+        total_net_profit = await get_total_net_profit()
+
         perf = await get_recent_performance(20)
         if perf and perf['total'] > 0:
-            win_rate = perf['win_rate']; wins = perf['wins']; total_trades = perf['total']
+            win_rate = perf['win_rate']
+            wins = perf['wins']
+            total_trades = perf['total']
         else:
-            win_rate = 0.0; wins = 0; total_trades = 0
+            win_rate = 0.0
+            wins = 0
+            total_trades = 0
+
         lines = []
         lines.append(f"📊 **多币种量化机器人看板** {self.env_tag}")
         lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
         lines.append(f"• 策略模式: 🚀 **终极16合1策略**")
+        # ✅ 修复：止盈显示为百分比
         lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct:.1%}")
         lines.append(f"• 占用资金: {occupied:.2f} USDT")
         lines.append("-" * 40)
+
         has_position = False
         for sym in self.symbols:
             count = self.position_counts.get(sym, 0)
             if count == 0:
                 continue
             has_position = True
+
             tp = self._get_coin_param(sym, 'tp_pct', self.tp_pct)
             sl = self._get_coin_param(sym, 'sl_pct', self.sl_pct)
             tsl = self._get_coin_param(sym, 'trailing_sl_pct', self.trailing_sl_pct)
             tmpt = self._get_coin_param(sym, 'trailing_tp_pct', self.trailing_tp_pct)
             amount = self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)
             timeframe = self._get_coin_param(sym, 'timeframe', self.timeframe)
+
             max_pos = self.max_positions_per_coin
             filled = min(count, max_pos)
             bar = "▓" * filled + "░" * (max_pos - filled)
-            lines.append(f"\n🔹 **[{sym}]** (周期:{timeframe} | 止盈:{tp*100:+.1f}% | 移动止损:{tsl*100:.1f}% | 单笔:{amount:.1f}U)")
+            # ✅ 修复：独立参数也显示为百分比
+            lines.append(f"\n🔹 **[{sym}]** (周期:{timeframe} | 止盈:{tp:.1%} | 移动止损:{tsl:.1%} | 单笔:{amount:.1f}U)")
             lines.append(f"[{bar}] {count}/{max_pos}")
+
             entry = self.entries.get(sym, 0)
             high_price = self._trailing_high.get(sym, 0)
+
             if entry > 0:
                 lines.append(f"└ 仓位#1: 买价{entry:.4f} | 最高{high_price:.4f}")
                 if count > 1:
                     lines.append(f"└ ... 还有 {count-1} 个仓位")
+
         if not has_position:
             lines.append("\n📭 暂无持仓")
+
         lines.append("-" * 40)
         lines.append(f"• 胜率: {win_rate*100:.1f}% ({wins}/{total_trades} 胜)")
         lines.append(f"• 今日亏损: {self._today_loss_pct*100:.1f}%")
         lines.append(f"• 连续亏损: {self._consecutive_losses} 笔")
         lines.append(f"• 全局状态: {'⏸️ 暂停' if self._is_paused else '🟢 正常'}")
-        # 套利统计
+
         stats = self._delta_neutral_stats
         lines.append(f"• 💰 费率套利: {stats['total_trades']}笔 累计盈利{stats['total_profit']:.4f}U 今日{stats['profit_today']:.4f}U")
+
         if self.ai_enabled and time.time() - self.ai_insight["timestamp"] < 3600:
             lines.append(f"• 🤖 AI: {self.ai_insight['recommendation']} (评分{self.ai_insight['score']:.0f})")
             lines.append(f"   BTC:{self.ai_insight['btc_trend']} ETH:{self.ai_insight['eth_trend']} FG:{self.ai_insight['fear_greed']}")
         else:
             lines.append("• 🤖 AI: 分析中...")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
     async def cmd_check(self, update, context):
         if not self._auth(update):
             return
