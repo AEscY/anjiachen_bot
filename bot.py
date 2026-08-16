@@ -1,6 +1,6 @@
 """
 UltimateBot v10.0 - 终极完整版（16合1全栈策略 + 自主AI代理 + EVOQUANT + 确定性屏蔽）
-集成：ArchetypeTrader / CrossSync-Trader / Meta-RL-Crypto / ChanFormer / F2Agent / 置信度感知RL / 端到端DL统计套利 / AI驱动高频 / 链上数据量化 / 多源情绪融合 / 三角套利 / 跨DEX套利 / 自主AI代理 / EVOQUANT / 确定性屏蔽 / RALA增强
+集成：ArchetypeTrader / CrossSync-Trader / Meta-RL-Crypto / ChanFormer / F2Agent / 置信度感知RL / 端到端DL统计套利 / AI驱动高频 / 链上数据量化 / 多源情绪融合 / 三角套利 / 跨DEX套利（已注释） / 自主AI代理 / EVOQUANT / 确定性屏蔽 / RALA增强
 """
 import asyncio
 import aiohttp
@@ -1268,8 +1268,10 @@ class QuantBot:
                 logger.error(f"链上监控异常: {e}")
                 await asyncio.sleep(300)
 
-    # ==================== 跨DEX套利监控 ====================
+    # ==================== 跨DEX套利监控（已注释，不运行） ====================
 
+    # 如果你想重新启用跨DEX套利监控，取消下面函数的注释，并在 run() 中取消对应行的注释
+    """
     async def _dex_arbitrage_monitor(self):
         while self.is_running:
             try:
@@ -1283,6 +1285,7 @@ class QuantBot:
             except Exception as e:
                 logger.error(f"DEX套利监控异常: {e}")
                 await asyncio.sleep(120)
+    """
 
     # ==================== 三角套利监控 ====================
 
@@ -3089,12 +3092,15 @@ class QuantBot:
             asyncio.create_task(self.ws.watch_orderbooks(self.symbols))
 
         await self.tg_app.bot.delete_webhook(drop_pending_updates=True)
+
+        # 启动各个监控任务
         asyncio.create_task(self._auto_trade_monitor())
         asyncio.create_task(self._trailing_monitor())
         asyncio.create_task(self._risk_monitor_task())
         asyncio.create_task(self._delta_neutral_arbitrage())
         asyncio.create_task(self._onchain_monitor())
-        asyncio.create_task(self._dex_arbitrage_monitor())
+        # 跨DEX套利监控已注释（不需要则关闭）
+        # asyncio.create_task(self._dex_arbitrage_monitor())
         asyncio.create_task(self._triangular_arbitrage_monitor())
         asyncio.create_task(self._ai_analyze_market())
 
