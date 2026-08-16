@@ -373,8 +373,9 @@ class SentimentAugmentedRL:
     
     @staticmethod
     def calculate_alpha_reward(price_history, sentiment_history, rsi_history, n=30):
+        # ---- 修复：数据不足时返回中性值 50,0.5 ----
         if len(price_history) < n or len(sentiment_history) < n:
-            return 0, 0.5
+            return 50, 0.5  # 原为 0, 0.5
         
         recent_prices = price_history[-n:]
         recent_sentiment = sentiment_history[-n:]
@@ -1177,8 +1178,8 @@ class QuantBot:
         self._sentiment_history = {}
         self._ohlcv_history = {}
         self._trade_history = []
-        self._current_market_state = "neutral"   # 初始化字符串，不再存元组
-        self._current_market_score = 0.5         # 新增：存储状态评分
+        self._current_market_state = "neutral"
+        self._current_market_score = 0.5
         self._current_state_params = {}
         self._kelly_cache = {}
 
@@ -1529,12 +1530,10 @@ class QuantBot:
         price_hist = self._price_history.get(sym, [])
         vol_hist = self._volatility_history.get(sym, [])
         
-        # 修复：解包返回的元组，只存储状态字符串和分数
         state_str, state_score = self.market_state.detect_state(tech_data, price_hist, vol_hist)
-        self._current_market_state = state_str          # 只存字符串
-        self._current_market_score = state_score        # 可选存储分数
+        self._current_market_state = state_str
+        self._current_market_score = state_score
         
-        # 获取自适应参数
         state_params = self.market_state.get_strategy_params(
             state_str, self.tp_pct, self.sl_pct, self.single_order_usdt
         )
@@ -1717,18 +1716,30 @@ class QuantBot:
 
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
         """整合所有优化的开仓决策"""
+        # ---- 修复：强制更新价格历史，确保数据积累 ----
+        if sym not in self._price_history:
+            self._price_history[sym] = []
+        self._price_history[sym].append(p)
+        if len(self._price_history[sym]) > 100:
+            self._price_history[sym].pop(0)
+
+        # 同时更新RSI历史（如果tech有效）
+        if tech and sym in self._rsi_history:
+            rsi = tech.get('rsi', 50)
+            self._rsi_history[sym].append({'rsi': rsi, 'price': p, 'time': time.time()})
+            if len(self._rsi_history[sym]) > 100:
+                self._rsi_history[sym].pop(0)
+
         scores = []
         details = []
 
-        # 收集历史
+        # 收集其他历史（原代码已有）
         if sym not in self._volume_history:
             self._volume_history[sym] = []
         if sym not in self._close_prices_history:
             self._close_prices_history[sym] = []
         if sym not in self._bb_bandwidth_history:
             self._bb_bandwidth_history[sym] = []
-        if sym not in self._rsi_history:
-            self._rsi_history[sym] = []
 
         ticker = self.ws.get_ticker(sym)
         if ticker:
@@ -1742,14 +1753,17 @@ class QuantBot:
             if len(self._close_prices_history[sym]) > 100:
                 self._close_prices_history[sym].pop(0)
 
-        rsi = tech.get('rsi', 50)
-        self._rsi_history[sym].append({'rsi': rsi, 'price': p, 'time': time.time()})
-        if len(self._rsi_history[sym]) > 100:
-            self._rsi_history[sym].pop(0)
+        if tech:
+            rsi = tech.get('rsi', 50)
+            if sym not in self._rsi_history:
+                self._rsi_history[sym] = []
+            self._rsi_history[sym].append({'rsi': rsi, 'price': p, 'time': time.time()})
+            if len(self._rsi_history[sym]) > 100:
+                self._rsi_history[sym].pop(0)
 
-        bb_upper = tech.get('bb_upper', 0)
-        bb_lower = tech.get('bb_lower', 0)
-        if bb_upper > 0 and bb_lower > 0:
+        bb_upper = tech.get('bb_upper', 0) if tech else 0
+        bb_lower = tech.get('bb_lower', 0) if tech else 0
+        if bb_upper > 0 and bb_lower > 0 and p > 0:
             bw = (bb_upper - bb_lower) / p * 100 if p > 0 else 0
             self._bb_bandwidth_history[sym].append(bw)
             if len(self._bb_bandwidth_history[sym]) > 100:
@@ -1761,7 +1775,7 @@ class QuantBot:
         news = await self.real_data.get_news_sentiment()
         social = await self.real_data.get_social_sentiment()
         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
-        volatility = tech.get('atr', 0) / tech.get('bb_middle', 1) if tech.get('bb_middle', 0) > 0 else 0.01
+        volatility = tech.get('atr', 0) / tech.get('bb_middle', 1) if tech and tech.get('bb_middle', 0) > 0 else 0.01
         all_coin_data = {}
         for s in self.symbols:
             t = self.ws.get_ticker(s)
@@ -1883,7 +1897,6 @@ class QuantBot:
     # ==================== 参数优化命令 ====================
 
     async def cmd_optimize(self, update, context):
-        """手动触发参数优化"""
         if not self._auth(update):
             return
         
@@ -1897,7 +1910,6 @@ class QuantBot:
         )
 
     async def cmd_state(self, update, context):
-        """查看市场状态"""
         if not self._auth(update):
             return
         
@@ -1916,7 +1928,6 @@ class QuantBot:
             else:
                 lines.append(f"  {key}: {val}")
         
-        # 凯利仓位
         recent_pnls = [t.get('pnl_pct', 0) for t in self.trades[-30:] if t.get('pnl_pct') is not None]
         if recent_pnls:
             wins = [p for p in recent_pnls if p > 0]
@@ -1932,7 +1943,6 @@ class QuantBot:
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def _auto_optimize_params(self):
-        """自动参数优化"""
         if len(self.trades) < 20:
             return
         
@@ -2241,7 +2251,6 @@ class QuantBot:
         await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_status(self, update, context):
-        """显示持仓状态和系统信息（增强异常保护）"""
         if not self._auth(update):
             return
         try:
@@ -2258,7 +2267,6 @@ class QuantBot:
                     total_value += free * ticker['last']
             occupied = total_value - usdt_free
             
-            # 获取近期表现（可能出错，加try保护）
             try:
                 perf = await get_recent_performance(20)
                 if perf and perf['total'] > 0:
