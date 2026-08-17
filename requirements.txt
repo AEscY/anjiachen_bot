@@ -1,9 +1,7 @@
-python-telegram-bot>=20.0
-ccxt>=4.0.90
-pydantic-settings
-pandas
-aiohttp
-aiosqlite
-streamlit
-plotly
+aiohttp>=3.9.0
 python-dotenv>=1.0.0
+websockets>=12.0
+numpy>=1.24.0
+pandas>=2.0.0
+python-telegram-bot>=20.0
+redis>=5.0.0  # 新增，用于极速状态缓存（如果没装redis，代码会自动降级为内存，不影响运行）
