@@ -1941,7 +1941,7 @@ class QuantBot:
         if not self._auth(update):
             return
         lines = [
-            f"📊 **市场状态** {self.env_tag}",
+            f"📊 市场状态 {self.env_tag}",
             f"• 当前状态: {self._current_market_state}",
             f"• 状态评分: {self._current_market_score:.2f}",
             f"• 状态参数:",
@@ -1965,7 +1965,7 @@ class QuantBot:
             lines.append(f"• 凯利仓位: {kelly*100:.1f}%")
             lines.append(f"• 胜率: {win_rate*100:.1f}%")
             lines.append(f"• 盈亏比: {avg_win/avg_loss:.2f}" if avg_loss > 0 else "• 盈亏比: N/A")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def _auto_optimize_params(self):
         if len(self.trades) < 20:
@@ -2038,7 +2038,7 @@ class QuantBot:
         if not self._auth(update):
             return
         bal = await self.exchange.fetch_balance()
-        lines = ["📋 **当前持币**\n"]
+        lines = ["📋 当前持币\n"]
         has_any = False
         for sym in self.symbols:
             coin = sym.split('/')[0]
@@ -2059,7 +2059,7 @@ class QuantBot:
                     lines.append(f"• {sym}: {free:.4f} 现价{p:.2f} 价值{val:.2f} 仓位{count}/{self.max_positions_per_coin}{pnl}")
         if not has_any:
             lines.append("暂无持仓")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_autotrade(self, update, context):
         if not self._auth(update):
@@ -2176,7 +2176,7 @@ class QuantBot:
             positions.append(f"{sym}: {free:.4f} 价值{val:.2f}U 仓位{count}/{self.max_positions_per_coin}")
         today = await get_today_trades()
         lines = [
-            f"📊 **仪表盘** {self.env_tag}",
+            f"📊 仪表盘 {self.env_tag}",
             f"💰 总资产: {total_value:.2f}U | 可用: {usdt_free:.2f}U",
             f"📈 持仓:",
             *positions,
@@ -2189,7 +2189,7 @@ class QuantBot:
         lines.append(f"自适应学习: {'🟢' if self.learning_enabled else '🔴'} | 阈值: {self.auto_min_score} | 仓位: {self.single_order_usdt}U")
         lines.append(f"回撤熔断: {self.max_drawdown_pct * 100:.0f}%")
         lines.append(f"市场状态: {self._current_market_state}")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_backup(self, update, context):
         if not self._auth(update):
@@ -2209,7 +2209,7 @@ class QuantBot:
             self.entries[sym] = price
             await update.effective_message.reply_text(f"📝 {sym} 入场价: {price:.2f}")
         except:
-            await update.effective_message.reply_text("❌ `/entry ETH/USDT 3120`")
+            await update.effective_message.reply_text("❌ /entry ETH/USDT 3120")
 
     async def cmd_set_trades(self, update, context):
         if not self._auth(update):
@@ -2248,8 +2248,6 @@ class QuantBot:
             await self._save_config()
             names = {"conservative":"保守","balanced":"平衡","aggressive":"激进","adaptive":"自适应"}
             await update.effective_message.reply_text(f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct:.1%} 止损{self.sl_pct:.1%}")
-        except:
-            pass
 
     async def cmd_history(self, update, context):
         if not self._auth(update):
@@ -2257,14 +2255,14 @@ class QuantBot:
         if not self.trades:
             await update.effective_message.reply_text("📜 暂无记录")
             return
-        lines = ["📜 **最近交易**\n"]
+        lines = ["📜 最近交易\n"]
         for t in self.trades[:10]:
             net_pnl = t.get('net_pnl', 0); net_pnl_pct = t.get('net_pnl_pct', 0)
             if net_pnl != 0:
                 lines.append(f"{'🟢' if net_pnl_pct>0 else '🔴'} {t['time']} {t['symbol']} 净利{net_pnl_pct:+.2f}% ({net_pnl:+.4f}U)")
             else:
                 lines.append(f"{'🟢' if t['pnl_pct']>0 else '🔴'} {t['time']} {t['symbol']} {t['pnl_pct']:+.2f}%")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_status(self, update, context):
         if not self._auth(update):
@@ -2300,9 +2298,9 @@ class QuantBot:
                 total_trades = 0
 
             lines = []
-            lines.append(f"📊 **多币种量化机器人看板** {self.env_tag}")
+            lines.append(f"📊 多币种量化机器人看板 {self.env_tag}")
             lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
-            lines.append(f"• 策略模式: 🚀 **自适应27合1策略**")
+            lines.append(f"• 策略模式: 🚀 自适应27合1策略")
             lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct:.1%}")
             lines.append(f"• 市场状态: {self._current_market_state}")
             lines.append(f"• 占用资金: {occupied:.2f} USDT")
@@ -2322,7 +2320,7 @@ class QuantBot:
                 max_pos = self.max_positions_per_coin
                 filled = min(count, max_pos)
                 bar = "▓" * filled + "░" * (max_pos - filled)
-                lines.append(f"\n🔹 **[{sym}]** (周期:{timeframe} | 止盈:{tp:.1%} | 移动止损:{tsl:.1%} | 单笔:{amount:.1f}U)")
+                lines.append(f"\n🔹 [{sym}] (周期:{timeframe} | 止盈:{tp:.1%} | 移动止损:{tsl:.1%} | 单笔:{amount:.1f}U)")
                 lines.append(f"[{bar}] {count}/{max_pos}")
                 entry = self.entries.get(sym, 0)
                 high_price = self._trailing_high.get(sym, 0)
@@ -2344,7 +2342,7 @@ class QuantBot:
                 lines.append(f"   📊 状态:{self.ai_insight['market_state']} 凯利:{self.ai_insight['kelly_position']*100:.1f}%")
             else:
                 lines.append("• 🤖 AI: 分析中...")
-            await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+            await update.effective_message.reply_text("\n".join(lines))
         except Exception as e:
             logger.error(f"状态命令异常: {e}")
             await update.effective_message.reply_text("❌ 获取状态失败，请稍后重试")
@@ -2352,7 +2350,7 @@ class QuantBot:
     async def cmd_check(self, update, context):
         if not self._auth(update):
             return
-        lines = ["📈 **信号 + 开仓条件（自适应27合1）**\n"]
+        lines = ["📈 信号 + 开仓条件（自适应27合1）\n"]
         fg_data = await self.real_data.get_fear_greed_index()
         fg = fg_data["value"] if fg_data else None
         bal = await self.exchange.fetch_balance()
@@ -2379,8 +2377,8 @@ class QuantBot:
     async def cmd_symbols(self, update, context):
         if not self._auth(update):
             return
-        s_list = "\n".join([f"• `{s}`" for s in self.symbols])
-        await update.effective_message.reply_text(f"📋 **监控列表**:\n{s_list}", parse_mode="Markdown")
+        s_list = "\n".join([f"• {s}" for s in self.symbols])
+        await update.effective_message.reply_text(f"📋 监控列表:\n{s_list}")
 
     async def cmd_panic(self, update, context):
         if not self._auth(update):
@@ -2396,7 +2394,7 @@ class QuantBot:
 
     async def cmd_help(self, update, context):
         await update.effective_message.reply_text(
-            f"🤖 **命令列表**\n"
+            f"🤖 命令列表\n"
             f"/stats 仪表盘 /backup 备份\n"
             f"/menu 控制台 /status 持仓 /check 信号\n"
             f"/settp 5 /setsl 2 /setamount 1\n"
@@ -2609,7 +2607,7 @@ class QuantBot:
             await update.effective_message.reply_text(f"⚠️ {target} 不在监控列表中")
             return
         bal = await self.exchange.fetch_balance()
-        lines = [f"📊 **币种参数与盈亏** {self.env_tag}\n"]
+        lines = [f"📊 币种参数与盈亏 {self.env_tag}\n"]
         symbols_to_show = [target] if target else self.symbols
         for sym in symbols_to_show:
             coin = sym.split('/')[0]
@@ -2641,14 +2639,14 @@ class QuantBot:
                 pass
             extra = "🔸独立" if sym in self.coin_configs else "🌐全局"
             lines.append(
-                f"{extra} **{sym}**\n"
+                f"{extra} {sym}\n"
                 f"  止盈{tp:.1%} 止损{sl:.1%} 移盈{tmpt:.1%} 移损{tsl:.1%}\n"
                 f"  单笔{amount:.1f}U 阈值{score}分 仓位{count}/{self.max_positions_per_coin}\n"
                 f"  持仓{free:.4f} 现价{p:.2f} 价值{val:.2f}U{pnl_str}\n"
                 f"  累计净盈亏: {total_net_pnl:+.4f}U"
             )
         lines.append("💡 /setcoin 修改独立参数 | /resetcoin 重置为全局")
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_setcoinonly(self, update, context):
         if not self._auth(update):
@@ -2670,7 +2668,7 @@ class QuantBot:
                 self.timeframe = p["tf"]; self.single_order_usdt = p["amt"]; self.reserve_bottom = p["reserve"]; self.auto_min_score = p["score"]
                 await self._save_config()
                 await update.effective_message.reply_text(
-                    f"✅ **已固定币种: {sym}**\n"
+                    f"✅ 已固定币种: {sym}\n"
                     f"• 止盈: {self.tp_pct:.1%}\n"
                     f"• 止损: {self.sl_pct:.1%}\n"
                     f"• 周期: {self.timeframe}\n"
@@ -2680,7 +2678,7 @@ class QuantBot:
                 )
             else:
                 await self._save_config()
-                await update.effective_message.reply_text(f"✅ **已固定币种: {sym}**\n• 使用当前全局参数")
+                await update.effective_message.reply_text(f"✅ 已固定币种: {sym}\n• 使用当前全局参数")
         except Exception as e:
             await update.effective_message.reply_text(f"❌ 格式: /setcoinonly ETH\n错误: {e}")
 
@@ -2698,8 +2696,8 @@ class QuantBot:
         self.single_order_usdt = 1.0; self.timeframe = "1m"; self.auto_min_score = 65; self.reserve_bottom = 5
         await self._save_config()
         await update.effective_message.reply_text(
-            f"🚀 **低本金快速滚雪球方案已激活！**\n\n"
-            f"📊 **监控币种**\n"
+            f"🚀 低本金快速滚雪球方案已激活！\n\n"
+            f"📊 监控币种\n"
             f"🔹 ETH/USDT  止盈{self.coin_configs['ETH/USDT']['tp_pct']:.1%} 止损{self.coin_configs['ETH/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['ETH/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['ETH/USDT']['auto_min_score']}\n"
             f"🔹 BTC/USDT  止盈{self.coin_configs['BTC/USDT']['tp_pct']:.1%} 止损{self.coin_configs['BTC/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['BTC/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['BTC/USDT']['auto_min_score']}\n"
             f"🔹 SOL/USDT  止盈{self.coin_configs['SOL/USDT']['tp_pct']:.1%} 止损{self.coin_configs['SOL/USDT']['sl_pct']:.1%} 单笔{self.coin_configs['SOL/USDT']['single_order_usdt']:.1f}U 阈值{self.coin_configs['SOL/USDT']['auto_min_score']}\n"
@@ -2716,24 +2714,24 @@ class QuantBot:
         stats = self._delta_neutral_stats
         config = self._delta_neutral_config
         lines = [
-            f"📊 **资金费率套利统计** {self.env_tag}",
+            f"📊 资金费率套利统计 {self.env_tag}",
             f"• 总交易次数: {stats['total_trades']} 笔",
             f"• 累计盈利: {stats['total_profit']:.4f} U",
             f"• 今日盈利: {stats['profit_today']:.4f} U",
             f"• 最近交易: {datetime.fromtimestamp(stats['last_trade_time']).strftime('%H:%M') if stats['last_trade_time'] else '无'}",
             "",
-            f"⚙️ **当前配置**",
+            f"⚙️ 当前配置",
             f"• 触发费率: {config['min_funding_rate']*100:.2f}%",
             f"• 每币最大仓位: {config['max_position_per_coin']}",
             f"• 资金分配: {config['allocation_percent']*100:.0f}%",
             f"• 自动复利: ✅ 开启",
         ]
-        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def render_brain_status(self, msg_obj):
         try:
             macro = await self.real_data.check_macro_risk()
-            lines = [f"🧠 **AI 超级大脑** {self.env_tag}", f"1️⃣ 宏观: {macro['status']}"]
+            lines = [f"🧠 AI 超级大脑 {self.env_tag}", f"1️⃣ 宏观: {macro['status']}"]
             lines.append("2️⃣ AI市场分析:")
             if self.ai_enabled and time.time() - self.ai_insight["timestamp"] < 3600:
                 lines.append(f"   BTC: {self.ai_insight['btc_trend']} | ETH: {self.ai_insight['eth_trend']}")
@@ -2766,7 +2764,7 @@ class QuantBot:
 
     async def render_gap_analysis(self, msg_obj):
         try:
-            lines = ["📈 **差距分析**\n"]
+            lines = ["📈 差距分析\n"]
             for sym in self.symbols:
                 ticker = self.ws.get_ticker(sym)
                 if ticker is None:
@@ -3663,7 +3661,8 @@ class QuantBot:
                                  "💰 凯利动态仓位管理\n"
                                  "📊 GARCH波动率预测\n"
                                  "🎯 阶梯式移动止盈\n\n"
-                                 "策略组合：**终极自适应版**"
+                                 "策略组合：**终极自适应版**",
+                            parse_mode="Markdown"
                         )
                     except:
                         pass
