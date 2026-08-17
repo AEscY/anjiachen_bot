@@ -2,6 +2,7 @@ python-telegram-bot>=20.0
 ccxt>=4.0.90
 pydantic-settings
 pandas
+numpy
 aiohttp
 aiosqlite
 streamlit
