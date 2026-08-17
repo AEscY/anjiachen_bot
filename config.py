@@ -1,33 +1,70 @@
+"""
+config.py - 全局配置中心
+使用 Pydantic Settings 管理所有环境变量，内置日志脱敏过滤器。
+"""
 import os
-from dotenv import load_dotenv
+import logging
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
-load_dotenv()
 
-class Config:
-    # ----- 交易所基础 -----
-    OKX_API_KEY = os.getenv("OKX_API_KEY")
-    OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
-    OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-    IS_SANDBOX = os.getenv("IS_SANDBOX", "true").lower() == "true"
-    SYMBOL = os.getenv("SYMBOL", "BTC-USDT")
-    
-    # ----- 电报通知 -----
-    TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-    TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-    ALLOWED_USERS = os.getenv("ALLOWED_USERS", "").split(",")
+# ---------- 日志脱敏过滤器 ----------
+class SensitiveFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        for key in ['OKX_API_KEY', 'OKX_SECRET_KEY', 'OKX_PASSPHRASE', 'TG_BOT_TOKEN',
+                    'BINANCE_API_KEY', 'BINANCE_SECRET_KEY']:
+            val = os.getenv(key, '')
+            if val and len(val) > 8:
+                msg = msg.replace(val, val[:4] + '****' + val[-4:])
+        record.msg = msg
+        record.args = ()
+        return True
 
-    # ----- 🚀 动态策略参数（实时自适应） -----
-    BASE_GRID_NUM = 10                # 基础网格挂单层数（双边）
-    GRID_VOLATILITY_SCALE = 1.5       # 波动率放大系数（ATR越大，网格拉得越宽）
-    IMBALANCE_THRESHOLD = 0.25        # 订单簿失衡触发阈值（0.25即买盘/卖盘差距>25%触发抢跑）
-    TRAILING_STOP_PCT = 0.005         # 移动止盈回撤比例 (0.5%)
-    MAX_POSITION_USDT = 1000          # 单方向最大持仓价值（USDT）
-    MIN_ORDER_USDT = 10               # 最小下单金额
-    
-    # ----- WebSocket 订阅配置 -----
-    WS_URL = "wss://ws.okx.com:8443/ws/v5/public" if not IS_SANDBOX else "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
-    
-    @staticmethod
-    def get_contract_info():
-        # 根据交易对自动推断合约精度（后续可扩展）
-        return {"instId": Config.SYMBOL, "sz_decimals": 0, "px_decimals": 1}
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.addFilter(SensitiveFilter())
+root_logger = logging.getLogger()
+root_logger.addFilter(SensitiveFilter())
+
+
+# ---------- Pydantic 配置类 ----------
+class Settings(BaseSettings):
+    TG_BOT_TOKEN: str = Field(default="", description="Telegram Bot Token")
+    TG_CHAT_ID: str = Field(default="", description="Telegram 通知接收 ID")
+    IS_SANDBOX: bool = Field(default=True, description="是否为模拟盘模式")
+    SYMBOL: str = Field(default="ETH/USDT", description="默认交易对")
+    PORT: int = Field(default=10000, description="Web 服务端口")
+    ALLOWED_USERS: str = Field(default="", description="白名单用户 ID（逗号分隔）")
+    WEBHOOK_URL: str = Field(default="", description="Render Webhook URL")
+
+    EXCHANGE_NAME: str = Field(default="okx", description="交易所名称")
+
+    OKX_API_KEY: str = Field(default="", description="OKX API Key")
+    OKX_SECRET_KEY: str = Field(default="", description="OKX Secret Key")
+    OKX_PASSPHRASE: str = Field(default="", description="OKX Passphrase")
+
+    API_KEY: str = Field(default="", description="通用 API Key")
+    SECRET_KEY: str = Field(default="", description="通用 Secret Key")
+    PASSWORD: str = Field(default="", description="通用 Passphrase")
+
+    TAKER_FEE: float = Field(default=0.001, description="吃单费率")
+    MAKER_FEE: float = Field(default=0.0008, description="挂单费率")
+    MIN_PROFIT_MARGIN: float = Field(default=0.001, description="最小安全垫")
+
+    @property
+    def allowed_users_list(self) -> list[int]:
+        if not self.ALLOWED_USERS:
+            return []
+        return [int(x.strip()) for x in self.ALLOWED_USERS.split(",") if x.strip().isdigit()]
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+
+settings = Settings()
