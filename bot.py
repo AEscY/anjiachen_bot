@@ -1720,10 +1720,10 @@ class QuantBot:
                 logger.error(f"AI分析异常: {e}")
             await asyncio.sleep(1800)
 
-    # ==================== 开仓决策（核心优化） ====================
+    # ==================== 开仓决策（稳定版） ====================
 
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
-        """整合所有优化的开仓决策"""
+        """整合所有优化的开仓决策 - 稳定版（移除外部API和随机数据）"""
         # ---- 强制更新价格历史，确保数据积累 ----
         if sym not in self._price_history:
             self._price_history[sym] = []
@@ -1737,9 +1737,7 @@ class QuantBot:
             if len(self._rsi_history[sym]) > 100:
                 self._rsi_history[sym].pop(0)
 
-        scores = []
-        details = []
-
+        # 初始化各类历史数据容器
         if sym not in self._volume_history:
             self._volume_history[sym] = []
         if sym not in self._close_prices_history:
@@ -1775,55 +1773,35 @@ class QuantBot:
             if len(self._bb_bandwidth_history[sym]) > 100:
                 self._bb_bandwidth_history[sym].pop(0)
 
+        # 只获取多周期技术数据（不依赖外部API）
         multi = await self._get_multi_timeframe_data(sym)
-        onchain = await self.real_data.get_onchain_metrics(sym)
-        news = await self.real_data.get_news_sentiment()
-        social = await self.real_data.get_social_sentiment()
+
+        # 获取 RSI 历史
         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
-        volatility = tech.get('atr', 0) / tech.get('bb_middle', 1) if tech and tech.get('bb_middle', 0) > 0 else 0.01
-        all_coin_data = {}
-        for s in self.symbols:
-            t = self.ws.get_ticker(s)
-            if t:
-                all_coin_data[s] = {'price': t.get('last', 0), 'change_24h': t.get('percentage', 0)}
 
+        # 市场状态
         state, state_params = await self._update_market_state(sym, tech)
-        details.append(f"状态:{state}")
+        details = [f"状态:{state}"]
 
+        # 多智能体分析（仅基于技术）
         agent_analysis = await self.multi_agent.analyze({}, tech)
         agent_strategy = self.multi_agent.generate_strategy(agent_analysis, {})
         details.append(f"Agent:{agent_analysis.get('state', 'neutral')}")
 
-        # ---------- 计算各子分数，并赋予权重 ----------
+        # ---------- 计算各子分数，仅使用可靠技术因子 ----------
         # 权重总和为1
         weights = {
-            'sent_rl': 0.12,
-            'web': 0.12,
-            'low_buy': 0.15,
-            'ofi': 0.05,
-            'arch': 0.05,
-            'cross': 0.05,
-            'meta': 0.05,
-            'f2': 0.05,
-            'onchain': 0.05,
-            'sentiment': 0.05,
-            'agent': 0.05,
-            'default': 0.21  # 剩余权重给综合
+            'low_buy': 0.25,      # 低买信号（基于技术）
+            'ofi': 0.10,          # 订单流不平衡（基于盘口）
+            'arch': 0.10,         # Archetype（基于价格/量）
+            'cross': 0.10,        # 多周期共振（技术）
+            'meta': 0.10,         # Meta RL（基于价格/胜率）
+            'f2': 0.10,           # F2 Agent（纯技术）
+            'agent': 0.10,        # 多智能体策略因子（基于技术状态）
+            'default': 0.15       # 综合补充（基于RSI等）
         }
 
-        # 1. 情绪RL
-        sent_rl_score, sent_rl_conf = self.sentiment_rl.calculate_alpha_reward(
-            self._price_history.get(sym, []), self._sentiment_history.get(sym, []), rsi_hist)
-        scores.append(sent_rl_score * weights['sent_rl'])
-        details.append(f"SentRL:{sent_rl_score:.0f}")
-
-        # 2. Web融合
-        web_score, web_factors = self.web_agent.fusion_score(tech, news, social, fg, onchain)
-        scores.append(web_score * weights['web'])
-        if web_factors:
-            details.append(f"Web:{','.join(web_factors[:2])}")
-
-        # 3. 低买信号
+        # 1. 低买信号（最强因子）
         ema20 = None
         try:
             ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 20)
@@ -1836,52 +1814,73 @@ class QuantBot:
             tech, p, ema20, agent_analysis.get('state', 'neutral')
         )
         enhanced_score = strength if enhanced_buy else 50
-        scores.append(enhanced_score * weights['low_buy'])
+        scores = [enhanced_score * weights['low_buy']]
         if enhanced_buy:
             details.append(f"低买强{strength:.0f}")
 
-        # 4. OFI
+        # 2. OFI（订单流不平衡）
         ob = self.ws.get_orderbook(sym)
         if ob:
             ofi = self.executor.calculate_ofi(ob)
             ofi_score = 50 + ofi * 30
             scores.append(ofi_score * weights['ofi'])
             details.append(f"OFI:{ofi:.2f}")
+        else:
+            scores.append(50 * weights['ofi'])
 
-        # 5. Archetype
+        # 3. Archetype
         arch_signal, arch_type = self.frontier.archetype_trader_signal(
             self._price_history.get(sym, []), self._volume_history.get(sym, []), rsi_hist, self._bb_bandwidth_history.get(sym, []))
         scores.append((50 + arch_signal * 30) * weights['arch'])
         details.append(f"Arch:{arch_type}")
 
-        # 6. Cross-sync
-        cross_score, _ = self.frontier.crosssync_score(multi.get('1m'), multi.get('5m'), multi.get('15m'), funding, fg)
+        # 4. 多周期交叉（只使用技术，去除恐惧贪婪）
+        cross_score, _ = self.frontier.crosssync_score(
+            multi.get('1m'), multi.get('5m'), multi.get('15m'), 
+            funding,  # funding 作为参考，但不依赖外部情绪
+            None     # 去除 fear_greed
+        )
         scores.append(cross_score * weights['cross'])
 
-        # 7. Meta RL
-        meta_score = self.frontier.meta_rl_score(self._price_history.get(sym, []), self._win_rate_history.get(sym, []), self._sharpe_history.get(sym, []))
+        # 5. Meta RL（基于价格、胜率）
+        meta_score = self.frontier.meta_rl_score(
+            self._price_history.get(sym, []), 
+            self._win_rate_history.get(sym, []), 
+            self._sharpe_history.get(sym, [])
+        )
         scores.append(meta_score * weights['meta'])
 
-        # 8. F2 Agent
-        f2_score, _ = self.frontier.f2agent_signal(tech, onchain, news, fg, social)
+        # 6. F2 Agent（使用技术，去掉外部数据）
+        # 我们手动构建只包含技术的 F2 分数，避免依赖外部
+        f2_score = 50  # 基准
+        rsi_val = tech.get('rsi', 50)
+        if rsi_val < 35:
+            f2_score += 15
+        elif rsi_val > 65:
+            f2_score -= 15
+        price_val = tech.get('bb_middle', 0)
+        bb_lower_val = tech.get('bb_lower', 0)
+        bb_upper_val = tech.get('bb_upper', 0)
+        if bb_upper_val > bb_lower_val and price_val > 0:
+            bb_pos = (price_val - bb_lower_val) / (bb_upper_val - bb_lower_val)
+            if bb_pos < 0.2:
+                f2_score += 15
+            elif bb_pos > 0.8:
+                f2_score -= 10
+        f2_score = min(100, max(0, f2_score))
         scores.append(f2_score * weights['f2'])
 
-        # 9. Onchain
-        onchain_score, _ = self.frontier.onchain_quant_score(onchain)
-        scores.append(onchain_score * weights['onchain'])
-
-        # 10. Sentiment
-        sentiment_score, _ = self.frontier.multi_source_sentiment(news, social, fg)
-        scores.append(sentiment_score * weights['sentiment'])
-
-        # 11. Agent策略
+        # 7. Agent策略因子
         agent_score = 50 + agent_strategy.get('tp_factor', 1.0) * 10
         scores.append(agent_score * weights['agent'])
 
-        # 12. 默认综合（占剩余权重）
-        default_score = 50 + (rsi_hist[-1] if rsi_hist else 50) * 0.1
+        # 8. 默认综合（基于RSI和波动）
+        rsi_last = rsi_hist[-1] if rsi_hist else 50
+        default_score = 50 + (50 - rsi_last) * 0.3 + (tech.get('bandwidth_pct', 0) * 0.5)
+        default_score = min(100, max(0, default_score))
         scores.append(default_score * weights['default'])
 
+        # 计算总分
         total_score = sum(scores)
         total_score = min(100, max(0, total_score))
 
@@ -1891,6 +1890,7 @@ class QuantBot:
         should_open = total_score >= coin_score
         is_high_confidence = total_score >= 80
 
+        # 凯利仓位
         recent_pnls = [t.get('pnl_pct', 0) for t in self.trades[-30:] if t.get('pnl_pct') is not None]
         if recent_pnls:
             wins = [p for p in recent_pnls if p > 0]
