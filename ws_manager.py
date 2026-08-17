@@ -1,93 +1,65 @@
-"""
-ws_manager.py - WebSocket 实时数据管理器（修复多币种监听）
-"""
 import asyncio
-import ccxt.pro as ccxt_pro
-from config import settings, logger
+import websockets
+import json
+import threading
+from config import Config
+from utils import calculate_imbalance
 
-
-class WSDataManager:
-    def __init__(self, exchange_rest):
-        self.rest = exchange_rest
-        self.exchange = None
-        self.tickers = {}       # symbol -> {last, bid, ask, timestamp}
-        self.orderbooks = {}    # symbol -> {bids, asks, timestamp}
+class WSManager:
+    def __init__(self, on_update_callback):
+        self.url = Config.WS_URL
+        self.callback = on_update_callback
+        self.ws = None
+        self.last_price = 0.0
+        self.bids = []   # 买盘
+        self.asks = []   # 卖盘
+        self.imbalance = 0.0
         self._running = False
 
     async def connect(self):
-        """建立 WebSocket 连接"""
-        name = settings.EXCHANGE_NAME
-        key = settings.OKX_API_KEY or settings.API_KEY
-        secret = settings.OKX_SECRET_KEY or settings.SECRET_KEY
-        password = settings.OKX_PASSPHRASE or settings.PASSWORD
-
-        config = {'apiKey': key, 'secret': secret, 'enableRateLimit': True}
-        if name in ('okx', 'bybit'):
-            config['password'] = password
-
-        exchange_class = getattr(ccxt_pro, name, None)
-        if exchange_class is None:
-            logger.error(f"❌ ccxt.pro 不支持 {name}")
-            return False
-
-        self.exchange = exchange_class(config)
-        if settings.IS_SANDBOX and name == 'okx':
-            self.exchange.set_sandbox_mode(True)
-
-        logger.info(f"🔌 WebSocket 已连接到 {name}")
-        return True
-
-    async def watch_tickers(self, symbols):
-        """实时监听价格变动（逐个币种监听）"""
         self._running = True
         while self._running:
-            for sym in symbols:
-                try:
-                    ticker = await self.exchange.watch_ticker(sym)
-                    if ticker and 'symbol' in ticker:
-                        self.tickers[ticker['symbol']] = {
-                            'last': ticker.get('last', 0),
-                            'bid': ticker.get('bid', 0),
-                            'ask': ticker.get('ask', 0),
-                            'timestamp': asyncio.get_event_loop().time()
-                        }
-                except Exception as e:
-                    logger.warning(f"WebSocket {sym} 断线: {e}")
-            await asyncio.sleep(0.1)
+            try:
+                async with websockets.connect(self.url) as websocket:
+                    self.ws = websocket
+                    # 订阅交易对深度和Ticker
+                    sub_depth = {
+                        "op": "subscribe",
+                        "args": [{"channel": "books", "instId": Config.SYMBOL}]
+                    }
+                    sub_ticker = {
+                        "op": "subscribe",
+                        "args": [{"channel": "tickers", "instId": Config.SYMBOL}]
+                    }
+                    await websocket.send(json.dumps(sub_depth))
+                    await websocket.send(json.dumps(sub_ticker))
+                    print(f"✅ WebSocket 已连接，监听 {Config.SYMBOL}")
+                    
+                    async for message in websocket:
+                        await self._handle_message(json.loads(message))
+            except Exception as e:
+                print(f"⚠️ WebSocket断开，重连中... {e}")
+                await asyncio.sleep(3)
 
-    async def watch_orderbooks(self, symbols, limit=5):
-        """实时监听订单簿（逐个币种监听）"""
-        self._running = True
-        while self._running:
-            for sym in symbols:
-                try:
-                    ob = await self.exchange.watch_order_book(sym, limit)
-                    if ob and 'symbol' in ob:
-                        self.orderbooks[ob['symbol']] = {
-                            'bids': ob.get('bids', []),
-                            'asks': ob.get('asks', []),
-                            'timestamp': asyncio.get_event_loop().time()
-                        }
-                except Exception as e:
-                    logger.warning(f"WebSocket 订单簿 {sym} 断线: {e}")
-            await asyncio.sleep(0.1)
+    async def _handle_message(self, data):
+        if "data" not in data:
+            return
+        
+        for item in data["data"]:
+            # 处理深度数据
+            if "bids" in item and "asks" in item:
+                self.bids = item["bids"]
+                self.asks = item["asks"]
+                self.imbalance = calculate_imbalance(self.bids, self.asks, depth=15)
+                # 触发策略回调
+                if self.callback:
+                    await self.callback("depth", self)
+            
+            # 处理最新价
+            if "last" in item:
+                self.last_price = float(item["last"])
+                if self.callback:
+                    await self.callback("ticker", self)
 
-    def get_ticker(self, symbol):
-        """获取缓存的最新价格（非阻塞）"""
-        return self.tickers.get(symbol)
-
-    def get_orderbook(self, symbol):
-        """获取缓存的最新订单簿（非阻塞）"""
-        return self.orderbooks.get(symbol)
-
-    def get_last_price(self, symbol):
-        """获取最新成交价"""
-        ticker = self.tickers.get(symbol)
-        if ticker:
-            return ticker['last']
-        return None
-
-    async def stop(self):
+    def stop(self):
         self._running = False
-        if self.exchange:
-            await self.exchange.close()
