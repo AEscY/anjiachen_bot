@@ -60,17 +60,14 @@ class WSDataManager:
                                     'ask': ticker.get('ask', 0),
                                     'timestamp': time.time()
                                 }
-                self._reconnect_attempt = 0  # 成功后重置重试计数
+                self._reconnect_attempt = 0
             except Exception as e:
                 logger.warning(f"WebSocket 批量订阅断线: {e}")
                 self._reconnect_attempt += 1
-                # 指数退避，最大60秒
                 wait = min(60, 2 ** self._reconnect_attempt)
                 logger.info(f"🔄 等待 {wait}s 后重连...")
                 await asyncio.sleep(wait)
-                # 重新初始化连接
                 await self.connect()
-                # 重新订阅
                 if self.exchange:
                     try:
                         await self.exchange.watch_tickers(symbols)
