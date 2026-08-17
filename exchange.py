@@ -92,13 +92,29 @@ class ExchangeManager:
         return None
 
     async def fetch_funding_rate(self, symbol):
-        if self.exchange:
-            try:
-                res = await self.exchange.fetch_funding_rate(symbol)
-                return res.get('fundingRate', None) if isinstance(res, dict) else None
-            except Exception as e:
-                logger.warning(f"获取资金费率失败 {symbol}: {e}")
-        return None
+        """
+        获取资金费率（仅对永续合约有效，现货返回 None 并静默跳过）
+        """
+        if not self.exchange:
+            return None
+        # 判断是否为现货（简单判断：不包含 PERP、SWAP 等关键词）
+        # 注意：OKX 现货格式如 ETH/USDT，永续为 ETH/USDT:USDT 或 ETH/USDT-SWAP
+        # 这里用常见模式判断：如果交易对不含 'PERP'、'SWAP'、':USDT' 等，视为现货
+        symbol_upper = symbol.upper()
+        # 如果包含这些关键字，则认为是永续合约；否则视为现货直接返回 None
+        if 'PERP' not in symbol_upper and 'SWAP' not in symbol_upper and ':USDT' not in symbol_upper:
+            # 对于 OKX，现货通常就是 BTC/USDT 这种格式，没有额外后缀
+            # 但也可能有其他币种，简单判断：如果交易所是 okx 且不包含上述关键词，视为现货
+            if settings.EXCHANGE_NAME == 'okx':
+                return None
+        try:
+            res = await self.exchange.fetch_funding_rate(symbol)
+            return res.get('fundingRate', None) if isinstance(res, dict) else None
+        except Exception as e:
+            # 静默忽略（不打印警告，因为已经是现货或未知错误）
+            # 但为了调试，可以保留 debug 级别
+            logger.debug(f"获取资金费率失败 {symbol}: {e}")
+            return None
 
     async def fetch_long_short_ratio(self, symbol):
         if self.exchange:
