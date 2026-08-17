@@ -2248,6 +2248,9 @@ class QuantBot:
             await self._save_config()
             names = {"conservative":"保守","balanced":"平衡","aggressive":"激进","adaptive":"自适应"}
             await update.effective_message.reply_text(f"⚡ {names[mode]}方案已生效\n止盈{self.tp_pct:.1%} 止损{self.sl_pct:.1%}")
+        except Exception as e:
+            logger.error(f"cmd_preset error: {e}")
+            await update.effective_message.reply_text(f"❌ 设置预设失败: {e}")
 
     async def cmd_history(self, update, context):
         if not self._auth(update):
