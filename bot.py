@@ -1209,7 +1209,7 @@ class QuantBot:
         self._onchain_cache = {}
         self._triangular_positions = {}
 
-        # 资金费率套利
+        # 资金费率套利（已修正注释，明确为“费率抄底”）
         self._delta_neutral_config = {
             "enabled": True,
             "min_funding_rate": 0.0003,
@@ -1259,6 +1259,9 @@ class QuantBot:
 
         self._btc_safe_flag = True
         self._drawdown_safe_flag = True
+
+        # 新增：每日重置标记
+        self._last_reset_date = datetime.now(CST).day
 
         # AI 分析
         self.ai_insight = {
@@ -1418,6 +1421,13 @@ class QuantBot:
             return base_amount * 4
 
     async def _check_risk_limits(self):
+        # 每日重置亏损计数
+        today = datetime.now(CST).day
+        if today != self._last_reset_date:
+            self._today_loss_pct = 0.0
+            self._consecutive_losses = 0
+            self._last_reset_date = today
+
         if self._consecutive_losses >= 4:
             if time.time() - self._last_pause_time > 3600:
                 self._consecutive_losses = 0
@@ -1784,16 +1794,36 @@ class QuantBot:
         agent_strategy = self.multi_agent.generate_strategy(agent_analysis, {})
         details.append(f"Agent:{agent_analysis.get('state', 'neutral')}")
 
+        # ---------- 计算各子分数，并赋予权重 ----------
+        # 权重总和为1
+        weights = {
+            'sent_rl': 0.12,
+            'web': 0.12,
+            'low_buy': 0.15,
+            'ofi': 0.05,
+            'arch': 0.05,
+            'cross': 0.05,
+            'meta': 0.05,
+            'f2': 0.05,
+            'onchain': 0.05,
+            'sentiment': 0.05,
+            'agent': 0.05,
+            'default': 0.21  # 剩余权重给综合
+        }
+
+        # 1. 情绪RL
         sent_rl_score, sent_rl_conf = self.sentiment_rl.calculate_alpha_reward(
             self._price_history.get(sym, []), self._sentiment_history.get(sym, []), rsi_hist)
-        scores.append(sent_rl_score * 0.12)
+        scores.append(sent_rl_score * weights['sent_rl'])
         details.append(f"SentRL:{sent_rl_score:.0f}")
 
+        # 2. Web融合
         web_score, web_factors = self.web_agent.fusion_score(tech, news, social, fg, onchain)
-        scores.append(web_score * 0.12)
+        scores.append(web_score * weights['web'])
         if web_factors:
             details.append(f"Web:{','.join(web_factors[:2])}")
 
+        # 3. 低买信号
         ema20 = None
         try:
             ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 20)
@@ -1806,38 +1836,52 @@ class QuantBot:
             tech, p, ema20, agent_analysis.get('state', 'neutral')
         )
         enhanced_score = strength if enhanced_buy else 50
-        scores.append(enhanced_score * 0.15)
+        scores.append(enhanced_score * weights['low_buy'])
         if enhanced_buy:
             details.append(f"低买强{strength:.0f}")
 
+        # 4. OFI
         ob = self.ws.get_orderbook(sym)
         if ob:
             ofi = self.executor.calculate_ofi(ob)
             ofi_score = 50 + ofi * 30
-            scores.append(ofi_score * 0.05)
+            scores.append(ofi_score * weights['ofi'])
             details.append(f"OFI:{ofi:.2f}")
 
+        # 5. Archetype
         arch_signal, arch_type = self.frontier.archetype_trader_signal(
             self._price_history.get(sym, []), self._volume_history.get(sym, []), rsi_hist, self._bb_bandwidth_history.get(sym, []))
-        scores.append((50 + arch_signal * 30) * 0.05)
+        scores.append((50 + arch_signal * 30) * weights['arch'])
         details.append(f"Arch:{arch_type}")
 
+        # 6. Cross-sync
         cross_score, _ = self.frontier.crosssync_score(multi.get('1m'), multi.get('5m'), multi.get('15m'), funding, fg)
-        scores.append(cross_score * 0.05)
+        scores.append(cross_score * weights['cross'])
 
+        # 7. Meta RL
         meta_score = self.frontier.meta_rl_score(self._price_history.get(sym, []), self._win_rate_history.get(sym, []), self._sharpe_history.get(sym, []))
-        scores.append(meta_score * 0.05)
+        scores.append(meta_score * weights['meta'])
 
+        # 8. F2 Agent
         f2_score, _ = self.frontier.f2agent_signal(tech, onchain, news, fg, social)
-        scores.append(f2_score * 0.05)
+        scores.append(f2_score * weights['f2'])
 
+        # 9. Onchain
         onchain_score, _ = self.frontier.onchain_quant_score(onchain)
-        scores.append(onchain_score * 0.05)
+        scores.append(onchain_score * weights['onchain'])
 
+        # 10. Sentiment
         sentiment_score, _ = self.frontier.multi_source_sentiment(news, social, fg)
-        scores.append(sentiment_score * 0.05)
+        scores.append(sentiment_score * weights['sentiment'])
 
-        # ---- 修复：直接求和，不再除以 len(scores) ----
+        # 11. Agent策略
+        agent_score = 50 + agent_strategy.get('tp_factor', 1.0) * 10
+        scores.append(agent_score * weights['agent'])
+
+        # 12. 默认综合（占剩余权重）
+        default_score = 50 + (rsi_hist[-1] if rsi_hist else 50) * 0.1
+        scores.append(default_score * weights['default'])
+
         total_score = sum(scores)
         total_score = min(100, max(0, total_score))
 
@@ -2294,7 +2338,7 @@ class QuantBot:
             lines.append(f"• 连续亏损: {self._consecutive_losses} 笔")
             lines.append(f"• 全局状态: {'⏸️ 暂停' if self._is_paused else '🟢 正常'}")
             stats = self._delta_neutral_stats
-            lines.append(f"• 💰 费率套利: {stats['total_trades']}笔 累计盈利{stats['total_profit']:.4f}U 今日{stats['profit_today']:.4f}U")
+            lines.append(f"• 💰 费率抄底: {stats['total_trades']}笔 累计盈利{stats['total_profit']:.4f}U 今日{stats['profit_today']:.4f}U")
             if self.ai_enabled and time.time() - self.ai_insight["timestamp"] < 3600:
                 lines.append(f"• 🤖 AI: {self.ai_insight['recommendation']} (评分{self.ai_insight['score']:.0f})")
                 lines.append(f"   📊 状态:{self.ai_insight['market_state']} 凯利:{self.ai_insight['kelly_position']*100:.1f}%")
@@ -3097,9 +3141,10 @@ class QuantBot:
         except Exception:
             return self._get_coin_param(symbol, 'tp_pct', self.tp_pct), self._get_coin_param(symbol, 'sl_pct', self.sl_pct)
 
-    # ==================== 资金费率套利 ====================
+    # ==================== 资金费率套利（已修正注释） ====================
 
     async def _delta_neutral_arbitrage(self):
+        # 注意：此功能目前仅为“费率抄底”策略，并非真正的中性套利（未做空永续），存在方向性风险。
         while self.is_running:
             try:
                 if not self._delta_neutral_config.get("enabled", True):
@@ -3139,7 +3184,7 @@ class QuantBot:
                         if sym not in self._delta_neutral_positions:
                             success = await self._open_delta_neutral(sym, rate, amount_usdt)
                             if success:
-                                logger.info(f"✅ 资金费率套利开仓 {sym} 费率{rate*100:.2f}% 金额{amount_usdt:.2f}U")
+                                logger.info(f"✅ 费率抄底开仓 {sym} 费率{rate*100:.2f}% 金额{amount_usdt:.2f}U")
                         else:
                             pos = self._delta_neutral_positions[sym]
                             if pos['entry_time'] + 7.5*3600 < time.time():
@@ -3150,8 +3195,8 @@ class QuantBot:
                                     self._delta_neutral_stats["profit_today"] += pnl
                                     self._delta_neutral_stats["last_trade_time"] = time.time()
                                     await self._alert(
-                                        f"✅ {sym} 资金费率套利平仓 盈利{pnl:.4f}U\n"
-                                        f"累计套利收益: {self._delta_neutral_stats['total_profit']:.4f}U",
+                                        f"✅ {sym} 费率抄底平仓 盈利{pnl:.4f}U\n"
+                                        f"累计抄底收益: {self._delta_neutral_stats['total_profit']:.4f}U",
                                         "info"
                                     )
                     else:
@@ -3166,7 +3211,7 @@ class QuantBot:
 
                 await asyncio.sleep(30)
             except Exception as e:
-                logger.error(f"资金费率套利异常: {e}")
+                logger.error(f"费率抄底异常: {e}")
                 await asyncio.sleep(30)
 
     async def _open_delta_neutral(self, symbol, funding_rate, amount_usdt=None):
@@ -3180,7 +3225,7 @@ class QuantBot:
                 return False
             price = ticker['last']
             if self._cached_usdt_free < amount_usdt * 1.1:
-                logger.warning(f"⚠️ 余额不足 {symbol} 套利需要{amount_usdt:.2f}U")
+                logger.warning(f"⚠️ 余额不足 {symbol} 需要{amount_usdt:.2f}U")
                 return False
             coin_amount = amount_usdt / price
             rounded_amount = await self._round_amount_by_precision(symbol, coin_amount)
@@ -3199,7 +3244,7 @@ class QuantBot:
                 return True
             return False
         except Exception as e:
-            logger.error(f"开仓套利失败 {symbol}: {e}")
+            logger.error(f"开仓失败 {symbol}: {e}")
             return False
 
     async def _close_delta_neutral(self, symbol):
@@ -3218,7 +3263,7 @@ class QuantBot:
                 return pnl
             return 0.0
         except Exception as e:
-            logger.error(f"平仓套利失败 {symbol}: {e}")
+            logger.error(f"平仓失败 {symbol}: {e}")
             return 0.0
 
     # ==================== 链上监控 ====================
@@ -3292,7 +3337,8 @@ class QuantBot:
                     else:
                         self.api_error_count = 0
 
-                today_stats = await get_today_trades()
+                # 缓存今日统计
+                today_stats = await self._get_cached_today_stats()
                 if today_stats and today_stats['total'] >= 3:
                     if today_stats['win_rate'] < 0.2 and abs(today_stats['avg_loss_pct']) > self.max_daily_loss_pct:
                         await self._alert("⛔ 日亏损熔断", "critical")
@@ -3472,6 +3518,14 @@ class QuantBot:
                 self.api_error_count += 1
                 self.api_error_pause_time = asyncio.get_event_loop().time()
                 await asyncio.sleep(10)
+
+    # ==================== 缓存今日统计 ====================
+    async def _get_cached_today_stats(self):
+        now = time.time()
+        if not hasattr(self, '_today_stats_cache') or now - self._today_stats_time > 30:
+            self._today_stats_cache = await get_today_trades()
+            self._today_stats_time = now
+        return self._today_stats_cache
 
     # ==================== 移动止盈止损（阶梯止盈增强） ====================
 
