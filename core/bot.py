@@ -2479,7 +2479,7 @@ class QuantBot:
                 lines.append(f"{sym}: {p:.2f} | 评分{sc:.0f}分 | {status}")
                 lines.append(f"   状态:{decision['state']} | 凯利:{decision['kelly_position']*100:.1f}%")
                 if decision['details']:
-                    lines.append(f"   技术: {', '.join(decision['details'][:3])")
+                    lines.append(f"   技术: {', '.join(decision['details'][:3])｝")
             except Exception:
                 continue
         await update.effective_message.reply_text("\n".join(lines))
