@@ -68,7 +68,12 @@ class RealDataEngine:
         if hasattr(self, 'ws'):
             await self.ws.stop()
         logger.info("✅ 机器人资源已释放")
-
+        62
+        """关闭共享 session，释放资源"""
+        if self._ session:
+            await self._session.close ()
+           self._ session = None
+logger.info（"4 RealDataEngine session 已关闭"）
     async def get_fear_greed_index(self):
         now = asyncio.get_event_loop().time()
         if now - self._fear_greed_cache["timestamp"] < self._cache_ttl:
