@@ -49,33 +49,20 @@ class RealDataEngine:
         self._news_cache = {"sentiment": 0, "headlines": [], "timestamp": 0}
         self._social_cache = {"sentiment": 0, "timestamp": 0}
         self._base_url = "https://cryptocurrency.cv/api"
-        # 创建共享的 aiohttp session（所有请求共用，最后统一关闭）
         self._session = None
 
     async def _get_session(self):
-        """懒加载创建共享 session"""
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self):
-        """优雅关闭，释放所有资源"""
-        logger.info("🧹 正在关闭机器人资源...")
-        # 关闭 RealDataEngine 的 aiohttp session
-        if hasattr(self, 'real_data'):
-            await self.real_data.close()
-        # 关闭 WebSocket
-        if hasattr(self, 'ws'):
-            await self.ws.stop()
-        logger.info("✅ 机器人资源已释放")
-        
-        async def close(self):
         """关闭共享 session，释放资源"""
         if self._session:
             await self._session.close()
             self._session = None
             logger.info("✅ RealDataEngine session 已关闭")
-        
+
     async def get_fear_greed_index(self):
         now = asyncio.get_event_loop().time()
         if now - self._fear_greed_cache["timestamp"] < self._cache_ttl:
