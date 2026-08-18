@@ -4,6 +4,7 @@ advanced.py - 前沿量化策略引擎
 配对交易、做市策略、LLM辅助决策、强化学习调参
 所有功能均可独立开关，且带有回测模拟模式
 """
+import os
 import asyncio
 import numpy as np
 import pandas as pd
