@@ -1,6 +1,6 @@
 """
-exchange.py - 多交易所管理器
-新增：TWAP智能下单
+exchange.py - 多交易所管理器（修复余额解析、订单取消返回值）
+增加：指数退避重试，处理 OKX 限频错误
 """
 import os
 import asyncio
@@ -71,6 +71,9 @@ class ExchangeManager:
         return None
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
+        """
+        获取K线，增加指数退避重试，针对 OKX 限频错误 (50011) 特殊处理
+        """
         if not self.exchange:
             return None
         for attempt in range(3):
@@ -83,7 +86,7 @@ class ExchangeManager:
                 if '50011' in err_msg or 'Too Many Requests' in err_msg:
                     wait = 2 ** (attempt + 2)  # 4, 8, 16 秒
                 else:
-                    wait = 2 ** attempt
+                    wait = 2 ** attempt  # 1, 2, 4 秒
                 logger.warning(f"K线获取失败 {symbol} (第{attempt+1}次): {e}，等待 {wait}s 重试")
                 await asyncio.sleep(wait)
         logger.error(f"K线获取彻底失败 {symbol}")
@@ -141,7 +144,6 @@ class ExchangeManager:
             return {'USDT': {'free': 0}}
 
     async def create_market_buy_order(self, symbol, amount):
-        """普通市价买单（保留兼容）"""
         if not self.exchange:
             logger.error("❌ 交易所未初始化")
             return None
@@ -164,68 +166,6 @@ class ExchangeManager:
         except Exception as e:
             logger.error(f"❌ 市价卖单失败 [{symbol}] amount={amount:.6f}: {e}\n{traceback.format_exc()}")
             return None
-
-    # ========== TWAP 智能下单 ==========
-    async def create_market_buy_order_with_twap(self, symbol, total_amount_usdt, price=None, chunks=3, interval=1.0):
-        """
-        TWAP 拆单买入
-        :param symbol: 交易对
-        :param total_amount_usdt: 总金额（USDT）
-        :param price: 当前价格（若为None则自动获取）
-        :param chunks: 拆分数
-        :param interval: 每单间隔（秒）
-        :return: 订单列表
-        """
-        if not self.exchange:
-            logger.error("❌ 交易所未初始化")
-            return None
-        if total_amount_usdt <= 0:
-            return None
-        if price is None:
-            ticker = await self.fetch_ticker(symbol)
-            if not ticker:
-                logger.error(f"无法获取 {symbol} 价格，TWAP失败")
-                return None
-            price = ticker['last']
-        chunk_usdt = total_amount_usdt / chunks
-        orders = []
-        for i in range(chunks):
-            amount = chunk_usdt / price
-            # 精度处理
-            amount = await self._round_amount_by_precision(symbol, amount)
-            if amount <= 0:
-                continue
-            try:
-                order = await self.exchange.create_order(symbol, 'market', 'buy', amount)
-                if order:
-                    orders.append(order)
-                    logger.info(f"TWAP [{i+1}/{chunks}] 买 {symbol} {amount:.6f} @ {price:.2f}")
-                else:
-                    logger.warning(f"TWAP 第{i+1}单失败")
-                if i < chunks - 1:
-                    await asyncio.sleep(interval)
-            except Exception as e:
-                logger.error(f"TWAP 下单异常: {e}")
-                # 继续尝试后续
-        return orders
-
-    async def _round_amount_by_precision(self, symbol, amount):
-        """四舍五入到交易所精度"""
-        try:
-            market = self.exchange.market(symbol)
-            if market and 'precision' in market and 'amount' in market['precision']:
-                precision = market['precision']['amount']
-                if precision > 0:
-                    amount = float(int(amount / precision) * precision)
-                elif precision == 0:
-                    amount = int(amount)
-            if market and 'limits' in market and 'amount' in market['limits']:
-                min_amt = market['limits']['amount'].get('min', 0)
-                if min_amt and amount < min_amt:
-                    amount = min_amt
-            return max(0.000001, amount)
-        except:
-            return amount
 
     async def cancel_all_orders(self, symbol):
         if self.exchange:
