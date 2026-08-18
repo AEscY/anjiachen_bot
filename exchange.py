@@ -1,5 +1,6 @@
 """
 exchange.py - 多交易所管理器（修复余额解析、订单取消返回值）
+增加：指数退避重试，处理 OKX 限频错误
 """
 import os
 import asyncio
@@ -70,6 +71,9 @@ class ExchangeManager:
         return None
 
     async def fetch_ohlcv(self, symbol, timeframe='15m', limit=100):
+        """
+        获取K线，增加指数退避重试，针对 OKX 限频错误 (50011) 特殊处理
+        """
         if not self.exchange:
             return None
         for attempt in range(3):
@@ -78,8 +82,13 @@ class ExchangeManager:
                 if data and len(data) > 0:
                     return data
             except Exception as e:
-                logger.warning(f"K线获取失败 (第{attempt+1}次): {e}")
-            await asyncio.sleep(2)
+                err_msg = str(e)
+                if '50011' in err_msg or 'Too Many Requests' in err_msg:
+                    wait = 2 ** (attempt + 2)  # 4, 8, 16 秒
+                else:
+                    wait = 2 ** attempt  # 1, 2, 4 秒
+                logger.warning(f"K线获取失败 {symbol} (第{attempt+1}次): {e}，等待 {wait}s 重试")
+                await asyncio.sleep(wait)
         logger.error(f"K线获取彻底失败 {symbol}")
         return None
 
@@ -95,7 +104,6 @@ class ExchangeManager:
         if not self.exchange:
             return None
         try:
-            # 现货交易对直接返回None，避免错误日志
             if settings.EXCHANGE_NAME == 'okx' and '/' in symbol and ':' not in symbol:
                 return None
             res = await self.exchange.fetch_funding_rate(symbol)
