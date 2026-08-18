@@ -2055,14 +2055,14 @@ class QuantBot:
         try:
             if not context.args:
                 # 显示当前状态
-                lines = ["🧠 **高级模块状态**\n"]
+                lines = ["🧠 高级模块状态\n"]
                 for name, enabled in self.enabled_advanced.items():
                     status = "🟢 开启" if enabled else "🔴 关闭"
                     lines.append(f"• {name}: {status}")
                 lines.append("\n📌 用法：")
                 lines.append("/adv [模块名] on/off")
                 lines.append("例：/adv factor_moe on")
-                await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+                await update.effective_message.reply_text("\n".join(lines))
                 return
 
             module = context.args[0].lower()
