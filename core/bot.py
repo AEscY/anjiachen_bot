@@ -2053,7 +2053,7 @@ class QuantBot:
         if not self._auth(update):
             return
         try:
-            if len(context.args) == 0:
+            if not context.args:
                 # 显示当前状态
                 lines = ["🧠 **高级模块状态**\n"]
                 for name, enabled in self.enabled_advanced.items():
