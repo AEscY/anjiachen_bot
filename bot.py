@@ -1263,6 +1263,11 @@ class QuantBot:
         # 新增：每日重置标记
         self._last_reset_date = datetime.now(CST).day
 
+        # ========== 技术指标缓存（新增，解决限频） ==========
+        self._tech_cache = {}
+        self._tech_cache_time = {}
+        self._tech_cache_ttl = 30  # 缓存30秒
+
         # AI 分析
         self.ai_insight = {
             "timestamp": 0,
@@ -1546,6 +1551,19 @@ class QuantBot:
         }
         await save_config(cfg)
 
+    # ==================== 技术指标缓存方法（新增） ====================
+    async def _get_cached_tech(self, sym, timeframe='5m', limit=50):
+        """带缓存的技术指标获取，避免频繁API请求"""
+        key = f"{sym}_{timeframe}_{limit}"
+        now = time.time()
+        if key in self._tech_cache and (now - self._tech_cache_time.get(key, 0)) < self._tech_cache_ttl:
+            return self._tech_cache[key]
+        tech = await self.tech.calc(sym, timeframe, limit)
+        if tech:
+            self._tech_cache[key] = tech
+            self._tech_cache_time[key] = now
+        return tech
+
     # ==================== 市场状态检测与自适应 ====================
 
     async def _update_market_state(self, sym, tech_data):
@@ -1592,7 +1610,8 @@ class QuantBot:
                         if ticker is None:
                             continue
                         p = ticker['last']
-                        tech = await self.tech.calc(sym, self.timeframe, 50)
+                        # 使用缓存获取指标
+                        tech = await self._get_cached_tech(sym, self.timeframe, 50)
                         if tech is None:
                             continue
                         
@@ -1989,7 +2008,7 @@ class QuantBot:
         result = {}
         for tf in timeframes:
             try:
-                tech = await self.tech.calc(symbol, tf, 50)
+                tech = await self._get_cached_tech(symbol, tf, 50)
                 result[tf] = tech
             except:
                 result[tf] = None
@@ -2364,7 +2383,7 @@ class QuantBot:
                 if ticker is None:
                     continue
                 p = ticker['last']
-                tech = await self.tech.calc(sym, self.timeframe, 50)
+                tech = await self._get_cached_tech(sym, self.timeframe, 50)
                 funding = await self.exchange.fetch_funding_rate(sym)
                 decision = await self._should_open_position(sym, p, tech, funding, fg, usdt_free)
                 sc = decision['score']
@@ -2757,7 +2776,7 @@ class QuantBot:
                         lines.append(f"{idx+3}️⃣ {sym}: 现价获取失败")
                         continue
                     p = ticker['last']
-                    tech = await self.tech.calc(sym, self.timeframe, 50)
+                    tech = await self._get_cached_tech(sym, self.timeframe, 50)
                     lines.append(f"{idx+3}️⃣ {sym}: {p:.2f} 布林{tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}")
                 except Exception:
                     lines.append(f"{idx+3}️⃣ {sym}: 数据获取失败")
@@ -2776,7 +2795,7 @@ class QuantBot:
                     continue
                 p = ticker['last']
                 try:
-                    tech = await self.tech.calc(sym, self.timeframe, 50)
+                    tech = await self._get_cached_tech(sym, self.timeframe, 50)
                     target = min(tech['bb_lower'], p * 0.99)
                     gap = ((p - target) / p) * 100
                     lines.append(f"{sym}: {p:.2f} → {target:.2f} ({gap:+.2f}%)")
@@ -3133,12 +3152,14 @@ class QuantBot:
 
     async def _adjust_tp_sl_by_volatility(self, symbol):
         try:
-            tech = await self.tech.calc(symbol, self.timeframe, 20)
+            tech = await self._get_cached_tech(symbol, self.timeframe, 20)
+            if tech is None:
+                return self._get_coin_param(symbol, 'tp_pct', self.tp_pct), self._get_coin_param(symbol, 'sl_pct', self.sl_pct)
             volatility = tech['atr'] / tech['bb_middle']
             factor = max(0.5, min(2.0, 1.0 + (volatility - 0.01) * 50))
-            tp = self._get_coin_param(symbol, 'tp_pct', self.tp_pct)
-            sl = self._get_coin_param(symbol, 'sl_pct', self.sl_pct)
-            return tp * factor, sl * factor
+            tp = self._get_coin_param(symbol, 'tp_pct', self.tp_pct) * factor
+            sl = self._get_coin_param(symbol, 'sl_pct', self.sl_pct) * factor
+            return tp, sl
         except Exception:
             return self._get_coin_param(symbol, 'tp_pct', self.tp_pct), self._get_coin_param(symbol, 'sl_pct', self.sl_pct)
 
@@ -3302,7 +3323,7 @@ class QuantBot:
                 logger.error(f"三角套利监控异常: {e}")
                 await asyncio.sleep(300)
 
-    # ==================== 自动交易主循环 ====================
+    # ==================== 自动交易主循环（关键修改：增加轮询间隔至30秒） ====================
 
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
@@ -3396,7 +3417,9 @@ class QuantBot:
                                 logger.info(f"📊 固定网格触发 {sym} 下跌{drop_from_last*100:.2f}%，金额{coin_amount:.2f}U")
                             continue
 
-                        tech = await self.tech.calc(sym, self.timeframe, 50)
+                        tech = await self._get_cached_tech(sym, self.timeframe, 50)
+                        if tech is None:
+                            continue
                         funding = await self.exchange.fetch_funding_rate(sym)
 
                         decision = await self._should_open_position(sym, p, tech, funding, fg, usdt_free)
@@ -3513,12 +3536,13 @@ class QuantBot:
                 if len(self.trades) % 20 == 0 and len(self.trades) > 0:
                     await self._auto_optimize_params()
 
-                await asyncio.sleep(10)
+                # ✅ 关键修复：轮询间隔从 10 秒改为 30 秒，大幅降低 API 频率
+                await asyncio.sleep(30)
             except Exception as e:
                 logger.error(f"自动交易错误: {e}")
                 self.api_error_count += 1
                 self.api_error_pause_time = asyncio.get_event_loop().time()
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
 
     # ==================== 缓存今日统计 ====================
     async def _get_cached_today_stats(self):
