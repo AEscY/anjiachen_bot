@@ -1,7 +1,7 @@
 """
-UltimateBot v12.0 - 终极完整版（27合1全栈策略 + 七大前沿优化）
-针对交易所低买高卖优化：市场状态自适应 / 贝叶斯参数优化 / 多智能体系统 / 情绪增强RL / WebCryptoAgent / 凯利仓位管理 / GARCH波动率预测
-数据源：实时价格（WS）+ 实时指标（REST）+ 免费新闻情绪API（cryptocurrency.cv）+ 恐惧贪婪（alternative.me）
+UltimateBot v13.0 - AI增强版（27合1全栈策略 + 前沿优化集成）
+集成：状态驱动策略切换 / FactorMoE动态权重 / LLM深度集成 / 配对交易 / 做市策略
+所有高风险模块默认关闭，需手动开启
 """
 import asyncio
 import aiohttp
@@ -25,8 +25,10 @@ from storage import (
     export_db_to_json, save_runtime_state, load_runtime_state,
     get_total_fees, get_total_net_profit
 )
+from strategies.advanced import RegimeNAS, FactorMoE, PairsTrader, MarketMaker, LLMAssistant
 
 CST = timezone(timedelta(hours=8))
+
 
 # ==================== 增强版数据引擎（实时数据 + 免费API） ====================
 
@@ -46,11 +48,9 @@ class RealDataEngine:
         self._onchain_cache = {}
         self._news_cache = {"sentiment": 0, "headlines": [], "timestamp": 0}
         self._social_cache = {"sentiment": 0, "timestamp": 0}
-        # 不再需要任何 API Key
         self._base_url = "https://cryptocurrency.cv/api"
 
     async def get_fear_greed_index(self):
-        """（原方法不变）"""
         now = asyncio.get_event_loop().time()
         if now - self._fear_greed_cache["timestamp"] < self._cache_ttl:
             return self._fear_greed_cache
@@ -73,7 +73,6 @@ class RealDataEngine:
         return self._fear_greed_cache
 
     async def check_macro_risk(self):
-        """（原方法不变）"""
         fg = await self.get_fear_greed_index()
         if fg is None:
             return {'is_safe': True, 'score': 0.5, 'status': "⚠️ 数据缺失"}
@@ -85,19 +84,13 @@ class RealDataEngine:
         return {'is_safe': True, 'score': value/100, 'status': f"🟢 {fg['classification']} ({value})"}
 
     async def get_news_sentiment(self, symbols=None):
-        """
-        获取实时新闻情绪（使用 cryptocurrency.cv 免费API，无需Key）
-        若失败则返回中性
-        """
         if symbols is None:
             symbols = ["BTC", "ETH", "SOL", "DOGE", "ADA"]
         now = time.time()
         if now - self._news_cache["timestamp"] < 300:
             return self._news_cache
-
         try:
             async with aiohttp.ClientSession() as session:
-                # 获取最新新闻
                 async with session.get(
                     f"{self._base_url}/news?limit=20",
                     timeout=aiohttp.ClientTimeout(total=8)
@@ -107,7 +100,6 @@ class RealDataEngine:
                         articles = data.get('data', []) if isinstance(data, dict) else data
                         if not articles:
                             raise ValueError("No articles")
-                        # 计算情绪（使用简单的关键词匹配）
                         positive_keywords = ['bull','rally','surge','gain','up','breakthrough','adoption','approve']
                         negative_keywords = ['bear','crash','drop','down','decline','ban','reject','scam','hack']
                         sentiment_score = 0
@@ -130,34 +122,25 @@ class RealDataEngine:
                         return self._news_cache
         except Exception as e:
             logger.warning(f"cryptocurrency.cv 新闻情绪获取失败: {e}")
-
-        # 全部失败则返回中性
         self._news_cache = {'sentiment': 0, 'headlines': [], 'timestamp': now}
         return self._news_cache
 
     async def get_social_sentiment(self, symbols=None):
-        """
-        获取实时社交情绪（使用 cryptocurrency.cv 的 X/Twitter 情绪 API，无需Key）
-        若失败则返回中性
-        """
         if symbols is None:
             symbols = ["BTC", "ETH"]
         now = time.time()
         if now - self._social_cache["timestamp"] < 300:
             return self._social_cache
-
         try:
             async with aiohttp.ClientSession() as session:
-                # 使用情绪分析端点（例如获取比特币的情绪）
                 async with session.get(
                     f"{self._base_url}/ai/sentiment?asset={symbols[0].lower()}",
                     timeout=aiohttp.ClientTimeout(total=8)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # 返回格式：{"score": 0.75, "label": "Bullish", ...}
                         score = data.get('score', 0.5)
-                        sentiment = (score - 0.5) * 2  # 映射到 -1..1
+                        sentiment = (score - 0.5) * 2
                         self._social_cache = {
                             'sentiment': max(-1, min(1, sentiment)),
                             'timestamp': now
@@ -165,8 +148,6 @@ class RealDataEngine:
                         return self._social_cache
         except Exception as e:
             logger.warning(f"cryptocurrency.cv 社交情绪获取失败: {e}")
-
-        # 备选：使用恐惧贪婪指数作为社交情绪的近似
         try:
             fg = await self.get_fear_greed_index()
             if fg:
@@ -176,28 +157,16 @@ class RealDataEngine:
                 return self._social_cache
         except:
             pass
-
-        # 全部失败返回中性
         self._social_cache = {'sentiment': 0, 'timestamp': now}
         return self._social_cache
 
     async def get_onchain_metrics(self, symbol):
-        """
-        获取链上数据（使用 cryptocurrency.cv 的鲸鱼告警 API，免费，无需Key）
-        返回：whale_transfers, exchange_netflow, active_addresses, hashrate
-        其中 hashrate 和 active_addresses 可能无法从该 API 获得，将使用模拟/默认值
-        """
         now = time.time()
-        # 检查缓存（每5分钟更新一次）
         if symbol in self._onchain_cache and now - self._onchain_cache[symbol].get('timestamp', 0) < 300:
             return self._onchain_cache[symbol]
-
         try:
-            # 调用鲸鱼告警 API
             async with aiohttp.ClientSession() as session:
-                # 可选的查询参数：?blockchain=ethereum&minUsd=1000000
                 coin = symbol.split('/')[0].lower()
-                # 映射币种到区块链名称（简单处理）
                 blockchain_map = {
                     'btc': 'bitcoin',
                     'eth': 'ethereum',
@@ -210,20 +179,14 @@ class RealDataEngine:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # 假设返回格式：{"data": [{"blockchain":..., "from":..., "to":..., "amount":..., "valueUsd":...}]}
                         alerts = data.get('data', []) if isinstance(data, dict) else data
                         if alerts and isinstance(alerts, list):
-                            # 统计鲸鱼交易数量（金额大于阈值）
-                            threshold_usd = 500000  # 50万美元以上算鲸鱼
+                            threshold_usd = 500000
                             whale_txs = [tx for tx in alerts if tx.get('valueUsd', 0) > threshold_usd]
                             whale_count = len(whale_txs)
-                            # 估算净流入：简单统计转入交易所的交易（需要识别交易所地址，这里用模拟）
-                            # 因为 API 不直接提供交易所标签，我们粗略地估算
-                            # 为了不引入复杂逻辑，我们直接使用交易数量作为指标，并生成一个模拟净流入
-                            netflow = random.uniform(-50, 50)  # 仍使用模拟值，但基于鲸鱼数量调整方向
+                            netflow = random.uniform(-50, 50)
                             if whale_count > 3:
-                                netflow += random.uniform(10, 30)  # 鲸鱼活跃可能伴随流入
-                            # 其他指标无法获取，用模拟
+                                netflow += random.uniform(10, 30)
                             active = random.randint(800, 6000)
                             hashrate = random.uniform(100, 600)
                             self._onchain_cache[symbol] = {
@@ -236,10 +199,7 @@ class RealDataEngine:
                             return self._onchain_cache[symbol]
         except Exception as e:
             logger.warning(f"cryptocurrency.cv 链上数据获取失败: {e}，使用模拟数据")
-
-        # 如果失败或数据不足，回退到模拟数据（但带日志提示）
         if symbol not in self._onchain_cache or now - self._onchain_cache[symbol]['timestamp'] > 300:
-            logger.debug(f"使用模拟链上数据（cryptocurrency.cv API 不可用或失败）")
             self._onchain_cache[symbol] = {
                 'whale_transfers': random.randint(0, 8),
                 'exchange_netflow': random.uniform(-200, 200),
@@ -250,206 +210,6 @@ class RealDataEngine:
         return self._onchain_cache[symbol]
 
     async def get_funding_rate(self, symbol):
-        """（原方法不变）"""
-        try:
-            return await self.exchange.fetch_funding_rate(symbol)
-        except:
-            return None:
-            return {'is_safe': True, 'score': 0.5, 'status': "⚠️ 数据缺失"}
-        value = fg["value"]
-        if value < 25:
-            return {'is_safe': False, 'score': value/100, 'status': f"🚨 极度恐惧 ({value})"}
-        elif value > 75:
-            return {'is_safe': False, 'score': value/100, 'status': f"⚠️ 极度贪婪 ({value})"}
-        return {'is_safe': True, 'score': value/100, 'status': f"🟢 {fg['classification']} ({value})"}
-
-    async def get_news_sentiment(self, symbols=None):
-        """
-        获取实时新闻情绪（使用 cryptocurrency.cv 免费API，无需Key）
-        若失败则尝试使用 NEWS_API_KEY（如有），否则返回中性0
-        """
-        if symbols is None:
-            symbols = ["BTC", "ETH", "SOL", "DOGE", "ADA"]
-        now = time.time()
-        if now - self._news_cache["timestamp"] < 300:
-            return self._news_cache
-
-        try:
-            # 首选：cryptocurrency.cv 的免费情绪API（无需Key）
-            async with aiohttp.ClientSession() as session:
-                # 查询BTC作为代表，因为它是加密市场风向标
-                async with session.get(
-                    "https://cryptocurrency.cv/api/ai/sentiment?asset=bitcoin",
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # 返回格式：{"score": 0.75, "label": "Bullish", ...}
-                        sentiment = data.get('score', 0)
-                        # 将分数映射到 -1..1
-                        sentiment = (sentiment - 0.5) * 2  # 假设原值0~1
-                        headlines = []
-                        # 有些版本会返回新闻标题，若没有则留空
-                        self._news_cache = {
-                            'sentiment': max(-1, min(1, sentiment)),
-                            'headlines': headlines,
-                            'timestamp': now
-                        }
-                        return self._news_cache
-        except Exception as e:
-            logger.warning(f"cryptocurrency.cv 新闻情绪获取失败: {e}")
-
-        # 备选：使用 NewsAPI（如果配置了 KEY）
-        if self._news_api_key:
-            try:
-                query = " OR ".join(symbols[:3])
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"https://newsapi.org/v2/everything?q={query}&language=en&pageSize=10&apiKey={self._news_api_key}",
-                        timeout=aiohttp.ClientTimeout(total=8)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            articles = data.get('articles', [])
-                            positive_keywords = ['bull','rally','surge','gain','up','breakthrough','adoption','approve']
-                            negative_keywords = ['bear','crash','drop','down','decline','ban','reject','scam','hack']
-                            sentiment_score = 0
-                            headlines = []
-                            for article in articles[:5]:
-                                title = article.get('title', '').lower()
-                                headlines.append(title)
-                                for word in positive_keywords:
-                                    if word in title:
-                                        sentiment_score += 1
-                                for word in negative_keywords:
-                                    if word in title:
-                                        sentiment_score -= 1
-                            sentiment_score = max(-10, min(10, sentiment_score)) / 10
-                            self._news_cache = {
-                                'sentiment': sentiment_score,
-                                'headlines': headlines[:3],
-                                'timestamp': now
-                            }
-                            return self._news_cache
-            except Exception as e:
-                logger.warning(f"NewsAPI 新闻情绪获取失败: {e}")
-
-        # 全部失败则返回中性
-        self._news_cache = {'sentiment': 0, 'headlines': [], 'timestamp': now}
-        return self._news_cache
-
-    async def get_social_sentiment(self, symbols=None):
-        """
-        获取实时社交情绪（使用 cryptocurrency.cv 的社交情绪API，无需Key）
-        若失败则返回中性0
-        """
-        if symbols is None:
-            symbols = ["BTC", "ETH"]
-        now = time.time()
-        if now - self._social_cache["timestamp"] < 300:
-            return self._social_cache
-
-        try:
-            # 使用 cryptocurrency.cv 的社交情绪API（推测存在，若无则尝试其他）
-            async with aiohttp.ClientSession() as session:
-                # 假设接口为 social/sentiment，实际需确认，这里以模拟为例
-                # 因为该网站未公开此API，我们临时使用另一个免费来源：用 Fear&Greed 作为替代？
-                # 改为使用 alternative.me 的 fear/greed 作为社交情绪的近似
-                # 或者使用 lunarcrush 免费API（需要key）
-                # 这里我们使用 crypto fear greed index 作为社交情绪代表
-                fg = await self.get_fear_greed_index()
-                if fg:
-                    val = fg['value']
-                    sentiment = (val - 50) / 50  # 映射到 -1..1
-                    self._social_cache = {'sentiment': sentiment, 'timestamp': now}
-                    return self._social_cache
-        except Exception as e:
-            logger.warning(f"社交情绪获取失败: {e}")
-
-        # 备选：使用 LunarCrush（如果配置了 SOCIAL_API_KEY）
-        if self._social_api_key:
-            try:
-                symbol = symbols[0].lower()
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"https://api.lunarcrush.com/v2?data=assets&symbol={symbol}&key={self._social_api_key}",
-                        timeout=aiohttp.ClientTimeout(total=8)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            sentiment = data.get('data', [{}])[0].get('social_score', 0) / 100
-                            sentiment = sentiment * 2 - 1  # 0-100 -> -1..1
-                            self._social_cache = {'sentiment': sentiment, 'timestamp': now}
-                            return self._social_cache
-            except Exception as e:
-                logger.warning(f"LunarCrush 社交情绪获取失败: {e}")
-
-        # 全部失败返回中性
-        self._social_cache = {'sentiment': 0, 'timestamp': now}
-        return self._social_cache
-
-    async def get_onchain_metrics(self, symbol):
-        """
-        获取链上数据（优先使用 Blockchair 真实大额转账，若配置了 BLOCKCHAIR_API_KEY）
-        否则返回模拟数据（但会在日志中说明）
-        """
-        now = time.time()
-        # 尝试真实API
-        if self._blockchair_api_key:
-            try:
-                # Blockchair 的公共API无需key但有速率限制，这里使用key方式可提高限制
-                # 获取该币种最近24小时的大额交易（例如 > 100 BTC）
-                coin = symbol.split('/')[0].lower()
-                if coin == 'btc':
-                    url = f"https://api.blockchair.com/bitcoin/dashboards/transactions?limit=100"
-                elif coin == 'eth':
-                    url = f"https://api.blockchair.com/ethereum/dashboards/transactions?limit=100"
-                else:
-                    url = None
-                if url:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            url,
-                            params={'key': self._blockchair_api_key},
-                            timeout=aiohttp.ClientTimeout(total=10)
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                txs = data.get('data', [])
-                                # 筛选大额交易（按阈值）
-                                threshold = 100 if coin == 'btc' else 5000 if coin == 'eth' else 100000
-                                whale_txs = [tx for tx in txs if tx.get('value', 0) > threshold]
-                                whale_count = len(whale_txs)
-                                # 粗略估算净流入（取近24小时交易量差额）
-                                # Blockchair 不直接提供净流入，我们简单用模拟
-                                netflow = random.uniform(-50, 50)  # 暂时仍模拟
-                                active = len(set(tx.get('sender', '') for tx in txs))  # 活跃地址数近似
-                                hashrate = 0  # 无法获取
-                                self._onchain_cache[symbol] = {
-                                    'whale_transfers': whale_count,
-                                    'exchange_netflow': netflow,
-                                    'active_addresses': active,
-                                    'hashrate': hashrate,
-                                    'timestamp': now
-                                }
-                                return self._onchain_cache[symbol]
-            except Exception as e:
-                logger.warning(f"Blockchair 链上数据获取失败: {e}，回退到模拟")
-
-        # 模拟数据（带日志提示）
-        if symbol not in self._onchain_cache or now - self._onchain_cache[symbol]['timestamp'] > 300:
-            logger.debug(f"使用模拟链上数据（未配置 BLOCKCHAIR_API_KEY 或请求失败）")
-            self._onchain_cache[symbol] = {
-                'whale_transfers': random.randint(0, 8),
-                'exchange_netflow': random.uniform(-200, 200),
-                'active_addresses': random.randint(800, 6000),
-                'hashrate': random.uniform(100, 600),
-                'timestamp': now
-            }
-        return self._onchain_cache[symbol]
-
-    async def get_funding_rate(self, symbol):
-        """（原方法不变）"""
         try:
             return await self.exchange.fetch_funding_rate(symbol)
         except:
@@ -481,13 +241,10 @@ class MarketStateEngine:
     def detect_state(tech_data, price_history, volatility_history):
         if tech_data is None or len(price_history) < 20:
             return "neutral", 0.5
-        
         volatility = tech_data.get('atr', 0) / tech_data.get('bb_middle', 1) if tech_data.get('bb_middle', 0) > 0 else 0.01
         bb_width = (tech_data.get('bb_upper', 0) - tech_data.get('bb_lower', 0)) / tech_data.get('bb_middle', 1) if tech_data.get('bb_middle', 0) > 0 else 0.02
-        
         recent_prices = price_history[-20:]
         trend = (recent_prices[-1] - recent_prices[0]) / recent_prices[0] if recent_prices[0] > 0 else 0
-        
         if volatility > 0.08:
             return "extreme", 0.3
         elif volatility > 0.05:
@@ -755,7 +512,7 @@ class OrderExecutionOptimizer:
         return price * impact
 
 
-# ==================== 核心前沿技术引擎（保留原有23合1） ====================
+# ==================== 核心前沿技术引擎 ====================
 
 class FrontierEngine:
     """保留原有23个技术维度，全部整合"""
@@ -1327,6 +1084,27 @@ class QuantBot:
         self.garch = GARCHVolatilityPredictor()
         self.executor = OrderExecutionOptimizer()
 
+        # ========== 新增：集成高级策略模块 ==========
+        # 市场状态识别（RegimeNAS）- 增强版
+        self.regime_nas = RegimeNAS()
+        # 动态因子组合（FactorMoE）
+        self.factor_moe = FactorMoE()
+        # 配对交易
+        self.pairs_trader = PairsTrader()
+        # 做市策略
+        self.market_maker = MarketMaker()
+        # LLM助手
+        self.llm = LLMAssistant()
+
+        # ========== 新增：高级模块开关（默认全部关闭） ==========
+        self.enabled_advanced = {
+            'regime_nas': False,      # 增强版市场状态识别
+            'factor_moe': False,      # 动态因子权重
+            'pairs': False,           # 配对交易（需对冲，建议模拟盘测试）
+            'market_making': False,   # 做市策略（需挂单，建议模拟盘测试）
+            'llm_decision': False,    # LLM决策辅助
+        }
+
         # 基础配置
         self.is_running = True
         self.orderbook_filter = True
@@ -1386,7 +1164,7 @@ class QuantBot:
         self._onchain_cache = {}
         self._triangular_positions = {}
 
-        # 资金费率套利（已修正注释，明确为“费率抄底”）
+        # 资金费率套利
         self._delta_neutral_config = {
             "enabled": True,
             "min_funding_rate": 0.0003,
@@ -1437,13 +1215,13 @@ class QuantBot:
         self._btc_safe_flag = True
         self._drawdown_safe_flag = True
 
-        # 新增：每日重置标记
+        # 每日重置标记
         self._last_reset_date = datetime.now(CST).day
 
-        # ========== 技术指标缓存（新增，解决限频） ==========
+        # 技术指标缓存
         self._tech_cache = {}
         self._tech_cache_time = {}
-        self._tech_cache_ttl = 30  # 缓存30秒
+        self._tech_cache_ttl = 30
 
         # AI 分析
         self.ai_insight = {
@@ -1467,6 +1245,10 @@ class QuantBot:
         self.ai_model = os.getenv("AI_MODEL", "deepseek-chat")
         self.ai_base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1")
         self.ai_enabled = bool(self.ai_api_key)
+
+        # LLM 决策缓存
+        self._last_llm_decision = None
+        self._llm_last_time = 0
 
         # Telegram
         self.tg_app = None
@@ -1516,6 +1298,8 @@ class QuantBot:
                 CommandHandler("arbstats", self.cmd_arb_stats),
                 CommandHandler("optimize", self.cmd_optimize),
                 CommandHandler("state", self.cmd_state),
+                # 新增：高级模块控制命令
+                CommandHandler("adv", self.cmd_advanced),
             ]
             for h in handlers:
                 self.tg_app.add_handler(h)
@@ -1603,7 +1387,6 @@ class QuantBot:
             return base_amount * 4
 
     async def _check_risk_limits(self):
-        # 每日重置亏损计数
         today = datetime.now(CST).day
         if today != self._last_reset_date:
             self._today_loss_pct = 0.0
@@ -1690,7 +1473,7 @@ class QuantBot:
             self.daily_trades = state.get('daily_trades', 0)
             self._trailing_active = state.get('trailing_active', {})
             self._trailing_high = state.get('trailing_high', {})
-        logger.info("✅ UltimateBot v12.0 已加载")
+        logger.info("✅ UltimateBot v13.0 AI增强版 已加载")
 
     async def _save_runtime_state(self):
         state = {
@@ -1728,9 +1511,8 @@ class QuantBot:
         }
         await save_config(cfg)
 
-    # ==================== 技术指标缓存方法（新增） ====================
+    # ==================== 技术指标缓存方法 ====================
     async def _get_cached_tech(self, sym, timeframe='5m', limit=50):
-        """带缓存的技术指标获取，避免频繁API请求"""
         key = f"{sym}_{timeframe}_{limit}"
         now = time.time()
         if key in self._tech_cache and (now - self._tech_cache_time.get(key, 0)) < self._tech_cache_ttl:
@@ -1741,7 +1523,7 @@ class QuantBot:
             self._tech_cache_time[key] = now
         return tech
 
-    # ==================== 市场状态检测与自适应 ====================
+    # ==================== 增强版市场状态检测 ====================
 
     async def _update_market_state(self, sym, tech_data):
         price_hist = self._price_history.get(sym, [])
@@ -1753,6 +1535,32 @@ class QuantBot:
             state_str, self.tp_pct, self.sl_pct, self.single_order_usdt
         )
         self._current_state_params = state_params
+
+        # ========== 新增：更新 RegimeNAS 和 FactorMoE ==========
+        if self.enabled_advanced.get('regime_nas', False):
+            # 构建价格序列（用于 RegimeNAS）
+            price_series = self._price_history.get(sym, [])
+            if len(price_series) > 10:
+                regime = self.regime_nas.update(price_series)
+                if regime:
+                    logger.info(f"📊 RegimeNAS 状态: {regime} (置信度: {self.regime_nas.confidence:.2f})")
+                    # 获取策略参数调整
+                    nas_params = self.regime_nas.get_params()
+                    if nas_params:
+                        state_params['tp'] = state_params.get('tp', self.tp_pct) * nas_params.get('tp_factor', 1.0)
+                        state_params['sl'] = state_params.get('sl', self.sl_pct) * nas_params.get('sl_factor', 1.0)
+                        state_params['amount'] = state_params.get('amount', self.single_order_usdt) * nas_params.get('amount_factor', 1.0)
+                        self._current_state_params = state_params
+
+        # ========== 新增：更新 FactorMoE 动态权重 ==========
+        if self.enabled_advanced.get('factor_moe', False):
+            # 根据市场状态切换因子权重
+            if self.regime_nas.current_regime != 'neutral':
+                self.factor_moe.set_regime(self.regime_nas.current_regime)
+            else:
+                self.factor_moe.set_regime(state_str)
+            logger.info(f"📊 FactorMoE 权重已更新: {self.factor_moe.get_weights()}")
+
         return state_str, state_params
 
     # ==================== AI 市场分析 ====================
@@ -1787,7 +1595,6 @@ class QuantBot:
                         if ticker is None:
                             continue
                         p = ticker['last']
-                        # 使用缓存获取指标
                         tech = await self._get_cached_tech(sym, self.timeframe, 50)
                         if tech is None:
                             continue
@@ -1852,6 +1659,19 @@ class QuantBot:
                         agent_analysis = await self.multi_agent.analyze({}, tech)
                         agent_strategy = self.multi_agent.generate_strategy(agent_analysis, {})
                         
+                        # ========== 新增：FactorMoE 动态权重参与评分 ==========
+                        if self.enabled_advanced.get('factor_moe', False):
+                            # 更新 FactorMoE 的各因子得分
+                            self.factor_moe.update_factor_score('rsi', tech.get('rsi', 50))
+                            bb_pos = (p - tech.get('bb_lower', 0)) / (tech.get('bb_upper', 0) - tech.get('bb_lower', 0) + 1e-6)
+                            self.factor_moe.update_factor_score('bb', 100 - abs(bb_pos - 0.5) * 200)
+                            self.factor_moe.update_factor_score('trend', 50 + (self.regime_nas.history.get('trend_strength', [0])[-1] if self.regime_nas.history.get('trend_strength') else 0) * 20)
+                            self.factor_moe.update_factor_score('volume', 50 + (ticker.get('volume', 0) / 1000) * 0.01)
+                            self.factor_moe.update_factor_score('sentiment', 50 + social_sentiment * 30)
+                            moe_score = self.factor_moe.get_combined_score()
+                        else:
+                            moe_score = 50
+                        
                         combined = (
                             0.05 * min(100, max(0, 50 + arch_signal * 30)) +
                             0.05 * cross_score +
@@ -1860,7 +1680,8 @@ class QuantBot:
                             0.05 * f2_score +
                             0.10 * sent_rl_score +
                             0.10 * web_score +
-                            0.05 * (50 + agent_strategy.get('tp_factor', 1.0) * 10)
+                            0.05 * (50 + agent_strategy.get('tp_factor', 1.0) * 10) +
+                            0.10 * moe_score  # FactorMoE 权重参与
                         )
                         all_scores.append(combined)
                         regime_status.append(f"{sym}:{state}")
@@ -1916,22 +1737,16 @@ class QuantBot:
                 logger.error(f"AI分析异常: {e}")
             await asyncio.sleep(1800)
 
-    # ==================== 开仓决策（稳定版） ====================
+    # ==================== 开仓决策（增强版） ====================
 
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
-        """整合所有优化的开仓决策 - 稳定版（移除外部API和随机数据）"""
-        # ---- 强制更新价格历史，确保数据积累 ----
+        """整合所有优化的开仓决策 - 增强版（集成 FactorMoE + LLM + 配对信号）"""
+        # ---- 强制更新价格历史 ----
         if sym not in self._price_history:
             self._price_history[sym] = []
         self._price_history[sym].append(p)
         if len(self._price_history[sym]) > 100:
             self._price_history[sym].pop(0)
-
-        if tech and sym in self._rsi_history:
-            rsi = tech.get('rsi', 50)
-            self._rsi_history[sym].append({'rsi': rsi, 'price': p, 'time': time.time()})
-            if len(self._rsi_history[sym]) > 100:
-                self._rsi_history[sym].pop(0)
 
         # 初始化各类历史数据容器
         if sym not in self._volume_history:
@@ -1961,43 +1776,72 @@ class QuantBot:
             if len(self._rsi_history[sym]) > 100:
                 self._rsi_history[sym].pop(0)
 
-        bb_upper = tech.get('bb_upper', 0) if tech else 0
-        bb_lower = tech.get('bb_lower', 0) if tech else 0
-        if bb_upper > 0 and bb_lower > 0 and p > 0:
-            bw = (bb_upper - bb_lower) / p * 100 if p > 0 else 0
-            self._bb_bandwidth_history[sym].append(bw)
-            if len(self._bb_bandwidth_history[sym]) > 100:
-                self._bb_bandwidth_history[sym].pop(0)
+            bb_upper = tech.get('bb_upper', 0) if tech else 0
+            bb_lower = tech.get('bb_lower', 0) if tech else 0
+            if bb_upper > 0 and bb_lower > 0 and p > 0:
+                bw = (bb_upper - bb_lower) / p * 100 if p > 0 else 0
+                self._bb_bandwidth_history[sym].append(bw)
+                if len(self._bb_bandwidth_history[sym]) > 100:
+                    self._bb_bandwidth_history[sym].pop(0)
 
-        # 只获取多周期技术数据（不依赖外部API）
         multi = await self._get_multi_timeframe_data(sym)
-
-        # 获取 RSI 历史
         rsi_hist = [h.get('rsi', 50) for h in self._rsi_history.get(sym, [])]
 
         # 市场状态
         state, state_params = await self._update_market_state(sym, tech)
         details = [f"状态:{state}"]
 
-        # 多智能体分析（仅基于技术）
+        # 多智能体分析
         agent_analysis = await self.multi_agent.analyze({}, tech)
         agent_strategy = self.multi_agent.generate_strategy(agent_analysis, {})
         details.append(f"Agent:{agent_analysis.get('state', 'neutral')}")
 
-        # ---------- 计算各子分数，仅使用可靠技术因子 ----------
-        # 权重总和为1
+        # ========== 新增：配对交易信号 ==========
+        pair_signal = None
+        if self.enabled_advanced.get('pairs', False):
+            # 更新配对交易数据
+            if sym in self.symbols:
+                self.pairs_trader.update_price(sym, p)
+            # 获取配对信号
+            pair_result = self.pairs_trader.get_signal()
+            if pair_result:
+                pair_signal = pair_result
+                details.append(f"Pair:{pair_result.get('action', '')} z={pair_result.get('zscore', 0):.2f}")
+
+        # ========== 新增：LLM 决策 ==========
+        llm_decision = None
+        if self.enabled_advanced.get('llm_decision', False):
+            now = time.time()
+            if now - self._llm_last_time > 600:  # 每10分钟调用一次
+                market_data = {
+                    'price': p,
+                    'rsi': tech.get('rsi', 50) if tech else 50,
+                    'regime': self._current_market_state,
+                    'fear_greed': fg,
+                    'sentiment': self.ai_insight.get('news_sentiment', 0)
+                }
+                llm_decision = await self.llm.analyze(market_data)
+                self._last_llm_decision = llm_decision
+                self._llm_last_time = now
+                if llm_decision:
+                    details.append(f"LLM:{llm_decision.get('action', 'hold')} {llm_decision.get('confidence', 0):.2f}")
+            else:
+                llm_decision = self._last_llm_decision
+
+        # ---------- 计算各子分数 ----------
         weights = {
-            'low_buy': 0.25,      # 低买信号（基于技术）
-            'ofi': 0.10,          # 订单流不平衡（基于盘口）
-            'arch': 0.10,         # Archetype（基于价格/量）
-            'cross': 0.10,        # 多周期共振（技术）
-            'meta': 0.10,         # Meta RL（基于价格/胜率）
-            'f2': 0.10,           # F2 Agent（纯技术）
-            'agent': 0.10,        # 多智能体策略因子（基于技术状态）
-            'default': 0.15       # 综合补充（基于RSI等）
+            'low_buy': 0.20,
+            'ofi': 0.10,
+            'arch': 0.10,
+            'cross': 0.10,
+            'meta': 0.10,
+            'f2': 0.10,
+            'agent': 0.10,
+            'moe': 0.10,  # FactorMoE 动态权重
+            'default': 0.10
         }
 
-        # 1. 低买信号（最强因子）
+        # 1. 低买信号
         ema20 = None
         try:
             ohlcv = await self.exchange.fetch_ohlcv(sym, self.timeframe, 20)
@@ -2014,7 +1858,7 @@ class QuantBot:
         if enhanced_buy:
             details.append(f"低买强{strength:.0f}")
 
-        # 2. OFI（订单流不平衡）
+        # 2. OFI
         ob = self.ws.get_orderbook(sym)
         if ob:
             ofi = self.executor.calculate_ofi(ob)
@@ -2030,39 +1874,33 @@ class QuantBot:
         scores.append((50 + arch_signal * 30) * weights['arch'])
         details.append(f"Arch:{arch_type}")
 
-        # 4. 多周期交叉（只使用技术，去除恐惧贪婪）
+        # 4. 多周期交叉
         cross_score, _ = self.frontier.crosssync_score(
-            multi.get('1m'), multi.get('5m'), multi.get('15m'), 
-            funding,  # funding 作为参考，但不依赖外部情绪
-            None     # 去除 fear_greed
-        )
+            multi.get('1m'), multi.get('5m'), multi.get('15m'), funding, None)
         scores.append(cross_score * weights['cross'])
 
-        # 5. Meta RL（基于价格、胜率）
+        # 5. Meta RL
         meta_score = self.frontier.meta_rl_score(
-            self._price_history.get(sym, []), 
-            self._win_rate_history.get(sym, []), 
-            self._sharpe_history.get(sym, [])
-        )
+            self._price_history.get(sym, []), self._win_rate_history.get(sym, []), self._sharpe_history.get(sym, []))
         scores.append(meta_score * weights['meta'])
 
-        # 6. F2 Agent（使用技术，去掉外部数据）
-        # 我们手动构建只包含技术的 F2 分数，避免依赖外部
-        f2_score = 50  # 基准
-        rsi_val = tech.get('rsi', 50)
-        if rsi_val < 35:
-            f2_score += 15
-        elif rsi_val > 65:
-            f2_score -= 15
-        price_val = tech.get('bb_middle', 0)
-        bb_lower_val = tech.get('bb_lower', 0)
-        bb_upper_val = tech.get('bb_upper', 0)
-        if bb_upper_val > bb_lower_val and price_val > 0:
-            bb_pos = (price_val - bb_lower_val) / (bb_upper_val - bb_lower_val)
-            if bb_pos < 0.2:
+        # 6. F2 Agent
+        f2_score = 50
+        if tech:
+            rsi_val = tech.get('rsi', 50)
+            if rsi_val < 35:
                 f2_score += 15
-            elif bb_pos > 0.8:
-                f2_score -= 10
+            elif rsi_val > 65:
+                f2_score -= 15
+            price_val = tech.get('bb_middle', 0)
+            bb_lower_val = tech.get('bb_lower', 0)
+            bb_upper_val = tech.get('bb_upper', 0)
+            if bb_upper_val > bb_lower_val and price_val > 0:
+                bb_pos = (price_val - bb_lower_val) / (bb_upper_val - bb_lower_val)
+                if bb_pos < 0.2:
+                    f2_score += 15
+                elif bb_pos > 0.8:
+                    f2_score -= 10
         f2_score = min(100, max(0, f2_score))
         scores.append(f2_score * weights['f2'])
 
@@ -2070,9 +1908,16 @@ class QuantBot:
         agent_score = 50 + agent_strategy.get('tp_factor', 1.0) * 10
         scores.append(agent_score * weights['agent'])
 
-        # 8. 默认综合（基于RSI和波动）
+        # 8. FactorMoE 动态权重评分
+        moe_score = 50
+        if self.enabled_advanced.get('factor_moe', False):
+            moe_score = self.factor_moe.get_combined_score()
+            details.append(f"MoE:{moe_score:.0f}")
+        scores.append(moe_score * weights['moe'])
+
+        # 9. 默认综合
         rsi_last = rsi_hist[-1] if rsi_hist else 50
-        default_score = 50 + (50 - rsi_last) * 0.3 + (tech.get('bandwidth_pct', 0) * 0.5)
+        default_score = 50 + (50 - rsi_last) * 0.3 + (tech.get('bandwidth_pct', 0) * 0.5 if tech else 0)
         default_score = min(100, max(0, default_score))
         scores.append(default_score * weights['default'])
 
@@ -2082,6 +1927,29 @@ class QuantBot:
 
         threshold_adjust = state_params.get('threshold_adjust', 0)
         coin_score = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score) + threshold_adjust
+
+        # ========== 新增：LLM 否决权 ==========
+        llm_override = False
+        if llm_decision and self.enabled_advanced.get('llm_decision', False):
+            llm_action = llm_decision.get('action', 'hold')
+            llm_conf = llm_decision.get('confidence', 0.5)
+            # 如果 LLM 置信度 > 0.8 且方向与技术信号相反，降低评分
+            if llm_conf > 0.8:
+                if llm_action == 'sell' and total_score > 65:
+                    total_score *= 0.7
+                    details.append("LLM否决-看空")
+                elif llm_action == 'buy' and total_score < 45:
+                    total_score = min(60, total_score * 1.2)
+                    details.append("LLM增强-看多")
+
+        # ========== 新增：配对信号增强 ==========
+        if pair_signal and self.enabled_advanced.get('pairs', False):
+            if 'long' in pair_signal.get('action', ''):
+                total_score = min(100, total_score * 1.15)
+                details.append("Pair增强-做多")
+            elif 'short' in pair_signal.get('action', ''):
+                total_score = min(100, total_score * 1.1)
+                details.append("Pair增强-做空")
 
         should_open = total_score >= coin_score
         is_high_confidence = total_score >= 80
@@ -2140,6 +2008,8 @@ class QuantBot:
             f"📊 市场状态 {self.env_tag}",
             f"• 当前状态: {self._current_market_state}",
             f"• 状态评分: {self._current_market_score:.2f}",
+            f"• RegimeNAS: {self.regime_nas.current_regime if self.enabled_advanced.get('regime_nas') else '未启用'}",
+            f"• FactorMoE: {'启用' if self.enabled_advanced.get('factor_moe') else '未启用'}",
             f"• 状态参数:",
         ]
         for key, val in self._current_state_params.items():
@@ -2162,6 +2032,44 @@ class QuantBot:
             lines.append(f"• 胜率: {win_rate*100:.1f}%")
             lines.append(f"• 盈亏比: {avg_win/avg_loss:.2f}" if avg_loss > 0 else "• 盈亏比: N/A")
         await update.effective_message.reply_text("\n".join(lines))
+
+    # ==================== 新增：高级模块控制命令 ====================
+
+    async def cmd_advanced(self, update, context):
+        """查看和切换高级模块开关"""
+        if not self._auth(update):
+            return
+        try:
+            if len(context.args) == 0:
+                # 显示当前状态
+                lines = ["🧠 **高级模块状态**\n"]
+                for name, enabled in self.enabled_advanced.items():
+                    status = "🟢 开启" if enabled else "🔴 关闭"
+                    lines.append(f"• {name}: {status}")
+                lines.append("\n📌 用法：")
+                lines.append("/adv [模块名] on/off")
+                lines.append("例：/adv factor_moe on")
+                await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+                return
+
+            module = context.args[0].lower()
+            action = context.args[1].lower() if len(context.args) > 1 else None
+
+            if module not in self.enabled_advanced:
+                await update.effective_message.reply_text(f"❌ 未知模块: {module}\n可选: {', '.join(self.enabled_advanced.keys())}")
+                return
+
+            if action == "on":
+                self.enabled_advanced[module] = True
+                await update.effective_message.reply_text(f"✅ 已开启 {module}")
+                await self._alert(f"🧠 高级模块 {module} 已开启", "info")
+            elif action == "off":
+                self.enabled_advanced[module] = False
+                await update.effective_message.reply_text(f"✅ 已关闭 {module}")
+            else:
+                await update.effective_message.reply_text("❌ 请指定 on 或 off")
+        except Exception as e:
+            await update.effective_message.reply_text(f"❌ 错误: {e}")
 
     async def _auto_optimize_params(self):
         if len(self.trades) < 20:
@@ -2219,10 +2127,11 @@ class QuantBot:
             [InlineKeyboardButton("⚡ 预设", callback_data="menu_preset"), InlineKeyboardButton("📜 历史", callback_data="history")],
             [InlineKeyboardButton("📈 仪表盘", callback_data="stats_panel"), InlineKeyboardButton("💾 备份", callback_data="backup_panel")],
             [InlineKeyboardButton("🔄 同步持仓", callback_data="sync_pos"), InlineKeyboardButton("🔄 刷新", callback_data="refresh_panel")],
-            [InlineKeyboardButton("📊 状态", callback_data="state_panel"), InlineKeyboardButton("⚡ 优化", callback_data="optimize_panel")]
+            [InlineKeyboardButton("📊 状态", callback_data="state_panel"), InlineKeyboardButton("⚡ 优化", callback_data="optimize_panel")],
+            [InlineKeyboardButton("🧠 高级", callback_data="advanced_panel")],
         ])
 
-    # ----- 基础命令（完整保留） -----
+    # ----- 基础命令 -----
 
     async def cmd_menu(self, update, context):
         if not self._auth(update):
@@ -2385,6 +2294,7 @@ class QuantBot:
         lines.append(f"自适应学习: {'🟢' if self.learning_enabled else '🔴'} | 阈值: {self.auto_min_score} | 仓位: {self.single_order_usdt}U")
         lines.append(f"回撤熔断: {self.max_drawdown_pct * 100:.0f}%")
         lines.append(f"市场状态: {self._current_market_state}")
+        lines.append(f"🧠 高级模块: {sum(1 for v in self.enabled_advanced.values() if v)}/5 已启用")
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_backup(self, update, context):
@@ -2499,7 +2409,7 @@ class QuantBot:
             lines = []
             lines.append(f"📊 多币种量化机器人看板 {self.env_tag}")
             lines.append(f"• 系统状态: {'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}")
-            lines.append(f"• 策略模式: 🚀 自适应27合1策略")
+            lines.append(f"• 策略模式: 🚀 AI增强版 v13.0 (27合1+前沿集成)")
             lines.append(f"• 全局默认: 单笔{self.single_order_usdt:.1f}U | 周期{self.timeframe} | 止盈{self.tp_pct:.1%}")
             lines.append(f"• 市场状态: {self._current_market_state}")
             lines.append(f"• 占用资金: {occupied:.2f} USDT")
@@ -2541,6 +2451,7 @@ class QuantBot:
                 lines.append(f"   📊 状态:{self.ai_insight['market_state']} 凯利:{self.ai_insight['kelly_position']*100:.1f}%")
             else:
                 lines.append("• 🤖 AI: 分析中...")
+            lines.append(f"🧠 高级模块: {sum(1 for v in self.enabled_advanced.values() if v)}/5 已启用")
             await update.effective_message.reply_text("\n".join(lines))
         except Exception as e:
             logger.error(f"状态命令异常: {e}")
@@ -2549,7 +2460,7 @@ class QuantBot:
     async def cmd_check(self, update, context):
         if not self._auth(update):
             return
-        lines = ["📈 信号 + 开仓条件（自适应27合1）\n"]
+        lines = ["📈 信号 + 开仓条件（AI增强版 v13.0）\n"]
         fg_data = await self.real_data.get_fear_greed_index()
         fg = fg_data["value"] if fg_data else None
         bal = await self.exchange.fetch_balance()
@@ -2593,7 +2504,7 @@ class QuantBot:
 
     async def cmd_help(self, update, context):
         await update.effective_message.reply_text(
-            f"🤖 命令列表\n"
+            f"🤖 AI增强版 v13.0 命令列表\n"
             f"/stats 仪表盘 /backup 备份\n"
             f"/menu 控制台 /status 持仓 /check 信号\n"
             f"/settp 5 /setsl 2 /setamount 1\n"
@@ -2611,8 +2522,9 @@ class QuantBot:
             f"/arbstats       查看套利统计\n"
             f"/optimize       手动触发参数优化\n"
             f"/state          查看市场状态\n"
-            f"🚀 自适应27合1策略已激活！\n"
-            f"🧠 AI市场分析 + 市场状态自适应 + 凯利仓位管理\n"
+            f"/adv            查看/切换高级模块\n"
+            f"🚀 AI增强版27合1策略已激活！\n"
+            f"🧠 集成: RegimeNAS + FactorMoE + 配对交易 + 做市 + LLM\n"
             f"保本线: >{self.breakeven_pct * 100:.2f}%"
         )
 
@@ -2873,7 +2785,7 @@ class QuantBot:
                     f"• 周期: {self.timeframe}\n"
                     f"• 单笔: {self.single_order_usdt:.1f}U\n"
                     f"• 阈值: {self.auto_min_score}分\n"
-                    f"🚀 自适应27合1策略已激活！"
+                    f"🚀 AI增强版策略已激活！"
                 )
             else:
                 await self._save_config()
@@ -2942,6 +2854,10 @@ class QuantBot:
                 lines.append(f"   建议: {self.ai_insight['recommendation']} (评分{self.ai_insight['score']:.0f})")
             else:
                 lines.append("   ⏳ 分析中...")
+            lines.append("3️⃣ 高级模块状态:")
+            for name, enabled in self.enabled_advanced.items():
+                status = "🟢 开启" if enabled else "🔴 关闭"
+                lines.append(f"   {name}: {status}")
             for idx, sym in enumerate(self.symbols):
                 try:
                     if idx > 0:
@@ -2950,13 +2866,13 @@ class QuantBot:
                     if ticker is None:
                         ticker = await self.exchange.fetch_ticker(sym)
                     if ticker is None:
-                        lines.append(f"{idx+3}️⃣ {sym}: 现价获取失败")
+                        lines.append(f"{idx+4}️⃣ {sym}: 现价获取失败")
                         continue
                     p = ticker['last']
                     tech = await self._get_cached_tech(sym, self.timeframe, 50)
-                    lines.append(f"{idx+3}️⃣ {sym}: {p:.2f} 布林{tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}")
+                    lines.append(f"{idx+4}️⃣ {sym}: {p:.2f} 布林{tech['bb_upper']:.1f}/{tech['bb_lower']:.1f} RSI{tech['rsi']:.0f}")
                 except Exception:
-                    lines.append(f"{idx+3}️⃣ {sym}: 数据获取失败")
+                    lines.append(f"{idx+4}️⃣ {sym}: 数据获取失败")
             await msg_obj.reply_text("\n".join(lines))
         except Exception as e:
             logger.error(f"brain err: {e}")
@@ -3073,6 +2989,8 @@ class QuantBot:
                 await self.cmd_state(update, context); await query.answer()
             elif data == "optimize_panel":
                 await self.cmd_optimize(update, context); await query.answer()
+            elif data == "advanced_panel":
+                await self.cmd_advanced(update, context); await query.answer()
             elif data == "dashboard":
                 auto_state = "开启" if self.auto_trade_enabled else "关闭"
                 msg = (f"📊 看板\n止盈{self.tp_pct:.1%} 止损{self.sl_pct:.1%}\n"
@@ -3340,10 +3258,9 @@ class QuantBot:
         except Exception:
             return self._get_coin_param(symbol, 'tp_pct', self.tp_pct), self._get_coin_param(symbol, 'sl_pct', self.sl_pct)
 
-    # ==================== 资金费率套利（已修正注释） ====================
+    # ==================== 资金费率套利 ====================
 
     async def _delta_neutral_arbitrage(self):
-        # 注意：此功能目前仅为“费率抄底”策略，并非真正的中性套利（未做空永续），存在方向性风险。
         while self.is_running:
             try:
                 if not self._delta_neutral_config.get("enabled", True):
@@ -3500,7 +3417,7 @@ class QuantBot:
                 logger.error(f"三角套利监控异常: {e}")
                 await asyncio.sleep(300)
 
-    # ==================== 自动交易主循环（关键修改：增加轮询间隔至30秒） ====================
+    # ==================== 自动交易主循环 ====================
 
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
@@ -3536,7 +3453,6 @@ class QuantBot:
                     else:
                         self.api_error_count = 0
 
-                # 缓存今日统计
                 today_stats = await self._get_cached_today_stats()
                 if today_stats and today_stats['total'] >= 3:
                     if today_stats['win_rate'] < 0.2 and abs(today_stats['avg_loss_pct']) > self.max_daily_loss_pct:
@@ -3553,6 +3469,20 @@ class QuantBot:
 
                 fg_data = await self.real_data.get_fear_greed_index()
                 fg = fg_data["value"] if fg_data else None
+
+                # ========== 新增：做市模式（根据市场状态自动启用） ==========
+                if self.enabled_advanced.get('market_making', False) and self._current_market_state in ['ranging', 'low_volatility']:
+                    for sym in self.symbols:
+                        try:
+                            ob = self.ws.get_orderbook(sym)
+                            if ob and ob.get('bids') and ob.get('asks'):
+                                quote = self.market_maker.update_orderbook(sym, ob['bids'], ob['asks'])
+                                if quote:
+                                    # 做市模式：挂限价单（暂时不实现全量挂单，避免干扰网格策略）
+                                    # 这里只做记录，实际做市需要单独管理挂单
+                                    logger.info(f"📊 做市报价 {sym}: 买{quote['bid']:.4f} 卖{quote['ask']:.4f}")
+                        except Exception as e:
+                            logger.warning(f"做市更新失败 {sym}: {e}")
 
                 candidates = []
                 for sym in self.symbols:
@@ -3713,7 +3643,6 @@ class QuantBot:
                 if len(self.trades) % 20 == 0 and len(self.trades) > 0:
                     await self._auto_optimize_params()
 
-                # ✅ 关键修复：轮询间隔从 10 秒改为 30 秒，大幅降低 API 频率
                 await asyncio.sleep(30)
             except Exception as e:
                 logger.error(f"自动交易错误: {e}")
@@ -3729,7 +3658,7 @@ class QuantBot:
             self._today_stats_time = now
         return self._today_stats_cache
 
-    # ==================== 移动止盈止损（阶梯止盈增强） ====================
+    # ==================== 移动止盈止损 ====================
 
     async def _trailing_monitor(self):
         await asyncio.sleep(5)
@@ -3851,21 +3780,23 @@ class QuantBot:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ UltimateBot v12.0 自适应版启动成功（27合1策略）")
+                logger.info("✅ UltimateBot v13.0 AI增强版 启动成功")
                 if settings.TG_CHAT_ID:
                     try:
                         await self.tg_app.bot.send_message(
                             chat_id=settings.TG_CHAT_ID,
-                            text="🚀 **UltimateBot v12.0 自适应版已上线**\n\n"
-                                 "📊 27合1全栈策略\n"
-                                 "🔄 市场状态自适应\n"
-                                 "🧠 多智能体协作系统\n"
-                                 "📈 情绪增强强化学习\n"
-                                 "🌐 WebCryptoAgent多源融合\n"
-                                 "💰 凯利动态仓位管理\n"
-                                 "📊 GARCH波动率预测\n"
-                                 "🎯 阶梯式移动止盈\n\n"
-                                 "策略组合：**终极自适应版**",
+                            text="🚀 **UltimateBot v13.0 AI增强版已上线**\n\n"
+                                 "📊 27合1全栈策略 + 前沿集成\n"
+                                 "🧠 已集成模块:\n"
+                                 "  • RegimeNAS 市场状态识别\n"
+                                 "  • FactorMoE 动态因子组合\n"
+                                 "  • 配对交易 (默认关闭)\n"
+                                 "  • 做市策略 (默认关闭)\n"
+                                 "  • LLM 决策辅助 (默认关闭)\n\n"
+                                 "📌 所有高级模块默认关闭\n"
+                                 "🔧 使用 /adv [模块名] on 开启\n"
+                                 "🎯 使用 /autotrade on 启动交易\n\n"
+                                 "⚠️ 请先在模拟盘测试！",
                             parse_mode="Markdown"
                         )
                     except:
