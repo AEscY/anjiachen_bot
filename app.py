@@ -1,43 +1,39 @@
 """
-app.py - 量化网格机器人 主入口（实盘安全版）
-- 动态 PORT
-- 健康检查含数据库状态
-- 优雅关闭
+app.py - 量化网格机器人 主入口（支持 Render/Railway/Fly.io 云部署）
+修复：动态 PORT / 健康检查规范 / asyncio.run 优雅关闭
+增加：详细启动日志，捕获所有异常
 """
 import asyncio
 import os
 import signal
 import traceback
+import sys
 from exchange import ExchangeManager
 from bot import QuantBot
-from storage import init_db
+
+# 强制输出启动信息
+print("=" * 50)
+print("Starting UltimateBot...")
+print(f"Python version: {sys.version}")
+print(f"Working directory: {os.getcwd()}")
+print(f"Environment variables present: {list(os.environ.keys())}")
+print("=" * 50)
+sys.stdout.flush()
 
 
 async def health_check(reader, writer):
-    """
-    标准化 HTTP 健康检查响应（含数据库状态）
-    """
     try:
         try:
             await asyncio.wait_for(reader.read(1024), timeout=1.0)
         except (asyncio.TimeoutError, ConnectionResetError):
             pass
-
-        # 简单检查数据库是否可用
-        db_status = "OK"
-        try:
-            await init_db()
-        except Exception as e:
-            db_status = f"ERROR: {e}"
-
-        body = f"OK\nDB: {db_status}".encode()
         response = (
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/plain\r\n"
-            f"Content-Length: {len(body)}\r\n".encode()
+            b"Content-Length: 2\r\n"
             b"Connection: close\r\n"
             b"\r\n"
-            + body
+            b"OK"
         )
         writer.write(response)
         await writer.drain()
@@ -52,56 +48,78 @@ async def health_check(reader, writer):
 
 
 async def main():
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🩺 健康检查服务将监听端口: {port}")
-
-    health_server = await asyncio.start_server(health_check, '0.0.0.0', port)
-    print(f"✅ 健康检查服务已运行在端口 {port}")
-
-    # 初始化数据库（确保表存在）
-    await init_db()
-
-    exchange = ExchangeManager()
-    bot = QuantBot(exchange)
-
-    shutdown_event = asyncio.Event()
-
-    def signal_handler():
-        print("🛑 收到终止信号，正在优雅关闭...")
-        shutdown_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, signal_handler)
-
     try:
-        await asyncio.gather(
-            bot.run(),
-            health_server.serve_forever(),
-            asyncio.Event().wait()
+        print("🔄 Starting main()...")
+        port = int(os.environ.get("PORT", 10000))
+        print(f"🩺 Health check port: {port}")
+
+        # 启动健康检查服务器
+        health_server = await asyncio.start_server(health_check, '0.0.0.0', port)
+        print(f"✅ Health server running on port {port}")
+
+        print("🔌 Initializing exchange...")
+        exchange = ExchangeManager()
+        print("✅ Exchange initialized")
+
+        print("🤖 Initializing bot...")
+        bot = QuantBot(exchange)
+        print("✅ Bot initialized")
+
+        # 注册信号处理
+        shutdown_event = asyncio.Event()
+        def signal_handler():
+            print("🛑 Received shutdown signal")
+            shutdown_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, signal_handler)
+            except NotImplementedError:
+                # Windows 不支持信号处理
+                pass
+
+        print("🚀 Starting bot...")
+        # 将 bot.run() 放入任务
+        bot_task = asyncio.create_task(bot.run())
+        health_task = asyncio.create_task(health_server.serve_forever())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+        # 等待任一任务完成或异常
+        done, pending = await asyncio.wait(
+            [bot_task, health_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED
         )
-    except asyncio.CancelledError:
-        print("🛑 主任务被取消")
-    except Exception as e:
-        print(f"❌ 主程序异常: {e}")
-        traceback.print_exc()
-    finally:
-        print("🧹 正在清理资源...")
+
+        # 取消所有未完成的任务
+        for task in pending:
+            task.cancel()
+        for task in done:
+            if task.exception():
+                print(f"❌ Task failed with exception: {task.exception()}")
+                traceback.print_exception(task.exception())
+
+        print("🧹 Cleaning up...")
         health_server.close()
         await health_server.wait_closed()
         await exchange.close()
-        print("👋 资源清理完成，程序退出")
+        print("👋 Cleanup done, exiting.")
+
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR in main(): {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def run():
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 用户中断")
+        print("🛑 User interrupt")
     except Exception as e:
-        print(f"❌ 程序崩溃: {e}")
+        print(f"❌ Program crashed: {e}")
         traceback.print_exc()
-        raise
+        sys.exit(1)
 
 
 if __name__ == "__main__":
