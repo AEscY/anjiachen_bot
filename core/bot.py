@@ -73,7 +73,8 @@ class RealDataEngine:
         if self._ session:
             await self._session.close ()
            self._ session = None
-logger.info（"4 RealDataEngine session 已关闭"）
+           logger.info（"4 RealDataEngine session 已关闭")
+        
     async def get_fear_greed_index(self):
         now = asyncio.get_event_loop().time()
         if now - self._fear_greed_cache["timestamp"] < self._cache_ttl:
