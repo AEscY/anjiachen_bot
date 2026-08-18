@@ -8,8 +8,8 @@ import os
 import signal
 import traceback
 import sys
-from exchange import ExchangeManager
-from bot import QuantBot
+from core.exchange import ExchangeManager
+from core.bot import QuantBot
 
 # 强制输出启动信息
 print("=" * 50)
