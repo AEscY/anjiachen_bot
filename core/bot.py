@@ -49,23 +49,38 @@ class RealDataEngine:
         self._news_cache = {"sentiment": 0, "headlines": [], "timestamp": 0}
         self._social_cache = {"sentiment": 0, "timestamp": 0}
         self._base_url = "https://cryptocurrency.cv/api"
+        # 创建共享的 aiohttp session（所有请求共用，最后统一关闭）
+        self._session = None
+
+    async def _get_session(self):
+        """懒加载创建共享 session"""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self):
+        """关闭共享 session，释放资源"""
+        if self._session:
+            await self._session.close()
+            self._session = None
+            logger.info("🔌 RealDataEngine session 已关闭")
 
     async def get_fear_greed_index(self):
         now = asyncio.get_event_loop().time()
         if now - self._fear_greed_cache["timestamp"] < self._cache_ttl:
             return self._fear_greed_cache
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.alternative.me/fng/?limit=1",
-                                       timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    data = await resp.json()
-                    if data.get("data"):
-                        item = data["data"][0]
-                        self._fear_greed_cache = {
-                            "value": int(item["value"]),
-                            "classification": item["value_classification"],
-                            "timestamp": now
-                        }
+            session = await self._get_session()
+            async with session.get("https://api.alternative.me/fng/?limit=1",
+                                   timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+                if data.get("data"):
+                    item = data["data"][0]
+                    self._fear_greed_cache = {
+                        "value": int(item["value"]),
+                        "classification": item["value_classification"],
+                        "timestamp": now
+                    }
         except Exception as e:
             logger.warning(f"恐惧贪婪指数获取失败: {e}")
         if now - self._fear_greed_cache["timestamp"] > 1800:
@@ -90,36 +105,36 @@ class RealDataEngine:
         if now - self._news_cache["timestamp"] < 300:
             return self._news_cache
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self._base_url}/news?limit=20",
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        articles = data.get('data', []) if isinstance(data, dict) else data
-                        if not articles:
-                            raise ValueError("No articles")
-                        positive_keywords = ['bull','rally','surge','gain','up','breakthrough','adoption','approve']
-                        negative_keywords = ['bear','crash','drop','down','decline','ban','reject','scam','hack']
-                        sentiment_score = 0
-                        headlines = []
-                        for article in articles[:10]:
-                            title = article.get('title', '').lower()
-                            headlines.append(title[:100])
-                            for word in positive_keywords:
-                                if word in title:
-                                    sentiment_score += 1
-                            for word in negative_keywords:
-                                if word in title:
-                                    sentiment_score -= 1
-                        sentiment_score = max(-10, min(10, sentiment_score)) / 10
-                        self._news_cache = {
-                            'sentiment': sentiment_score,
-                            'headlines': headlines[:5],
-                            'timestamp': now
-                        }
-                        return self._news_cache
+            session = await self._get_session()
+            async with session.get(
+                f"{self._base_url}/news?limit=20",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    articles = data.get('data', []) if isinstance(data, dict) else data
+                    if not articles:
+                        raise ValueError("No articles")
+                    positive_keywords = ['bull','rally','surge','gain','up','breakthrough','adoption','approve']
+                    negative_keywords = ['bear','crash','drop','down','decline','ban','reject','scam','hack']
+                    sentiment_score = 0
+                    headlines = []
+                    for article in articles[:10]:
+                        title = article.get('title', '').lower()
+                        headlines.append(title[:100])
+                        for word in positive_keywords:
+                            if word in title:
+                                sentiment_score += 1
+                        for word in negative_keywords:
+                            if word in title:
+                                sentiment_score -= 1
+                    sentiment_score = max(-10, min(10, sentiment_score)) / 10
+                    self._news_cache = {
+                        'sentiment': sentiment_score,
+                        'headlines': headlines[:5],
+                        'timestamp': now
+                    }
+                    return self._news_cache
         except Exception as e:
             logger.warning(f"cryptocurrency.cv 新闻情绪获取失败: {e}")
         self._news_cache = {'sentiment': 0, 'headlines': [], 'timestamp': now}
@@ -132,20 +147,20 @@ class RealDataEngine:
         if now - self._social_cache["timestamp"] < 300:
             return self._social_cache
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self._base_url}/ai/sentiment?asset={symbols[0].lower()}",
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        score = data.get('score', 0.5)
-                        sentiment = (score - 0.5) * 2
-                        self._social_cache = {
-                            'sentiment': max(-1, min(1, sentiment)),
-                            'timestamp': now
-                        }
-                        return self._social_cache
+            session = await self._get_session()
+            async with session.get(
+                f"{self._base_url}/ai/sentiment?asset={symbols[0].lower()}",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    score = data.get('score', 0.5)
+                    sentiment = (score - 0.5) * 2
+                    self._social_cache = {
+                        'sentiment': max(-1, min(1, sentiment)),
+                        'timestamp': now
+                    }
+                    return self._social_cache
         except Exception as e:
             logger.warning(f"cryptocurrency.cv 社交情绪获取失败: {e}")
         try:
@@ -165,38 +180,38 @@ class RealDataEngine:
         if symbol in self._onchain_cache and now - self._onchain_cache[symbol].get('timestamp', 0) < 300:
             return self._onchain_cache[symbol]
         try:
-            async with aiohttp.ClientSession() as session:
-                coin = symbol.split('/')[0].lower()
-                blockchain_map = {
-                    'btc': 'bitcoin',
-                    'eth': 'ethereum',
-                    'sol': 'solana',
-                    'doge': 'dogecoin',
-                    'ada': 'cardano'
-                }
-                blockchain = blockchain_map.get(coin, 'bitcoin')
-                url = f"{self._base_url}/whale-alerts?blockchain={blockchain}&limit=50"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        alerts = data.get('data', []) if isinstance(data, dict) else data
-                        if alerts and isinstance(alerts, list):
-                            threshold_usd = 500000
-                            whale_txs = [tx for tx in alerts if tx.get('valueUsd', 0) > threshold_usd]
-                            whale_count = len(whale_txs)
-                            netflow = random.uniform(-50, 50)
-                            if whale_count > 3:
-                                netflow += random.uniform(10, 30)
-                            active = random.randint(800, 6000)
-                            hashrate = random.uniform(100, 600)
-                            self._onchain_cache[symbol] = {
-                                'whale_transfers': whale_count,
-                                'exchange_netflow': netflow,
-                                'active_addresses': active,
-                                'hashrate': hashrate,
-                                'timestamp': now
-                            }
-                            return self._onchain_cache[symbol]
+            session = await self._get_session()
+            coin = symbol.split('/')[0].lower()
+            blockchain_map = {
+                'btc': 'bitcoin',
+                'eth': 'ethereum',
+                'sol': 'solana',
+                'doge': 'dogecoin',
+                'ada': 'cardano'
+            }
+            blockchain = blockchain_map.get(coin, 'bitcoin')
+            url = f"{self._base_url}/whale-alerts?blockchain={blockchain}&limit=50"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    alerts = data.get('data', []) if isinstance(data, dict) else data
+                    if alerts and isinstance(alerts, list):
+                        threshold_usd = 500000
+                        whale_txs = [tx for tx in alerts if tx.get('valueUsd', 0) > threshold_usd]
+                        whale_count = len(whale_txs)
+                        netflow = random.uniform(-50, 50)
+                        if whale_count > 3:
+                            netflow += random.uniform(10, 30)
+                        active = random.randint(800, 6000)
+                        hashrate = random.uniform(100, 600)
+                        self._onchain_cache[symbol] = {
+                            'whale_transfers': whale_count,
+                            'exchange_netflow': netflow,
+                            'active_addresses': active,
+                            'hashrate': hashrate,
+                            'timestamp': now
+                        }
+                        return self._onchain_cache[symbol]
         except Exception as e:
             logger.warning(f"cryptocurrency.cv 链上数据获取失败: {e}，使用模拟数据")
         if symbol not in self._onchain_cache or now - self._onchain_cache[symbol]['timestamp'] > 300:
