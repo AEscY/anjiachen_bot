@@ -59,11 +59,15 @@ class RealDataEngine:
         return self._session
 
     async def close(self):
-        """关闭共享 session，释放资源"""
-        if self._session:
-            await self._session.close()
-            self._session = None
-            logger.info("🔌 RealDataEngine session 已关闭")
+        """优雅关闭，释放所有资源"""
+        logger.info("🧹 正在关闭机器人资源...")
+        # 关闭 RealDataEngine 的 aiohttp session
+        if hasattr(self, 'real_data'):
+            await self.real_data.close()
+        # 关闭 WebSocket
+        if hasattr(self, 'ws'):
+            await self.ws.stop()
+        logger.info("✅ 机器人资源已释放")
 
     async def get_fear_greed_index(self):
         now = asyncio.get_event_loop().time()
