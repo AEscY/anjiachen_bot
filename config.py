@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     TG_BOT_TOKEN: str = Field(default="", description="Telegram Bot Token")
     TG_CHAT_ID: str = Field(default="", description="Telegram 通知接收 ID")
     IS_SANDBOX: bool = Field(default=True, description="是否为模拟盘模式")
+    LIVE_TRADING_CONFIRM: bool = Field(default=False, description="关闭模拟盘前必须显式确认")
     SYMBOL: str = Field(default="ETH/USDT", description="默认交易对")
     PORT: int = Field(default=10000, description="Web 服务端口")
     ALLOWED_USERS: str = Field(default="", description="白名单用户 ID（逗号分隔）")

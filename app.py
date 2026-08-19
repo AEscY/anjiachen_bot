@@ -16,7 +16,7 @@ print("=" * 50)
 print("Starting UltimateBot...")
 print(f"Python version: {sys.version}")
 print(f"Working directory: {os.getcwd()}")
-print(f"Environment variables present: {list(os.environ.keys())}")
+print(f"Environment configuration loaded: {'yes' if os.environ else 'no'}")
 print("=" * 50)
 sys.stdout.flush()
 
@@ -95,9 +95,12 @@ async def main():
         for task in pending:
             task.cancel()
         for task in done:
-            if task.exception():
-                print(f"❌ Task failed with exception: {task.exception()}")
-                traceback.print_exception(task.exception())
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc:
+                print(f"❌ Task failed with exception: {exc}")
+                traceback.print_exception(exc)
 
         print("🧹 Cleaning up...")
         health_server.close()
