@@ -1,7 +1,6 @@
 """
-UltimateBot v14.0 - 精简现货低吸高卖引擎
-移除：资金费率套利、三角套利、高级策略模块、复杂信号堆砌
-增强：趋势过滤器、动态仓位、数据库连接池
+UltimateBot v14.1 - 精简现货低吸高卖引擎 + 市场自适应
+新增：轻量级自适应调节器（根据波动/趋势动态调整阈值、仓位、止盈止损）
 """
 import asyncio
 import aiohttp
@@ -137,6 +136,14 @@ class QuantBot:
         self.allowed = {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()} if raw else set()
         self.env_tag = "🧪 (模拟盘)" if settings.IS_SANDBOX else "🔴 (实盘)"
         self.coin_configs = {}
+
+        # ---------- 新增：自适应参数 ----------
+        self._adaptive_state = 'neutral'
+        self._adaptive_tp_factor = 1.0
+        self._adaptive_sl_factor = 1.0
+        self._adaptive_score_offset = 0
+        self._adaptive_amount_factor = 1.0
+        self._adaptive_update_time = 0
 
         # Telegram 应用
         self.tg_app = None
@@ -338,7 +345,7 @@ class QuantBot:
             self.entry_details = state.get('entry_details', {})
             self._daily_start_equity = float(state.get('daily_start_equity', 0))
             self._today_loss_usdt = float(state.get('today_loss_usdt', 0))
-        logger.info("✅ UltimateBot v14.0 精简版启动")
+        logger.info("✅ UltimateBot v14.1 自适应精简版启动")
 
     async def _save_runtime_state(self):
         state = {
@@ -383,10 +390,62 @@ class QuantBot:
             self._tech_cache_time[key] = now
         return tech
 
-    # ---------- 核心信号（精简5因子） ----------
+    # ---------- 新增：自适应参数更新 ----------
+    async def _update_market_adaptive_params(self, sym: str):
+        """根据技术指标更新自适应参数（每5分钟）"""
+        now = time.time()
+        if now - self._adaptive_update_time < 300:
+            return
+        tech = await self._get_cached_tech(sym, self.timeframe, 50)
+        if not tech:
+            return
+
+        atr = tech.get('atr', 0)
+        bb_mid = tech.get('bb_middle', 0)
+        bb_width = tech.get('bandwidth_pct', 0) / 100
+        trend = tech.get('trend_strength', 0)
+        volatility = atr / bb_mid if bb_mid > 0 else 0
+
+        # 状态判定
+        if volatility > 0.05:
+            state = 'volatile'
+        elif volatility < 0.01 and bb_width < 0.02:
+            state = 'ultra_low'
+        elif abs(trend) > 0.02:
+            state = 'trending'
+        else:
+            state = 'ranging'
+
+        # 参数映射
+        if state == 'volatile':
+            tp_f, sl_f, off, amt_f = 1.2, 1.5, 8, 0.6
+        elif state == 'trending':
+            if trend > 0:
+                tp_f, sl_f, off, amt_f = 1.5, 1.2, 10, 0.5
+            else:
+                tp_f, sl_f, off, amt_f = 1.2, 1.4, 8, 0.4
+        elif state == 'ranging':
+            tp_f, sl_f, off, amt_f = 1.0, 1.0, 0, 1.0
+        elif state == 'ultra_low':
+            tp_f, sl_f, off, amt_f = 0.8, 0.7, -5, 0.8
+        else:
+            tp_f, sl_f, off, amt_f = 1.0, 1.0, 0, 1.0
+
+        self._adaptive_state = state
+        self._adaptive_tp_factor = tp_f
+        self._adaptive_sl_factor = sl_f
+        self._adaptive_score_offset = off
+        self._adaptive_amount_factor = amt_f
+        self._adaptive_update_time = now
+        logger.info(f"📊 自适应状态: {state} (波动{volatility:.2%}, 趋势{trend:.2%})")
+
+    # ---------- 核心信号（精简5因子 + 自适应调节） ----------
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
         if tech is None:
             return {'should_open': False, 'score': 50, 'details': ['技术指标缺失']}
+
+        # 更新自适应参数（每5分钟）
+        await self._update_market_adaptive_params(sym)
 
         # 1. RSI评分
         rsi = tech.get('rsi', 50)
@@ -429,25 +488,36 @@ class QuantBot:
         vol = ticker.get('volume', 0) if ticker else 0
         vol_score = 50 + min(20, (vol / 1000) * 0.5)
 
+        # 综合评分
         total_score = (rsi_score * 0.25 + bb_score * 0.25 + ofi_score * 0.20 +
                        vol_score * 0.15 + 50 * 0.15) - trend_penalty
         total_score = max(0, min(100, total_score))
 
-        threshold = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
+        # 自适应阈值偏移
+        base_threshold = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
+        threshold = base_threshold + self._adaptive_score_offset
+        threshold = max(40, min(95, threshold))
+
         should_open = total_score >= threshold and trend_penalty < 30
 
+        # 自适应仓位
+        base_amount = self._calculate_dynamic_amount(self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt))
+        adjusted_amount = base_amount * self._adaptive_amount_factor
+
         details = [f"RSI:{rsi:.0f}", f"BB:{bb_score:.0f}", f"OFI:{ofi_score:.0f}",
-                   f"趋势:{trend_strength:.2%}", f"惩罚:{trend_penalty}"]
+                   f"趋势:{trend_strength:.2%}", f"惩罚:{trend_penalty}", f"状态:{self._adaptive_state}"]
 
         return {
             'should_open': should_open,
             'score': total_score,
             'details': details,
-            'amount': self._calculate_dynamic_amount(self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt)),
-            'state': 'trending' if trend_strength > 0.02 else 'ranging'
+            'amount': adjusted_amount,
+            'state': self._adaptive_state,
+            'adaptive_offset': self._adaptive_score_offset,
+            'adaptive_factor': self._adaptive_amount_factor
         }
-
-    # ---------- 自动交易主循环 ----------
+        
+        # ---------- 自动交易主循环 ----------
     async def _auto_trade_monitor(self):
         await asyncio.sleep(10)
         while True:
@@ -599,8 +669,17 @@ class QuantBot:
 
                         entry = self._weighted_entry(sym) or self.entries.get(sym, p)
                         detail = self.entry_details.get(sym, {})
-                        tp = detail.get('dyn_tp', self._get_coin_param(sym, 'tp_pct', self.tp_pct))
-                        sl = detail.get('dyn_sl', self._get_coin_param(sym, 'sl_pct', self.sl_pct))
+                        # 自适应止盈止损
+                        base_tp = self._get_coin_param(sym, 'tp_pct', self.tp_pct)
+                        base_sl = self._get_coin_param(sym, 'sl_pct', self.sl_pct)
+                        tp = base_tp * self._adaptive_tp_factor
+                        sl = base_sl * self._adaptive_sl_factor
+                        # 限制范围
+                        tp = max(self.breakeven_pct, min(0.06, tp))
+                        sl = max(0.002, min(0.04, sl))
+                        if tp / sl < 1.2:
+                            tp = sl * 1.2
+
                         high = self._trailing_high.get(sym, entry)
 
                         profit_pct = (p - entry) / entry * 100
@@ -778,6 +857,7 @@ class QuantBot:
             f"今日交易 {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}",
             f"日亏损 {self._today_loss_pct*100:.1f}% / {self.max_daily_loss_pct*100:.0f}%",
             f"回撤 {self.max_drawdown_pct*100:.0f}% | 暂停 {'是' if self._is_paused else '否'}",
+            f"自适应状态: {self._adaptive_state} (偏移{self._adaptive_score_offset:+d}分, 仓位{self._adaptive_amount_factor:.2f}x)",
         ]
         await update.effective_message.reply_text("\n".join(lines))
 
@@ -796,6 +876,7 @@ class QuantBot:
             status = "🎯 可开仓" if decision['should_open'] else "⏳ 等待"
             lines.append(f"{sym}: {p:.2f} | 评分{decision['score']:.0f} | {status}")
             lines.append(f"   {', '.join(decision['details'])}")
+            lines.append(f"   偏移{decision.get('adaptive_offset',0):+d}分, 仓位{decision.get('adaptive_factor',1.0):.2f}x")
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_holdings(self, update, context):
@@ -993,7 +1074,8 @@ class QuantBot:
             f"总手续费: {await get_total_fees():.4f}U",
             f"总净利: {await get_total_net_profit():.4f}U",
             f"连续亏损: {self._consecutive_losses}",
-            f"市场状态: {'暂停' if self._is_paused else '正常'}"
+            f"市场状态: {'暂停' if self._is_paused else '正常'}",
+            f"自适应状态: {self._adaptive_state}",
         ]
         await update.effective_message.reply_text("\n".join(lines))
 
@@ -1089,12 +1171,13 @@ class QuantBot:
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ UltimateBot v14.0 启动成功")
+                logger.info("✅ UltimateBot v14.1 自适应版启动成功")
                 if settings.TG_CHAT_ID:
                     await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID,
-                        text="🚀 **UltimateBot v14.0 精简低吸高卖引擎已启动**\n\n"
-                             "⚡ 核心功能: 现货网格低吸高卖\n"
+                        text="🚀 **UltimateBot v14.1 自适应低吸高卖引擎已启动**\n\n"
+                             "⚡ 核心功能: 现货网格低吸高卖 + 市场自适应\n"
                              "🛡️ 趋势过滤已启用\n"
+                             "📊 根据波动/趋势动态调仓\n"
                              "📌 发送 /autotrade on 启动交易")
                 while True:
                     await asyncio.sleep(30)
