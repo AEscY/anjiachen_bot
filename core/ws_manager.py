@@ -9,7 +9,6 @@ except ImportError:
     ccxt_pro = None
 from config import settings, logger
 
-
 class WSDataManager:
     def __init__(self, exchange_rest):
         self.rest = exchange_rest
@@ -95,7 +94,6 @@ class WSDataManager:
                 wait = min(60, 2 ** min(attempt, 6))
                 logger.info(f"🔄 等待 {wait}s 后重连 Ticker...")
                 await asyncio.sleep(wait)
-                # 不关闭共享 exchange；ccxt.pro 的 watch_* 会在底层连接断开后自动重连。
 
     async def _watch_single_orderbook(self, symbol, limit=5):
         if self.exchange is None:
@@ -133,7 +131,6 @@ class WSDataManager:
                 wait = min(60, 2 ** min(attempt, 6))
                 logger.info(f"🔄 订单簿 {symbol} 等待 {wait}s 后重连...")
                 await asyncio.sleep(wait)
-                # 不重建共享 exchange，避免影响 ticker 任务。
 
     async def watch_orderbooks(self, symbols, limit=5):
         for task in self._orderbook_tasks:
