@@ -155,6 +155,19 @@ async def main():
         print("🧹 Cleaning up...")
         health_server.close()
         await health_server.wait_closed()
+
+        # 必须先停 WebSocket：它用的是 ccxt.pro 的独立 exchange 实例
+        # （在 ws_manager 内部自己创建的），不归外面的 exchange 管。
+        # 只关 exchange 会让 WS 的连接残留，日志报
+        # "Unclosed client session" / "okx requires ... .close()"。
+        try:
+            ws = getattr(bot, "ws", None)
+            if ws is not None and hasattr(ws, "stop"):
+                await ws.stop()
+                print("🛑 WebSocket 已停止")
+        except Exception as e:
+            print(f"⚠️ 停止 WebSocket 时出错(可忽略): {e}")
+
         await exchange.close()
         print("👋 Cleanup done, exiting.")
 
