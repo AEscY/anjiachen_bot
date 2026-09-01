@@ -1765,7 +1765,9 @@ class QuantBot:
 
         # 原实现在内层写了 'while True: await asyncio.sleep(30)'，
         # 导致外层 try/except 永远等不到异常 —— 断线后既不重连也不清理，静默假死。
+        consecutive_failures = 0          # 连续失败次数，用于指数退避
         while True:
+            wait = 5                       # 本次循环结束后的等待秒数
             try:
                 self.mark_alive()          # 每次循环刷新心跳
                 await self.tg_app.initialize()
@@ -1778,17 +1780,53 @@ class QuantBot:
                              "⚡ 现货低吸高卖 + 市场自适应\n"
                              "🛡️ 趋势过滤 / 回撤熔断已启用\n"
                              "📌 发送 /autotrade on 启动交易")
-                # 阻塞直到 updater 停止；polling 出错时 idle() 会返回，异常交由外层处理
-                await self.tg_app.updater.idle()
+                # 阻塞直到 updater 停止。
+                #
+                # PTB v20 已移除 Updater.idle()（那是 v13 的同步 API），
+                # 直接调用会抛 'Updater' object has no attribute 'idle'。
+                # 改为轮询 running 状态，并顺带检测后台 polling 任务是否意外结束：
+                #   1) 正常停止 → running 变 False，退出循环走重连
+                #   2) polling 崩溃 → 抛出真实异常，由外层 except 捕获后重连
+                #   3) 每轮刷新心跳 —— 这一点很重要，否则长时间阻塞期间
+                #      健康检查会因心跳不更新而误判为"假活"
+                polling_task = getattr(self.tg_app.updater,
+                                      "_Updater__polling_task", None)
+                while getattr(self.tg_app.updater, "running", False):
+                    if polling_task is not None and polling_task.done():
+                        exc = (polling_task.exception()
+                               if not polling_task.cancelled() else None)
+                        if exc is not None:
+                            raise exc      # 交给外层，触发重连
+                        break
+                    self.mark_alive()
+                    await asyncio.sleep(1)
+                consecutive_failures = 0  # 成功启动，重置退避计数
                 logger.warning("⚠️ Telegram updater 已停止，准备重连")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Bot 断开: {e}")
+                consecutive_failures += 1
+                is_conflict = "Conflict" in type(e).__name__ or "Conflict" in str(e)
+                if is_conflict:
+                    # 另一个实例正在 getUpdates（常见于 Render 滚动重启时
+                    # 新旧实例短暂重叠）。此时狂试毫无意义 —— 只会让两边
+                    # 互相踢对方，陷入死循环。必须退避，等旧实例彻底退出。
+                    wait = min(30 * consecutive_failures, 180)
+                    logger.warning(
+                        f"⚠️ 检测到多实例冲突(Conflict)：另一个进程正在轮询。"
+                        f"第 {consecutive_failures} 次，退避 {wait}s 后重试。"
+                        f"若持续出现，请确认只有一个实例在运行。")
+                else:
+                    wait = min(5 * consecutive_failures, 60)
+                    logger.error(f"Bot 断开: {e}（第 {consecutive_failures} 次，{wait}s 后重连）")
             finally:
                 # 无论正常停止还是异常，都彻底清理，避免反复 initialize 造成句柄泄漏
                 await self._shutdown_telegram()
-            await asyncio.sleep(5)
+
+            # 退避等待；期间持续刷新心跳，避免被健康检查误判为假死
+            for _ in range(int(wait)):
+                self.mark_alive()
+                await asyncio.sleep(1)
 
     async def _shutdown_telegram(self):
         """幂等关闭 Telegram 应用；任一步失败都不影响下一次重连。"""
