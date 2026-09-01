@@ -3,7 +3,6 @@ indicators.py - 技术指标计算（增加趋势强度）
 """
 import pandas as pd
 import numpy as np
-from config import logger
 
 class TechnicalEngine:
     def __init__(self, exchange):

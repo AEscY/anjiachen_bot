@@ -4,27 +4,31 @@ UltimateBot v14.1 - 精简现货低吸高卖引擎 + 市场自适应
 """
 import asyncio
 import aiohttp
-import os
 import json
-import aiosqlite
 import time
-import math
-import numpy as np
 from datetime import datetime, timezone, timedelta
-from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from config import settings, logger
 from core.indicators import TechnicalEngine
+from core.risk import RiskManager
+from core.signals import SignalEngine, ScoreEngine
 from core.ws_manager import WSDataManager
 from storage import (
     init_db, load_config, save_config, load_trades, save_trade,
     save_trade_detail, get_recent_performance, get_today_trades,
     export_db_to_json, save_runtime_state, load_runtime_state,
-    get_total_fees, get_total_net_profit
+    get_total_fees, get_total_net_profit, now_parts
 )
 
 CST = timezone(timedelta(hours=8))
+
+# 允许的交易周期（原实现接受任意字符串，拼错会静默拉不到 K 线）
+VALID_TIMEFRAMES = {
+    '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w'
+}
+# 监控币种上限：每个币种都会占用 WebSocket 订阅与 REST 轮询配额
+MAX_SYMBOLS = 20
 
 # ==================== 实时数据引擎（简化为仅恐惧贪婪） ====================
 class RealDataEngine:
@@ -71,47 +75,71 @@ class QuantBot:
         self.ws = WSDataManager(exchange)
         self.tech = TechnicalEngine(exchange)
         self.real_data = RealDataEngine(exchange, self.ws)
-        self.lock = asyncio.Lock()
 
-        # 基础配置（从数据库加载）
+        # 网格引擎与执行层（网格模式下使用）
+        from core.grid import GridEngine
+        from core.execution import OrderExecutor
+        self.grid = GridEngine(self, exchange)
+        self.executor = OrderExecutor(exchange, self.grid, self)
+        self._last_atr_pct = 0.0
+        # 网格全局锁：保护配置与运行时状态的写入
+        self.lock = asyncio.Lock()
+        # 按币种串行锁：_auto_trade_monitor(买) 与 _trailing_monitor(卖) 并发读写同一份
+        # position_lots 账本，下单的网络 I/O 之间存在竞态窗口，可能导致超卖或
+        # ValueError 触发永久暂停。按币种加锁保证同币种操作串行，不同币种仍并行。
+        self._symbol_locks: dict = {}
+        self._symbol_locks_guard = asyncio.Lock()
+
+        # 基础配置：所有可调参数统一从 params 注册表取默认值。
+        # 新增参数只需在 core/params.py 加一行，无需改动此处。
+        from core.params import defaults as _param_defaults
+        for _k, _v in _param_defaults().items():
+            setattr(self, _k, _v)
+
+        # 非参数的运行时状态（不进注册表）
         self.symbols = [settings.SYMBOL, "BTC/USDT", "SOL/USDT"]
-        self.tp_pct = 0.015
-        self.sl_pct = 0.01
-        self.trailing_sl_pct = 0.005
-        self.trailing_tp_pct = 0.003
-        self.single_order_usdt = 1.0
         self.timeframe = "5m"
-        self.reserve_bottom = 10
-        self.max_daily_trades = 20
         self.auto_trade_enabled = False
-        self.auto_min_score = 65
-        self.max_per_coin_usdt = 50
-        self.max_daily_loss_pct = 0.05
-        self.max_total_allocated_pct = 0.8
-        self.max_drawdown_pct = 0.12
-        self.max_positions_per_coin = 8
         self.orderbook_filter = True
-        self.waterfall_breaker = True
+        self.single_order_usdt = 1.0        # 单次模式单笔额度（U）
+        self.max_single_order_pct = 0.10    # 单笔硬上限 10%
 
         # 运行时状态
         self.is_running = True
         self.trades = []
         self.entries = {}
-        self.position_lots = {}          # FIFO账本
+        self.position_lots = {}          # FIFO账本（单次模式）
+        self._ready = False               # 健康检查用：初始化完成才算就绪
+        self._last_alive = None           # 主循环心跳时间戳
+
+        # 启动对账：比对交易所真实余额与本地账本，
+        # 防止数据库丢失后机器人"以为空仓"而重复买入、止损失效
+        from core.reconcile import Reconciler
+        self.reconciler = Reconciler(self)
+
+        # 自动备份：定时导出数据库，并在数据丢失时自动从备份恢复
+        from core.backup import BackupManager
+        self.backup_mgr = BackupManager(
+            lambda: storage.DB_FILE,
+            uploader=self._upload_backup,   # 推到 Telegram，避免本地盘一锅端
+            upload_every=4,                 # 6h×4 = 每天推一次
+        )
+        self._stop_backup = None
         self.position_counts = {}
         self._trailing_high = {}
         self.entry_details = {}
-        self.daily_trades = 0
         self.last_reset_day = datetime.now(CST).date().isoformat()
-        self._consecutive_losses = 0
-        self._today_loss_pct = 0.0
-        self._today_loss_usdt = 0.0
-        self._daily_start_equity = 0.0
-        self._is_paused = False
-        self._drawdown_safe_flag = True
-        self.peak_total_value = 0
 
-        # 缓存
+        # 市场自适应（按波动/趋势动态调阈值与仓位）
+        # 这些是随行情推导出的运行中状态，不是用户配置，故不进参数注册表
+        self._adaptive_state = 'neutral'
+        self._adaptive_tp_factor = 1.0
+        self._adaptive_sl_factor = 1.0
+        self._adaptive_score_offset = 0
+        self._adaptive_amount_factor = 1.0
+        self._adaptive_update_time = 0.0
+
+        # 缓存（余额与指标的本地缓存，避免频繁打交易所接口）
         self._cached_balances = {}
         self._cached_usdt_free = 0.0
         self._balance_cache_time = 0
@@ -121,73 +149,40 @@ class QuantBot:
         self._tech_cache_ttl = 30
         self._price_history = {}
 
-        # AI 分析（简化）
-        self.ai_insight = {"timestamp": 0, "summary": "等待分析", "recommendation": "观望", "score": 50}
-        self.ai_enabled = False
-
         # 费率
         self.taker_fee = settings.TAKER_FEE
         self.maker_fee = settings.MAKER_FEE
         self.min_profit_margin = settings.MIN_PROFIT_MARGIN
         self.breakeven_pct = (self.taker_fee * 2) + self.min_profit_margin
 
+        # 风控状态统一由 RiskManager 承载，此处保留向后兼容的属性代理
+        self.risk = RiskManager(self, alert=self._alert)
+
         # Telegram 权限
         raw = settings.ALLOWED_USERS
-        self.allowed = {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()} if raw else set()
+        self.allowed = ({int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
+                        if raw else set())
         self.env_tag = "🧪 (模拟盘)" if settings.IS_SANDBOX else "🔴 (实盘)"
         self.coin_configs = {}
-
-        # ---------- 新增：自适应参数 ----------
-        self._adaptive_state = 'neutral'
-        self._adaptive_tp_factor = 1.0
-        self._adaptive_sl_factor = 1.0
-        self._adaptive_score_offset = 0
-        self._adaptive_amount_factor = 1.0
-        self._adaptive_update_time = 0
 
         # Telegram 应用
         self.tg_app = None
         if settings.TG_BOT_TOKEN:
             self._init_telegram()
 
-    def _init_telegram(self):
-        self.tg_app = ApplicationBuilder().token(settings.TG_BOT_TOKEN).build()
-        handlers = [
-            CommandHandler("start", self.cmd_menu),
-            CommandHandler("menu", self.cmd_menu),
-            CommandHandler("status", self.cmd_status),
-            CommandHandler("check", self.cmd_check),
-            CommandHandler("holdings", self.cmd_holdings),
-            CommandHandler("panic", self.cmd_panic),
-            CommandHandler("autotrade", self.cmd_autotrade),
-            CommandHandler("settp", self.cmd_set_tp),
-            CommandHandler("setsl", self.cmd_set_sl),
-            CommandHandler("settsl", self.cmd_set_tsl),
-            CommandHandler("settmpt", self.cmd_set_trailing_tp),
-            CommandHandler("setamount", self.cmd_set_amount),
-            CommandHandler("settf", self.cmd_set_tf),
-            CommandHandler("setreserve", self.cmd_set_reserve),
-            CommandHandler("addsymbol", self.cmd_add_symbol),
-            CommandHandler("delsymbol", self.cmd_del_symbol),
-            CommandHandler("setmaxpos", self.cmd_set_max_pos),
-            CommandHandler("setmaxalloc", self.cmd_set_max_alloc),
-            CommandHandler("setmaxloss", self.cmd_set_max_loss),
-            CommandHandler("setmaxcoin", self.cmd_set_max_coin),
-            CommandHandler("autoscore", self.cmd_autoscore),
-            CommandHandler("stats", self.cmd_stats),
-            CommandHandler("backup", self.cmd_backup),
-            CommandHandler("help", self.cmd_help),
-        ]
-        for h in handlers:
-            self.tg_app.add_handler(h)
-        self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
-        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
-
     # ---------- 辅助函数 ----------
     def _auth(self, update: Update):
         if not self.allowed:
             return settings.IS_SANDBOX
         return update.effective_user.id in self.allowed
+
+    async def _sym_lock(self, sym: str) -> asyncio.Lock:
+        """获取（必要时创建）某币种的串行锁。"""
+        if sym not in self._symbol_locks:
+            async with self._symbol_locks_guard:
+                if sym not in self._symbol_locks:
+                    self._symbol_locks[sym] = asyncio.Lock()
+        return self._symbol_locks[sym]
 
     def _get_coin_param(self, sym, key, default):
         return self.coin_configs.get(sym, {}).get(key, default)
@@ -242,7 +237,9 @@ class QuantBot:
             self.position_lots.pop(sym, None)
             self.entries.pop(sym, None)
             self.entry_details.pop(sym, None)
-            self._trailing_high[sym] = 0
+            # 原实现写入 0 而非删除：下次 _trailing_high.get(sym, entry) 会拿到 0，
+            # 导致 'p <= high*(1-ttp)' 恒为 False，移动止盈/止损静默失效
+            self._trailing_high.pop(sym, None)
         net_pnl = float(exit_revenue) - realized_cost - realized_fee_buy - float(sell_fee or 0)
         return net_pnl, realized_cost, realized_fee_buy
 
@@ -258,22 +255,29 @@ class QuantBot:
     async def _round_amount_by_precision(self, symbol, amount):
         return await self.exchange._prepare_amount(symbol, amount)
 
-    def _calculate_dynamic_amount(self, base_amount=0.5):
-        total_balance = self._cached_usdt_free
+    def _total_equity_usdt(self) -> float:
+        """账户总权益（USDT 现货 + 各币种按现价折算）。_tickers 为空时退化为可用 USDT。"""
+        total = float(self._cached_usdt_free or 0)
         for coin, val in self._cached_balances.items():
             if coin == 'USDT' or not isinstance(val, dict):
                 continue
             ticker = self.ws.get_ticker(coin + "/USDT")
             if ticker:
-                total_balance += float(val.get('free', 0)) * ticker.get('last', 0)
+                total += float(val.get('free', 0)) * float(ticker.get('last', 0))
+        return total
+
+    def _calculate_dynamic_amount(self, base_amount=1.0):
+        """
+        单笔额度 = max(下限, 总权益 × 单笔占比)，并受单笔占比上限约束。
+        原实现是阶梯常量：资金 100U 与 100000U 都只买 2U，大资金利用率极低。
+        """
+        total_balance = self._total_equity_usdt()
         if total_balance < 10:
             return max(0.1, base_amount * 0.3)
-        elif total_balance < 50:
-            return max(0.3, base_amount * 0.8)
-        elif total_balance < 100:
-            return base_amount
-        else:
-            return base_amount * 2
+        proportional = total_balance * self.single_order_pct
+        floor = base_amount * 0.5
+        cap = total_balance * self.max_single_order_pct
+        return max(floor, min(proportional, cap))
 
     async def _allocation_used_usdt(self):
         used = 0.0
@@ -282,13 +286,7 @@ class QuantBot:
         return max(0.0, used)
 
     async def _can_allocate(self, additional_usdt):
-        balance = self._cached_usdt_free
-        for coin, val in self._cached_balances.items():
-            if coin == 'USDT' or not isinstance(val, dict):
-                continue
-            ticker = self.ws.get_ticker(coin + "/USDT")
-            if ticker:
-                balance += float(val.get('free', 0)) * ticker.get('last', 0)
+        balance = self._total_equity_usdt()
         if balance <= 0:
             return False
         used = await self._allocation_used_usdt()
@@ -303,80 +301,389 @@ class QuantBot:
             self._daily_start_equity = 0.0
             self._consecutive_losses = 0
             self.last_reset_day = today
-        if self._consecutive_losses >= 4:
-            if time.time() - getattr(self, '_last_pause_time', 0) > 3600:
-                self._consecutive_losses = 0
-                self._is_paused = False
-            else:
+
+        # ---- 1) 回撤熔断：此前只在 _risk_monitor_task 里算了标志位，从不阻止开仓 ----
+        if not self._drawdown_safe_flag:
+            if not self._drawdown_alerted:
+                await self._alert(
+                    f"⛔ 回撤达上限 {self.max_drawdown_pct*100:.0f}%，禁止新开仓（平仓逻辑不受影响）",
+                    "critical",
+                )
+                self._drawdown_alerted = True
+            return False
+        self._drawdown_alerted = False
+
+        # ---- 2) 连续亏损熔断：_last_pause_time 此前从未写入，导致条件恒真、熔断形同虚设 ----
+        if self._consecutive_losses >= self.max_consecutive_losses:
+            if self._last_pause_time <= 0:
+                # 首次触发：记录时间并进入冷静期
+                self._last_pause_time = time.time()
+                self._is_paused = True
+                await self._alert(
+                    f"⛔ 连续亏损 {self._consecutive_losses} 笔，进入 {self.consecutive_loss_cooldown//60} 分钟冷静期",
+                    "critical",
+                )
                 return False
+            elapsed = time.time() - self._last_pause_time
+            if elapsed >= self.consecutive_loss_cooldown:
+                # 冷静期结束：复位
+                self._consecutive_losses = 0
+                self._last_pause_time = 0
+                self._is_paused = False
+                await self._alert("✅ 连续亏损冷静期结束，恢复交易", "info")
+            else:
+                remain = int(self.consecutive_loss_cooldown - elapsed)
+                if remain % 600 < 10:   # 避免每 10s 刷屏
+                    await self._alert(f"⏳ 冷静期剩余 {remain//60} 分钟", "warning")
+                return False
+
+        # ---- 3) 日内亏损熔断 ----
         if self._today_loss_pct >= self.max_daily_loss_pct:
             if not self._is_paused:
                 await self._alert(f"⛔ 日亏损达 {self._today_loss_pct*100:.1f}%，暂停交易", "critical")
                 self._is_paused = True
             return False
+
         return True
 
     async def _alert(self, message, level="warning"):
         emoji = {"info":"ℹ️","warning":"⚠️","critical":"🚨"}
+        # 无论推送成功与否都落日志，避免告警在推送失败时被完全吞掉
+        log = logger.warning if level != "info" else logger.info
+        log(f"[{level}] {message}")
         if settings.TG_CHAT_ID and self.tg_app:
             try:
                 await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID, text=f"{emoji.get(level,'⚠️')} **系统告警**\n{message}", parse_mode="Markdown")
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"告警推送失败: {e}")
 
     # ---------- 加载与保存 ----------
     async def load_and_init(self):
+        # 恢复必须在读库之前：若检测到数据丢失，先用最近备份回填
+        try:
+            restored, note = await self.backup_mgr.restore_if_needed()
+            if restored:
+                logger.warning(f"♻️ {note}")
+                self._pending_restore_note = note
+            elif note:
+                logger.info(f"ℹ️ {note}")
+        except Exception as e:
+            logger.warning(f"备份恢复检查失败，继续启动: {e}")
+
         await init_db()
         cfg = await load_config()
+
+        # 注册表参数：按声明的类型与范围校验后再套用，
+        # 损坏的配置项回退默认值，不会像从前那样导致整份配置丢失
+        from core.params import PARAMS, parse
         for key, val in cfg.items():
-            if hasattr(self, key):
+            if key not in PARAMS:
+                continue
+            spec = PARAMS[key]
+            if isinstance(val, (bool, int, float, str)) and type(val) is spec.ptype:
                 setattr(self, key, val)
-        self.symbols = cfg.get('symbols', [settings.SYMBOL, "BTC/USDT", "SOL/USDT"])
+                continue
+            parsed, err = parse(key, val)
+            if err:
+                logger.warning(f"配置项 {key}={val!r} 无效({err})，使用默认 "
+                               f"{spec.default}")
+                setattr(self, key, spec.default)
+            else:
+                setattr(self, key, parsed)
+
+        # 非注册表项
+        for key in ('timeframe', 'auto_trade_enabled', 'orderbook_filter',
+                    'single_order_usdt'):
+            if key in cfg:
+                setattr(self, key, cfg[key])
+        self.symbols = cfg.get('symbols') or [settings.SYMBOL, "BTC/USDT", "SOL/USDT"]
         self.coin_configs = json.loads(cfg.get('coin_configs', '{}')) if isinstance(cfg.get('coin_configs'), str) else cfg.get('coin_configs', {})
         self.trades = await load_trades()
+
         state = await load_runtime_state()
         if state:
             self.position_counts = state.get('position_counts', {})
             self.entries = state.get('entries', {})
-            self.peak_total_value = state.get('peak_total_value', 0)
-            self.daily_trades = state.get('daily_trades', 0)
             self._trailing_high = state.get('trailing_high', {})
             self.position_lots = state.get('position_lots', {})
             self.entry_details = state.get('entry_details', {})
-            self._daily_start_equity = float(state.get('daily_start_equity', 0))
-            self._today_loss_usdt = float(state.get('today_loss_usdt', 0))
-        logger.info("✅ UltimateBot v14.1 自适应精简版启动")
+            # 风控状态交由 RiskManager 恢复
+            self.risk.from_dict(state.get('risk', {}))
+            # 网格状态
+            grids = state.get('grid_states', {})
+            if isinstance(grids, dict):
+                from core.grid import GridState
+                for sym, gd in grids.items():
+                    gs = GridState.from_dict(gd)
+                    if gs:
+                        self.grid.states[sym] = gs
+        mode = "网格" if self.grid_enabled else "单次低吸高卖"
+        logger.info(f"✅ 启动完成 | 模式: {mode} | 层数 {self.grid_levels} | "
+                    f"间距 {self.grid_spacing_pct*100:.2f}% ({self.grid_spacing_mode}) | "
+                    f"中枢 {self.grid_anchor_mode}")
+
+        # 启动对账：务必在恢复状态之后、开始交易之前
+        await self._startup_reconcile()
+
+        # 从备份恢复的情况要单独告警，提醒用户核对
+        note = getattr(self, "_pending_restore_note", None)
+        if note:
+            await self._alert(f"♻️ **已从备份恢复数据库**\n\n{note}",
+                              level="warning")
+
+        # 启动后台定时备份
+        self._start_backup_loop()
+
+        # 初始化全部完成，健康检查从现在起才报健康
+        self._ready = True
+        self.mark_alive()
+        logger.info("✅ 健康检查已就绪（UptimeRobot 等外部监控可探测真实状态）")
+
+    # ---------- 启动对账 ----------
+
+    async def _startup_reconcile(self):
+        """
+        启动时比对交易所真实余额与本地账本。
+
+        对不上的币种会被暂停交易并推送告警 —— 宁可不跑，
+        也不能在"账本为空但实盘有币"的状态下重复买入。
+        """
+        try:
+            results = await self.reconciler.check_all()
+        except Exception as e:
+            logger.warning(f"启动对账失败，本次不阻塞: {e}")
+            return
+
+        blocking = [r for r in results if r.blocking]
+        drift = [r for r in results if r.level == "drift"]
+
+        if not results:
+            return
+
+        if drift:
+            logger.info(f"🔍 对账轻微偏差 {len(drift)} 项:\n" + self.reconciler.summary())
+
+        if blocking:
+            msg = ("🚨 **启动对账发现持仓不一致**\n\n"
+                   + self.reconciler.summary()
+                   + "\n\n已暂停上述币种交易。"
+                   "请人工核对后，用 `/reconcile` 重新对账，"
+                   "确认无误后用 `/resume` 解除。")
+            await self._alert(msg, level="critical")
+            logger.error(f"🚨 对账阻塞 {len(blocking)} 个币种，已暂停交易")
+        else:
+            ok = sum(1 for r in results if r.level == "ok")
+            logger.info(f"✅ 启动对账通过（{ok}/{len(results)} 一致）")
+
+    # ---------- 备份的上传与恢复 ----------
+
+    # ---------- 健康检查 ----------
+
+    def mark_alive(self):
+        """主循环每转一圈刷新一次心跳。"""
+        self._last_alive = time.time()
+
+    def health_status(self) -> dict:
+        """
+        给健康检查端点用的真实状态。
+
+        背景：原来的健康检查对任意路径无条件返回 200 "OK"，
+        无论机器人内部是否已经卡死。这意味着外部监控（UptimeRobot 等）
+        只能证明"端口开着"，证明不了"机器人在工作"。
+
+        现在会报告：进程是否就绪、距上次心跳多久、Telegram 是否连着。
+        外部监控据此能真正发现"假活" —— 端口通但主循环已停。
+        """
+        now = time.time()
+        last = getattr(self, "_last_alive", None)
+        age = (now - last) if last else None
+
+        tg_up = bool(self.tg_app and getattr(self.tg_app, "running", False)
+                     and self.tg_app.updater
+                     and getattr(self.tg_app.updater, "running", False))
+
+        # 心跳超过 5 分钟没刷新，判定主循环停滞
+        stale = age is not None and age > 300
+        healthy = self._ready and not stale and tg_up
+
+        return {
+            "healthy": healthy,
+            "ready": bool(getattr(self, "_ready", False)),
+            "heartbeat_age": None if age is None else round(age, 1),
+            "telegram": tg_up,
+            "mode": "grid" if self.grid_enabled else "single",
+            "sandbox": bool(settings.IS_SANDBOX),
+            "blocked": sorted(self.reconciler.blocked) if hasattr(self, "reconciler") else [],
+        }
+
+    async def _upload_backup(self, path: str, data: str) -> bool:
+        """把备份文件发到 Telegram —— 免费的异地存储"""
+        try:
+            if not (settings.TG_CHAT_ID and self.tg_app):
+                return False
+            import os
+            await self.tg_app.bot.send_document(
+                chat_id=settings.TG_CHAT_ID,
+                document=data.encode("utf-8"),
+                filename=f"backup_{os.path.basename(path)}",
+                caption="💾 自动备份（数据库丢失时可用 /restore 恢复）",
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"备份推送 Telegram 失败: {e}")
+            return False
+
+    async def cmd_restore(self, update, context):
+        """
+        /restore —— 从 JSON 备份恢复数据库。
+
+        用法：把备份文件（.json）直接发给机器人，并回复 /restore；
+        或在本地把文件放到 backups/ 目录后执行本命令恢复最近一份。
+        """
+        if not self._auth(update):
+            return
+        import glob
+        import os
+        from core.backup import BackupManager
+
+        # 优先用用户随消息发来的文件
+        msg = update.effective_message
+        target = None
+        if msg and msg.document:
+            try:
+                f = await msg.document.get_file()
+                target = await f.download_as_bytearray()
+                target = bytes(target).decode("utf-8")
+            except Exception as e:
+                return await msg.reply_text(f"读取文件失败: {e}")
+
+        if target is None:
+            # 否则取本地最近一份
+            files = sorted(glob.glob(
+                os.path.join(self.backup_mgr._dir(), "bot_*.json")))
+            if not files:
+                return await msg.reply_text(
+                    "本地没有备份文件。\n"
+                    "请把自动备份推送的 .json 文件发给机器人，"
+                    "并回复 /restore 进行恢复。")
+            with open(files[-1], "r", encoding="utf-8") as fp:
+                target = fp.read()
+
+        import storage
+        ok = await storage.import_db_from_json(target)
+        if not ok:
+            return await msg.reply_text("❌ 恢复失败，备份文件可能已损坏")
+
+        # 恢复后立刻重跑对账，防止账本与实盘不符
+        await self.reconciler.check_all()
+        summary = self.reconciler.summary()
+        blocked = self.reconciler.blocked
+        text = ("✅ 数据库已从备份恢复\n\n🔍 恢复后对账：\n" + summary)
+        if blocked:
+            text += ("\n\n⛔ 以下币种已暂停交易，请人工核对后 /resume：\n"
+                     + ", ".join(sorted(blocked)))
+        else:
+            text += "\n\n✅ 对账一致，可直接交易"
+        return await msg.reply_text(text, parse_mode="Markdown")
+
+    async def cmd_resetledger(self, update, context):
+        """
+        /resetledger —— 清空本地持仓账本
+
+        用途：从模拟盘切换到实盘前必须执行。
+        模拟盘跑出的持仓只存在于本地账本，切到实盘后真实账户并没有这些币，
+        对账会判定"本地有账、交易所为0"而暂停交易。
+        本命令把账本清零，让机器人以真实账户为起点重新开始。
+
+        注意：只清内存中的账本并立即落库，不删交易历史。
+        执行后请重启机器人，让它重新对账。
+        """
+        if not self._auth(update):
+            return
+
+        before = {sym: len(lots) for sym, lots in self.position_lots.items() if lots}
+        cleared = sum(before.values())
+
+        self.position_lots.clear()
+        self.position_counts.clear()
+        self.entries.clear()
+        self.entry_details.clear()
+        self._trailing_high.clear()
+        # 网格状态一并清除（模拟盘挂出的网格在实盘账户里不存在）
+        try:
+            self.grid.states.clear()
+        except Exception:
+            pass
+        # 风控计数归零，避免模拟盘的连亏记录延续到实盘
+        try:
+            self.risk.resume()
+        except Exception:
+            pass
+        # 解除对账造成的暂停
+        self.reconciler.clear()
+
+        await self._save_runtime_state()
+
+        if cleared:
+            detail = "、".join(f"{k}×{v}" for k, v in before.items())
+            text = (f"🧹 已清空本地账本（{cleared} 条记录：{detail}）\n\n"
+                    "网格状态与风控计数也已重置。\n"
+                    "**请重启机器人**，让它以真实账户余额为起点重新对账。")
+        else:
+            text = "🧹 本地账本本来就是空的，无需清理。"
+
+        return await update.effective_message.reply_text(text, parse_mode="Markdown")
+
+    def _start_backup_loop(self):
+        """启动后台定时备份（6 小时一次，滚动保留 7 份）"""
+        try:
+            import asyncio as _aio
+            self._stop_backup = _aio.Event()
+            _aio.create_task(self.backup_mgr.loop(self._stop_backup))
+            logger.info("💾 自动备份已开启（间隔 6 小时，保留 7 份）")
+        except Exception as e:
+            logger.warning(f"自动备份启动失败: {e}")
+
+    async def cmd_reconcile(self, update, context):
+        """手动重新对账：/reconcile"""
+        await self.reconciler.check_all()
+        text = "🔍 **持仓对账结果**\n\n" + self.reconciler.summary()
+        blocked = self.reconciler.blocked
+        if blocked:
+            text += "\n\n⛔ 已暂停: " + ", ".join(sorted(blocked))
+            text += "\n\n确认仓位无误后可用 `/resume` 解除暂停。"
+        else:
+            text += "\n\n✅ 无阻塞项"
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def _save_runtime_state(self):
         state = {
             'position_counts': self.position_counts,
             'entries': self.entries,
-            'peak_total_value': self.peak_total_value,
-            'daily_trades': self.daily_trades,
             'trailing_high': self._trailing_high,
+            'risk': self.risk.to_dict(),
+            'grid_states': {s: g.to_dict() for s, g in self.grid.states.items()},
             'entry_details': self.entry_details,
             'position_lots': self.position_lots,
-            'daily_start_equity': self._daily_start_equity,
-            'today_loss_usdt': self._today_loss_usdt,
         }
         await save_runtime_state(state)
 
     async def _save_config(self):
-        cfg = {
-            'tp_pct': self.tp_pct, 'sl_pct': self.sl_pct,
-            'trailing_sl_pct': self.trailing_sl_pct, 'trailing_tp_pct': self.trailing_tp_pct,
-            'single_order_usdt': self.single_order_usdt, 'timeframe': self.timeframe,
-            'reserve_bottom': self.reserve_bottom, 'symbols': self.symbols,
-            'orderbook_filter': self.orderbook_filter, 'waterfall_breaker': self.waterfall_breaker,
-            'max_daily_trades': self.max_daily_trades,
-            'auto_trade_enabled': self.auto_trade_enabled, 'auto_min_score': self.auto_min_score,
-            'max_per_coin_usdt': self.max_per_coin_usdt,
-            'max_daily_loss_pct': self.max_daily_loss_pct,
-            'max_total_allocated_pct': self.max_total_allocated_pct,
-            'max_drawdown_pct': self.max_drawdown_pct,
-            'max_positions_per_coin': self.max_positions_per_coin,
+        """
+        持久化全部可调参数。
+        此前手工罗列参数名，新增参数时极易漏写导致「改了存不住」。
+        改为遍历注册表，新增参数自动纳入持久化。
+        """
+        from core.params import PARAMS
+        cfg = {k: getattr(self, k) for k in PARAMS}
+        # 非注册表的状态项
+        cfg.update({
+            'symbols': self.symbols,
+            'timeframe': self.timeframe,
+            'auto_trade_enabled': self.auto_trade_enabled,
+            'orderbook_filter': self.orderbook_filter,
             'coin_configs': json.dumps(self.coin_configs),
-        }
+        })
         await save_config(cfg)
 
     async def _get_cached_tech(self, sym, timeframe='5m', limit=50):
@@ -488,9 +795,16 @@ class QuantBot:
         vol = ticker.get('volume', 0) if ticker else 0
         vol_score = 50 + min(20, (vol / 1000) * 0.5)
 
-        # 综合评分
+        # 6. 恐惧贪婪因子（此前被硬编码成常数 50，API 请求白跑）
+        #    恐惧(低值)=逢低买入机会好 → 高分；贪婪(高值)=追高风险 → 低分
+        if fg is None:
+            fg_score = 50.0
+        else:
+            fg_score = max(0.0, min(100.0, 100.0 - float(fg)))
+
+        # 综合评分（权重合计 = 1.0）
         total_score = (rsi_score * 0.25 + bb_score * 0.25 + ofi_score * 0.20 +
-                       vol_score * 0.15 + 50 * 0.15) - trend_penalty
+                       vol_score * 0.15 + fg_score * 0.15) - trend_penalty
         total_score = max(0, min(100, total_score))
 
         # 自适应阈值偏移
@@ -505,6 +819,7 @@ class QuantBot:
         adjusted_amount = base_amount * self._adaptive_amount_factor
 
         details = [f"RSI:{rsi:.0f}", f"BB:{bb_score:.0f}", f"OFI:{ofi_score:.0f}",
+                   f"FG:{fg_score:.0f}({'NA' if fg is None else int(fg)})",
                    f"趋势:{trend_strength:.2%}", f"惩罚:{trend_penalty}", f"状态:{self._adaptive_state}"]
 
         return {
@@ -549,6 +864,8 @@ class QuantBot:
                 candidates = []
                 for sym in self.symbols:
                     try:
+                        if self.reconciler.is_blocked(sym):
+                            continue
                         if self.position_counts.get(sym, 0) >= self.max_positions_per_coin:
                             continue
                         if self._bot_position_cost(sym) >= self.max_per_coin_usdt:
@@ -604,8 +921,11 @@ class QuantBot:
                     if rounded <= 0:
                         continue
 
-                    order = await self.exchange.create_market_buy_order(sym, rounded)
-                    if order:
+                    # 与卖出操作串行，避免下单 I/O 期间账本被并发修改
+                    async with await self._sym_lock(sym):
+                        order = await self.exchange.create_market_buy_order(sym, rounded)
+                        if not order:
+                            continue
                         self.daily_trades += 1
                         filled = float(order.get('filled') or 0)
                         avg = float(order.get('average') or p)
@@ -615,14 +935,15 @@ class QuantBot:
                         net_amount = filled - fee if fee_currency == base else filled
                         real_cost = filled * avg + (fee if fee_currency in ('', 'USDT') else 0)
                         if net_amount <= 0 or real_cost <= 0:
-                            self._is_paused = True
-                            await self._alert(f"{sym} 买单异常，已暂停", "critical")
+                            # 原实现直接 _is_paused=True，单次下单抖动即导致机器人永久停摆
+                            await self._alert(f"{sym} 买单异常(filled={filled})，跳过本轮", "critical")
                             continue
 
                         self._append_position_lot(sym, net_amount, avg, filled * avg, fee, fee_currency)
                         self.entry_details[sym] = {'signal_score': score, 'fear_greed': fg}
+                        disp_t, iso_t = now_parts()
                         await save_trade_detail({
-                            'time': datetime.now(CST).strftime("%m-%d %H:%M"), 'symbol': sym, 'side': 'buy',
+                            'time': disp_t, 'ts': iso_t, 'symbol': sym, 'side': 'buy',
                             'price': avg, 'amount': filled, 'signal_score': score, 'fear_greed': fg or 0,
                             'funding_rate': 0, 'pnl_pct': 0, 'real_cost': real_cost,
                             'fee': fee, 'fee_currency': fee_currency, 'order_id': order.get('id','')
@@ -631,12 +952,12 @@ class QuantBot:
                         usdt_free = self._cached_usdt_free
                         await self._save_runtime_state()
                         opened.add(sym)
-                        if settings.TG_CHAT_ID:
+                        if settings.TG_CHAT_ID and self.tg_app:
                             try:
                                 await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID,
                                     text=f"🤖 开仓 {sym} {amount_usdt:.2f}U @ {avg:.4f} 仓位{self.position_counts[sym]}/{self.max_positions_per_coin} | 评分{score:.0f}")
-                            except:
-                                pass
+                            except Exception as e:
+                                logger.warning(f"开仓通知发送失败: {e}")
                     await asyncio.sleep(1)
                 await asyncio.sleep(30)
             except Exception as e:
@@ -681,43 +1002,53 @@ class QuantBot:
                             tp = sl * 1.2
 
                         high = self._trailing_high.get(sym, entry)
+                        if high <= 0:
+                            high = entry          # 部分成交后 high 被误置 0 会导致移动止盈永远失效
 
                         profit_pct = (p - entry) / entry * 100
-                        if profit_pct >= tp * 100 * 0.5:
-                            if p <= high * (1 - self.trailing_tp_pct):
-                                reason = "trailing_tp"
-                                action = 'sell'
-                            else:
-                                action = 'hold'
-                        elif profit_pct <= -sl * 100:
-                            reason = "stop_loss"
-                            action = 'sell'
+                        tsl = self._get_coin_param(sym, 'trailing_sl_pct', self.trailing_sl_pct)
+                        ttp = self._get_coin_param(sym, 'trailing_tp_pct', self.trailing_tp_pct)
+
+                        # 判定顺序：先硬止损 → 完整止盈 → 移动止盈 → 移动止损
+                        # （原实现把 'profit >= tp*0.5' 放在最前，导致 take_profit 分支永不执行）
+                        if profit_pct <= -sl * 100:
+                            reason, action = "stop_loss", 'sell'
                         elif profit_pct >= tp * 100:
-                            reason = "take_profit"
-                            action = 'sell'
+                            reason, action = "take_profit", 'sell'
+                        elif profit_pct >= tp * 100 * 0.5 and p <= high * (1 - ttp):
+                            # 高盈利区回撤：锁定利润
+                            reason, action = "trailing_tp", 'sell'
+                        elif profit_pct > 0 and tsl > 0 and p <= high * (1 - tsl):
+                            # 移动止损：此前 trailing_sl_pct 从未参与任何计算
+                            reason, action = "trailing_sl", 'sell'
                         else:
-                            action = 'hold'
+                            reason, action = "", 'hold'
 
                         if p > high:
                             self._trailing_high[sym] = p
 
                         if action == 'sell':
-                            rounded = await self._round_amount_by_precision(sym, amount)
-                            if rounded <= 0:
-                                continue
-                            sell_order = await self.exchange.create_market_sell_order(sym, rounded)
-                            if not sell_order:
-                                continue
-                            sell_filled = float(sell_order.get('filled') or 0)
-                            sell_avg = float(sell_order.get('average') or p)
-                            sell_revenue = sell_filled * sell_avg
-                            sell_fee = float(sell_order.get('_fee_cost') or 0)
-                            try:
-                                net_pnl, real_cost, _ = self._consume_position_lots(sym, sell_filled, sell_avg, sell_revenue, sell_fee)
-                            except ValueError as e:
-                                logger.error(f"账本不一致 {sym}: {e}")
-                                self._is_paused = True
-                                continue
+                            # 与买入操作串行：下单 I/O 期间账本不得被并发修改
+                            async with await self._sym_lock(sym):
+                                amount = self._bot_position_amount(sym)
+                                if amount <= 0:
+                                    continue
+                                rounded = await self._round_amount_by_precision(sym, amount)
+                                if rounded <= 0:
+                                    continue
+                                sell_order = await self.exchange.create_market_sell_order(sym, rounded)
+                                if not sell_order:
+                                    continue
+                                sell_filled = float(sell_order.get('filled') or 0)
+                                sell_avg = float(sell_order.get('average') or p)
+                                sell_revenue = sell_filled * sell_avg
+                                sell_fee = float(sell_order.get('_fee_cost') or 0)
+                                try:
+                                    net_pnl, real_cost, _ = self._consume_position_lots(sym, sell_filled, sell_avg, sell_revenue, sell_fee)
+                                except ValueError as e:
+                                    # 原实现直接置 _is_paused=True 且无恢复手段，一次账本抖动即永久停摆
+                                    logger.error(f"账本不一致 {sym}: {e}，跳过本轮，不暂停整个机器人")
+                                    continue
                             net_pnl_pct = (net_pnl / real_cost * 100) if real_cost > 0 else 0
                             if net_pnl < 0:
                                 self._consecutive_losses += 1
@@ -725,30 +1056,137 @@ class QuantBot:
                             else:
                                 self._consecutive_losses = 0
 
-                            trade = {"time": datetime.now(CST).strftime("%m-%d %H:%M"), "symbol": sym,
+                            disp_t, iso_t = now_parts()
+                            trade = {"time": disp_t, "ts": iso_t, "symbol": sym,
                                      "entry": entry, "exit": p, "pnl_pct": ((p-entry)/entry*100),
                                      "net_pnl": net_pnl, "net_pnl_pct": net_pnl_pct}
                             await save_trade(trade)
                             self.trades.insert(0, trade)
-                            await save_trade_detail({"time": datetime.now(CST).strftime("%m-%d %H:%M"), "symbol": sym, "side": "sell",
+                            await save_trade_detail({"time": disp_t, "ts": iso_t, "symbol": sym, "side": "sell",
                                                      "price": sell_avg, "amount": sell_filled, "pnl_pct": ((p-entry)/entry*100),
                                                      "signal_score": detail.get('signal_score',0), "fear_greed": detail.get('fear_greed',0),
                                                      "real_revenue": sell_revenue, "fee": sell_fee, "order_id": sell_order.get('id',''),
                                                      "net_pnl_pct": net_pnl_pct})
-                            self._trailing_high[sym] = 0
+                            # 原实现无条件置 0，部分成交后移动止盈/止损会永久失效
+                            if self.position_counts.get(sym, 0) > 0:
+                                self._trailing_high[sym] = max(
+                                    self._trailing_high.get(sym, 0), p
+                                )
+                            else:
+                                self._trailing_high.pop(sym, None)
                             await self._save_runtime_state()
-                            if settings.TG_CHAT_ID:
+                            if settings.TG_CHAT_ID and self.tg_app:
                                 try:
                                     await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID,
                                         text=f"📉 {reason} {sym} @ {p:.2f} 净利{net_pnl_pct:+.2f}% ({net_pnl:+.4f}U)")
-                                except:
-                                    pass
+                                except Exception as e:
+                                    logger.warning(f"平仓通知发送失败: {e}")
                     except Exception as e:
                         logger.error(f"追踪异常 {sym}: {e}")
                 await asyncio.sleep(5)
             except Exception as e:
                 logger.error(f"追踪任务异常: {e}")
                 await asyncio.sleep(5)
+
+    # ---------- 网格主循环 ----------
+    async def _grid_monitor(self):
+        """
+        网格模式主循环。
+
+        与单次模式的关键差异：
+          - 下单交给 executor.sync_symbol()，它把「目标订单」同步到交易所，
+            重启后自动与交易所未成交单对账，无需手工恢复
+          - 每档独立配对，盈利来自每一格价差
+          - 趋势过滤 + 区间止损，防止在单边下跌中一路建仓
+        """
+        await asyncio.sleep(8)
+        while True:
+            try:
+                if not self.is_running or not self.grid_enabled:
+                    await asyncio.sleep(10)
+                    continue
+                if not self.auto_trade_enabled:
+                    await asyncio.sleep(10)
+                    continue
+
+                await self._refresh_balance_cache()
+                equity = self._total_equity_usdt()
+                if equity <= 0:
+                    await asyncio.sleep(15)
+                    continue
+
+                # 风险监控更新峰值与回撤
+                self.risk.update_equity(equity)
+
+                for sym in self.symbols:
+                    try:
+                        if self.reconciler.is_blocked(sym):
+                            continue
+                        await self._grid_step(sym, equity)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"网格循环异常 {sym}: {e}")
+                    await asyncio.sleep(1)
+
+                await self._save_runtime_state()
+                await asyncio.sleep(20)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"网格主循环异常: {e}")
+                await asyncio.sleep(20)
+
+    async def _grid_step(self, sym, equity):
+        """单个币种的网格推进"""
+        ticker = self.ws.get_ticker(sym)
+        if not ticker:
+            return
+        # 数据陈旧检测：断网时不基于过期价格下单
+        ts = float(ticker.get('timestamp') or 0)
+        if ts > 0 and (time.time() - ts) > float(self.data_max_age):
+            logger.debug(f"{sym} 行情陈旧，跳过本轮")
+            return
+
+        p = float(ticker.get('last') or 0)
+        if p <= 0:
+            return
+
+        # 1) 区间止损优先
+        if self.grid.should_stop_loss(sym, p):
+            await self._alert(f"🕸️ {sym} 击穿网格区间下限，触发止损清仓", "critical")
+            if await self.executor.liquidate(sym, p):
+                self.grid.reset(sym, p)
+                self.risk.record_close(-1, abs(float(self.grid_stop_loss_pct)) * 100)
+                await self._save_runtime_state()
+            return
+
+        # 2) 计算 ATR（决定动态间距）
+        tech = await self._get_cached_tech(sym, self.timeframe, 50)
+        atr_pct = SignalEngine.atr_pct(tech) if tech else 0.0
+        self._last_atr_pct = atr_pct
+
+        # 3) 趋势过滤：下跌趋势中不新开网格（已有持仓继续吃网格利润）
+        allowed, why = SignalEngine.grid_entry_allowed(tech, self)
+        st = self.grid.get_state(sym)
+        if not allowed and st is None:
+            logger.debug(f"{sym} 暂不开网: {why}")
+            return
+
+        # 4) 风控闸门
+        used = await self._allocation_used_usdt()
+        ok, reason = await self.risk.can_open(
+            sym, extra_usdt=0.0, used_usdt=used, equity=equity)
+        if not ok and st is None:
+            logger.debug(f"{sym} 风控拦截: {reason}")
+            return
+
+        # 5) 同步订单到交易所（含对账与成交检测）
+        res = await self.executor.sync_symbol(sym, p, atr_pct, equity)
+        if res.get("filled"):
+            await self._save_runtime_state()
+        if res.get("placed") or res.get("cancelled"):
+            logger.info(f"🕸️ {sym} 网格同步: 挂{res['placed']} 撤{res['cancelled']}")
 
     # ---------- 风险监控 ----------
     async def _risk_monitor_task(self):
@@ -769,11 +1207,10 @@ class QuantBot:
                     self._today_loss_usdt = max(0.0, self._daily_start_equity - equity)
                     self._today_loss_pct = self._today_loss_usdt / self._daily_start_equity if self._daily_start_equity > 0 else 0.0
                     self.peak_total_value = max(self.peak_total_value or equity, equity)
-                    drawdown = (self.peak_total_value - equity) / self.peak_total_value
+                    drawdown = (self.peak_total_value - equity) / self.peak_total_value if self.peak_total_value > 0 else 0.0
                     self._drawdown_safe_flag = drawdown < self.max_drawdown_pct
-                    if not self._drawdown_safe_flag:
-                        self._is_paused = True
-                        await self._alert(f"回撤 {drawdown*100:.2f}% 达到上限，暂停", "critical")
+                    self._last_drawdown = drawdown
+                    # 告警统一交给 _check_risk_limits，避免此处每 30s 重复刷屏
                 await self._save_runtime_state()
                 await asyncio.sleep(30)
             except Exception as e:
@@ -825,8 +1262,9 @@ class QuantBot:
             [InlineKeyboardButton("💵 额度", callback_data="menu_set_amount"), InlineKeyboardButton("⏱ 周期", callback_data="menu_set_tf")],
             [InlineKeyboardButton("🔒 底线", callback_data="menu_set_reserve"), InlineKeyboardButton("🔢 上限", callback_data="menu_set_trades")],
             [InlineKeyboardButton("➕ 币种", callback_data="menu_add_symbol"), InlineKeyboardButton("➖ 币种", callback_data="menu_del_symbol")],
+            [InlineKeyboardButton("🕸️ 网格", callback_data="grid"), InlineKeyboardButton("⚙️ 参数", callback_data="params")],
             [InlineKeyboardButton("📈 仪表盘", callback_data="stats"), InlineKeyboardButton("💾 备份", callback_data="backup")],
-            [InlineKeyboardButton("🔄 刷新", callback_data="refresh")],
+            [InlineKeyboardButton("✅ 解除熔断", callback_data="resume"), InlineKeyboardButton("🔄 刷新", callback_data="refresh")],
         ])
 
     async def cmd_status(self, update, context):
@@ -916,195 +1354,332 @@ class QuantBot:
         except:
             await update.effective_message.reply_text("用法: /autotrade on|off")
 
-    async def cmd_set_tp(self, update, context):
-        if not self._auth(update): return
-        try:
-            val = float(context.args[0]) / 100.0
-            if val < self.breakeven_pct:
-                await update.effective_message.reply_text(f"低于保本线 {self.breakeven_pct*100:.2f}%")
-                return
-            self.tp_pct = val
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 止盈: {self.tp_pct:.1%}")
-        except:
-            await update.effective_message.reply_text("❌ /settp 1.2")
+    # ---------- 通用参数命令（由 params 注册表驱动）----------
+    # 此前每个参数各写一个命令函数，导致 11 个函数结构雷同、校验规则不一致，
+    # 且部分用裸 except: pass 静默吞掉输入错误。
+    # 现在统一由注册表驱动，新增参数无需改动命令层。
 
-    async def cmd_set_sl(self, update, context):
-        if not self._auth(update): return
-        try:
-            val = float(context.args[0]) / 100.0
-            self.sl_pct = val
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 止损: {self.sl_pct:.1%}")
-        except:
-            pass
+    async def cmd_set(self, update, context):
+        """/set <参数名> <值> —— 修改任意可调参数"""
+        if not self._auth(update):
+            return
+        from core.params import PARAMS, parse, display, range_hint
+        args = context.args or []
+        if len(args) < 2:
+            return await update.effective_message.reply_text(
+                "❌ 用法: /set <参数名> <值>\n"
+                "例: /set grid_levels 10\n"
+                "查看全部可调参数: /params")
 
-    async def cmd_set_tsl(self, update, context):
-        if not self._auth(update): return
-        try:
-            self.trailing_sl_pct = float(context.args[0]) / 100.0
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 移动止损: {self.trailing_sl_pct:.1%}")
-        except:
-            pass
+        key = args[0].strip().lower()
+        # 支持别名（如 /set tp 等价于 tp_pct）
+        if key not in PARAMS:
+            cands = [k for k in PARAMS if k.startswith(key)]
+            if len(cands) == 1:
+                key = cands[0]
+            elif len(cands) > 1:
+                return await update.effective_message.reply_text(
+                    f"❌ 参数名不明确，匹配到: {', '.join(cands)}")
+            else:
+                return await update.effective_message.reply_text(
+                    f"❌ 未知参数: {args[0]}\n用 /params 查看全部可调参数")
 
-    async def cmd_set_trailing_tp(self, update, context):
-        if not self._auth(update): return
-        try:
-            self.trailing_tp_pct = float(context.args[0]) / 100.0
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 移动止盈: {self.trailing_tp_pct:.1%}")
-        except:
-            pass
+        val, err = parse(key, args[1])
+        if err:
+            spec = PARAMS[key]
+            return await update.effective_message.reply_text(
+                f"❌ {err}\n范围: {range_hint(spec)}")
 
-    async def cmd_set_amount(self, update, context):
-        if not self._auth(update): return
+        old = getattr(self, key, None)
+        setattr(self, key, val)
+        await self._save_config()
+        spec = PARAMS[key]
+        return await update.effective_message.reply_text(
+            f"✅ {spec.desc}\n"
+            f"   {display(key, old)}  →  {display(key, val)}")
+
+    async def cmd_get(self, update, context):
+        """/get <参数名> —— 查看当前值"""
+        if not self._auth(update):
+            return
+        from core.params import PARAMS, display, range_hint
+        args = context.args or []
+        if not args:
+            return await update.effective_message.reply_text("❌ 用法: /get <参数名>")
+        key = args[0].strip().lower()
+        if key not in PARAMS:
+            cands = [k for k in PARAMS if k.startswith(key)]
+            if len(cands) == 1:
+                key = cands[0]
+            else:
+                return await update.effective_message.reply_text(f"❌ 未知参数: {args[0]}")
+        spec = PARAMS[key]
+        return await update.effective_message.reply_text(
+            f"⚙️ {spec.desc}\n"
+            f"   当前: {display(key, getattr(self, key, spec.default))}\n"
+            f"   默认: {display(key, spec.default)}\n"
+            f"   范围: {range_hint(spec)}\n"
+            f"   命令: /set {key} <值>")
+
+    async def cmd_params(self, update, context):
+        """/params —— 列出全部可调参数"""
+        if not self._auth(update):
+            return
+        from core.params import GROUPS, display
+        args = context.args or []
+        lines = ["⚙️ 可调参数（/set <名> <值> 修改）", ""]
+        for grp in ["网格·档位", "网格·中枢", "网格·资金", "网格·风控",
+                    "执行", "通用风控", "单次模式", "自适应"]:
+            specs = GROUPS.get(grp)
+            if not specs:
+                continue
+            if args and args[0].lower() not in grp.lower():
+                continue
+            lines.append(f"【{grp}】")
+            for s in specs:
+                cur = display(s.key, getattr(self, s.key, s.default))
+                lines.append(f"  {s.key} = {cur}")
+            lines.append("")
+        if len(lines) > 2:
+            lines.append("💡 /params 网格  只看网格类；/get <名> 看详情")
+        return await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_alias(self, update, context):
+        """兼容旧命令：/settp /setsl /setlevels ... 全部转发到 /set"""
+        if not self._auth(update):
+            return
+        from core.params import ALIAS_MAP
+        cmd = (update.effective_message.text or "").split()[0].lstrip("/").split("@")[0]
+        key = ALIAS_MAP.get(cmd.lower())
+        if not key:
+            return await update.effective_message.reply_text(f"❌ 未知命令 {cmd}")
+        args = context.args or []
+        if not args:
+            from core.params import PARAMS, range_hint
+            spec = PARAMS[key]
+            return await update.effective_message.reply_text(
+                f"⚙️ {spec.desc}\n用法: /{cmd} <值>\n范围: {range_hint(spec)}")
+        # 复用 /set 的处理逻辑
+        context.args = [key, args[0]]
+        return await self.cmd_set(update, context)
+
+    async def cmd_gridstatus(self, update, context):
+        """/grid —— 查看各币种网格运行状态"""
+        if not self._auth(update):
+            return
+        if not self.grid:
+            return await update.effective_message.reply_text("网格引擎未初始化")
+        lines = [f"🕸️ 网格状态 {self.env_tag}",
+                 f"模式: {'网格' if self.grid_enabled else '单次低吸高卖'}"
+                 f" | 层数 {self.grid_levels} | 间距 {self._cur_spacing()*100:.2f}%"]
+        for sym in self.symbols:
+            t = self.ws.get_ticker(sym)
+            if not t:
+                continue
+            p = float(t.get('last') or 0)
+            st = self.grid.stats(sym, p)
+            if not st:
+                lines.append(f"\n• {sym}: 未建网格")
+                continue
+            lines.append(
+                f"\n• {sym} @ {p:.4f}\n"
+                f"   档位 {st['lots']}/{self.grid_levels}"
+                f" | 中枢 {st['center']:.4f} | 间距 {st['spacing_pct']:.2f}%\n"
+                f"   已实现 {st['realized']:+.4f}U"
+                f" | 浮动 {st['unrealized']:+.4f}U\n"
+                f"   循环 {st['cycles']} 次 | 手续费 {st['fees']:.4f}U\n"
+                f"   区间 {st['lower_band']:.4f} ~ {st['upper_band']:.4f}")
+        return await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_gridreset(self, update, context):
+        """/gridreset <币种> —— 重置该币种网格（不清仓，仅重建档位）"""
+        if not self._auth(update):
+            return
+        args = context.args or []
+        sym = (args[0].upper() if args else "")
+        if "/" not in sym:
+            sym = (sym or settings.SYMBOL) + "/USDT" if "/" not in (sym or settings.SYMBOL) else (sym or settings.SYMBOL)
+        t = self.ws.get_ticker(sym)
+        if not t:
+            return await update.effective_message.reply_text(f"❌ 无行情 {sym}")
+        p = float(t.get('last') or 0)
+        self.grid.reset(sym, p)
+        await self._save_runtime_state()
+        return await update.effective_message.reply_text(f"✅ 已重置 {sym} 网格，锚点 {p:.4f}")
+
+    def _cur_spacing(self):
+        """当前生效的网格间距（供展示）"""
         try:
-            self.single_order_usdt = float(context.args[0])
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 单笔额度: {self.single_order_usdt}U")
-        except:
-            pass
+            return self.grid.calc_spacing(self._last_atr_pct)
+        except Exception:
+            return float(self.grid_spacing_pct)
 
     async def cmd_set_tf(self, update, context):
-        if not self._auth(update): return
-        try:
-            self.timeframe = context.args[0].lower()
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 周期: {self.timeframe}")
-        except:
-            pass
-
-    async def cmd_set_reserve(self, update, context):
-        if not self._auth(update): return
-        try:
-            self.reserve_bottom = float(context.args[0])
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 底线: {self.reserve_bottom}U")
-        except:
-            pass
+        """/settf 5m —— 设置 K 线周期"""
+        if not self._auth(update):
+            return
+        args = context.args or []
+        if not args:
+            return await update.effective_message.reply_text("❌ 用法: /settf 5m")
+        tf = args[0].strip().lower()
+        if tf not in VALID_TIMEFRAMES:
+            return await update.effective_message.reply_text(
+                f"❌ 不支持周期 {tf}\n可选: {', '.join(sorted(VALID_TIMEFRAMES))}")
+        self.timeframe = tf
+        self._tech_cache.clear()
+        self._tech_cache_time.clear()
+        await self._save_config()
+        return await update.effective_message.reply_text(f"✅ 周期: {self.timeframe}")
 
     async def cmd_add_symbol(self, update, context):
-        if not self._auth(update): return
-        try:
-            sym = context.args[0].upper()
-            if "/" not in sym: sym += "/USDT"
-            if sym not in self.symbols:
-                self.symbols.append(sym)
-                await self._save_config()
-                await update.effective_message.reply_text(f"✅ 已添加 {sym}")
-            else:
-                await update.effective_message.reply_text("⚠️ 已存在")
-        except:
-            pass
+        """/addsymbol ETH —— 新增监控币种"""
+        if not self._auth(update):
+            return
+        args = context.args or []
+        if not args:
+            return await update.effective_message.reply_text("❌ 用法: /addsymbol ETH")
+        sym = args[0].strip().upper()
+        if "/" not in sym:
+            sym += "/USDT"
+        if sym in self.symbols:
+            return await update.effective_message.reply_text("⚠️ 已存在")
+        if len(self.symbols) >= MAX_SYMBOLS:
+            return await update.effective_message.reply_text(
+                f"⚠️ 最多 {MAX_SYMBOLS} 个币种（过多会拖慢轮询与 WebSocket）")
+        self.symbols.append(sym)
+        await self._resubscribe_symbols()
+        await self._save_config()
+        return await update.effective_message.reply_text(f"✅ 已添加 {sym}")
 
     async def cmd_del_symbol(self, update, context):
-        if not self._auth(update): return
-        try:
-            sym = context.args[0].upper()
-            if "/" not in sym: sym += "/USDT"
-            if sym in self.symbols:
-                self.symbols.remove(sym)
-                await self._save_config()
-                await update.effective_message.reply_text(f"✅ 已删除 {sym}")
-            else:
-                await update.effective_message.reply_text("⚠️ 不存在")
-        except:
-            pass
+        """/delsymbol ETH —— 删除监控币种"""
+        if not self._auth(update):
+            return
+        args = context.args or []
+        if not args:
+            return await update.effective_message.reply_text("❌ 用法: /delsymbol ETH")
+        sym = args[0].strip().upper()
+        if "/" not in sym:
+            sym += "/USDT"
+        if sym not in self.symbols:
+            return await update.effective_message.reply_text("⚠️ 不存在")
+        # 网格或持仓未清时拒绝删除，避免资金遗留
+        gst = self.grid.get_state(sym) if self.grid else None
+        if gst and gst.lots:
+            return await update.effective_message.reply_text(
+                f"⛔ {sym} 网格尚有 {len(gst.lots)} 档持仓，请先清仓")
+        if self._bot_position_amount(sym) > 1e-12:
+            return await update.effective_message.reply_text(
+                f"⛔ {sym} 尚有持仓，请先平仓再删除")
+        self.symbols.remove(sym)
+        if self.grid:
+            self.grid.remove(sym)
+        await self._resubscribe_symbols()
+        await self._save_config()
+        return await update.effective_message.reply_text(f"✅ 已删除 {sym}")
 
-    async def cmd_set_max_pos(self, update, context):
-        if not self._auth(update): return
+    async def _resubscribe_symbols(self):
+        """币种变动后重建 WebSocket 订阅"""
         try:
-            self.max_positions_per_coin = int(context.args[0])
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 最大仓位数: {self.max_positions_per_coin}")
-        except:
-            pass
-
-    async def cmd_set_max_alloc(self, update, context):
-        if not self._auth(update): return
-        try:
-            pct = float(context.args[0]) / 100.0
-            self.max_total_allocated_pct = max(0.1, min(1.0, pct))
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 总仓位上限: {self.max_total_allocated_pct*100:.0f}%")
-        except:
-            pass
-
-    async def cmd_set_max_loss(self, update, context):
-        if not self._auth(update): return
-        try:
-            pct = float(context.args[0]) / 100.0
-            self.max_daily_loss_pct = max(0.01, min(0.5, pct))
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 日熔断: {self.max_daily_loss_pct*100:.1f}%")
-        except:
-            pass
-
-    async def cmd_set_max_coin(self, update, context):
-        if not self._auth(update): return
-        try:
-            self.max_per_coin_usdt = float(context.args[0])
-            await self._save_config()
-            await update.effective_message.reply_text(f"✅ 单币最大持仓: {self.max_per_coin_usdt}U")
-        except:
-            pass
-
-    async def cmd_autoscore(self, update, context):
-        if not self._auth(update): return
-        try:
-            score = int(context.args[0])
-            if 50 <= score <= 95:
-                self.auto_min_score = score
-                await self._save_config()
-                await update.effective_message.reply_text(f"✅ 阈值: {score}分")
-            else:
-                await update.effective_message.reply_text("阈值需50-95")
-        except:
-            pass
+            asyncio.create_task(self.ws.watch_orderbooks(self.symbols))
+        except Exception as e:
+            logger.warning(f"重订阅订单簿失败: {e}")
 
     async def cmd_stats(self, update, context):
-        if not self._auth(update): return
+        """/stats —— 交易统计仪表盘"""
+        if not self._auth(update):
+            return
         perf = await get_recent_performance(20)
         today = await get_today_trades()
         lines = [
             f"📊 仪表盘 {self.env_tag}",
-            f"今日: {today['total'] if today else 0}笔 胜率{today['win_rate']*100:.0f}% 盈亏{today['total_pnl_sum']:+.2f}%" if today else "今日无交易",
-            f"近20笔: 胜率{perf['win_rate']*100:.0f}% 平均盈利{perf['avg_win_pct']:.2f}% 平均亏损{perf['avg_loss_pct']:.2f}%" if perf else "暂无数据",
+            f"模式: {'🕸️ 网格' if self.grid_enabled else '📈 单次低吸高卖'}",
+            (f"今日: {today['total']}笔 胜率{today['win_rate']*100:.0f}% "
+             f"盈亏{today['total_pnl_sum']:+.2f}%" if today else "今日无交易"),
+            (f"近20笔: 胜率{perf['win_rate']*100:.0f}% 平均盈利{perf['avg_win_pct']:.2f}% "
+             f"平均亏损{perf['avg_loss_pct']:.2f}%" if perf else "暂无数据"),
             f"总手续费: {await get_total_fees():.4f}U",
             f"总净利: {await get_total_net_profit():.4f}U",
-            f"连续亏损: {self._consecutive_losses}",
-            f"市场状态: {'暂停' if self._is_paused else '正常'}",
-            f"自适应状态: {self._adaptive_state}",
+            f"连续亏损: {self.risk.consecutive_losses}",
+            f"回撤: {self.risk.last_drawdown*100:.2f}% / 上限{self.max_drawdown_pct*100:.0f}%",
+            f"状态: {'⛔ 暂停' if self.risk.is_paused else '✅ 正常'}",
         ]
-        await update.effective_message.reply_text("\n".join(lines))
+        if self.grid_enabled:
+            lines.append("")
+            lines.append("🕸️ 网格明细")
+            for sym in self.symbols:
+                t = self.ws.get_ticker(sym)
+                if not t:
+                    continue
+                st = self.grid.stats(sym, float(t.get('last') or 0))
+                if st:
+                    lines.append(
+                        f"  {sym}: 循环{st['cycles']}次 已实现{st['realized']:+.4f}U "
+                        f"浮动{st['unrealized']:+.4f}U")
+        return await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_backup(self, update, context):
-        if not self._auth(update): return
+        """/backup —— 导出数据库备份"""
+        if not self._auth(update):
+            return
         data = await export_db_to_json()
         if data:
-            await update.effective_message.reply_document(document=data.encode(), filename=f"backup_{datetime.now(CST).strftime('%Y%m%d_%H%M%S')}.json")
-        else:
-            await update.effective_message.reply_text("备份失败")
+            return await update.effective_message.reply_document(
+                document=data.encode(),
+                filename=f"backup_{datetime.now(CST).strftime('%Y%m%d_%H%M%S')}.json")
+        return await update.effective_message.reply_text("备份失败")
+
+    async def cmd_resume(self, update, context):
+        """/resume —— 手动解除所有熔断并重置回撤峰值"""
+        if not self._auth(update):
+            return
+        self.risk.resume()
+        # 同时解除启动对账造成的暂停（人工确认后）
+        reconciled = len(self.reconciler.blocked)
+        if reconciled:
+            self.reconciler.clear()
+        await self._save_runtime_state()
+        extra = f"，并解除 {reconciled} 个币种的对账暂停" if reconciled else ""
+        return await update.effective_message.reply_text(
+            f"✅ 已解除熔断，回撤峰值已重置{extra}")
 
     async def cmd_help(self, update, context):
         if not self._auth(update): return
-        await update.effective_message.reply_text(
-            "📖 命令列表\n"
-            "/menu 控制台\n/status 状态\n/check 信号\n/holdings 持币\n/panic 全平\n"
-            "/autotrade on|off\n/settp 1.2  /setsl 0.8  /settsl 0.5  /settmpt 0.3\n"
-            "/setamount 1  /settf 5m  /setreserve 10\n"
-            "/addsymbol ETH  /delsymbol ETH\n"
-            "/setmaxpos 8  /setmaxalloc 80  /setmaxloss 5  /setmaxcoin 100\n"
-            "/autoscore 65\n/stats  /backup"
+        return await update.effective_message.reply_text(
+            "📖 命令列表\n\n"
+            "【基础】\n"
+            "/menu 控制台  /status 状态  /stats 统计\n"
+            "/check 信号  /holdings 持币  /panic 全平\n"
+            "/autotrade on|off  /backup 备份  /resume 解除熔断\n"
+            "/reconcile 持仓对账（比对交易所余额与本地账本）\n"
+            "/restore 从备份恢复（把备份文件发给机器人回复本命令）\n"
+            "/resetledger 清空本地账本（模拟盘转实盘前必做）\n\n"
+            "【参数】—— 所有参数都能改\n"
+            "/params 查看全部可调参数\n"
+            "/set <参数名> <值>   例: /set grid_levels 10\n"
+            "/get <参数名>        查看当前值与范围\n\n"
+            "【网格】\n"
+            "/grid 网格状态  /gridreset ETH 重置网格\n"
+            "/set grid_enabled true  切换网格模式\n\n"
+            "【币种】\n"
+            "/addsymbol ETH  /delsymbol ETH  /settf 5m\n\n"
+            "💡 旧命令 /settp /setsl /setmaxdd 等仍可用，等价转发到 /set"
         )
 
     # ---------- 按钮处理 ----------
     async def handle_button_click(self, update, context):
         query = update.callback_query
         data = query.data
+
+        # 原实现此处完全没有鉴权，任何能看到消息的人都可触发交易开关
+        if not self._auth(update):
+            await query.answer("⛔ 无权限", show_alert=True)
+            return
+
+        answered = False
         if data == "panic_confirm":
             await query.answer("发送 /panic 确认", show_alert=True)
+            answered = True
         elif data == "toggle_auto":
             self.auto_trade_enabled = not self.auto_trade_enabled
             await self._save_config()
@@ -1118,6 +1693,7 @@ class QuantBot:
             await query.answer("已关机")
         elif data == "refresh":
             await self._refresh_panel(query)
+            answered = True
         elif data == "status":
             await self.cmd_status(update, context)
         elif data == "holdings":
@@ -1134,9 +1710,22 @@ class QuantBot:
         elif data.startswith("menu_set_"):
             key = data.replace("menu_set_", "")
             await query.message.reply_text(f"请输入 {key} 的新值，例如 /{key} 1.2")
+        elif data == "resume":
+            self.risk.resume()
+            await self._save_runtime_state()
+            await query.answer("✅ 已手动解除熔断", show_alert=True)
+            answered = True
+        elif data == "grid":
+            await self.cmd_gridstatus(update, context)
+        elif data == "params":
+            await self.cmd_params(update, context)
         else:
             await query.answer("功能待实现", show_alert=True)
-        await query.answer()
+            answered = True
+
+        # 只应答一次；Telegram 对同一 callback_query 重复 answer 会报错
+        if not answered:
+            await query.answer()
 
     async def _refresh_panel(self, query):
         try:
@@ -1165,22 +1754,225 @@ class QuantBot:
         asyncio.create_task(self._auto_trade_monitor())
         asyncio.create_task(self._trailing_monitor())
         asyncio.create_task(self._risk_monitor_task())
+        asyncio.create_task(self._grid_monitor())
 
+        # 启动对账：把持久化的网格状态与交易所实际挂单对齐。
+        # 声明式执行的好处 —— 只需重算目标状态，差异会在下一轮 sync 自动补齐。
+        if self.grid_enabled:
+            restored = len(self.grid.states)
+            logger.info(f"🕸️ 网格模式已启用，恢复 {restored} 个币种状态，"
+                        f"将在首个同步周期与交易所对账")
+
+        # 原实现在内层写了 'while True: await asyncio.sleep(30)'，
+        # 导致外层 try/except 永远等不到异常 —— 断线后既不重连也不清理，静默假死。
         while True:
             try:
+                self.mark_alive()          # 每次循环刷新心跳
                 await self.tg_app.initialize()
                 await self.tg_app.start()
                 await self.tg_app.updater.start_polling(drop_pending_updates=True)
-                logger.info("✅ UltimateBot v14.1 自适应版启动成功")
+                logger.info("✅ UltimateBot 启动成功")
                 if settings.TG_CHAT_ID:
                     await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID,
-                        text="🚀 **UltimateBot v14.1 自适应低吸高卖引擎已启动**\n\n"
-                             "⚡ 核心功能: 现货网格低吸高卖 + 市场自适应\n"
-                             "🛡️ 趋势过滤已启用\n"
-                             "📊 根据波动/趋势动态调仓\n"
+                        text="🚀 **自适应低吸高卖引擎已启动**\n\n"
+                             "⚡ 现货低吸高卖 + 市场自适应\n"
+                             "🛡️ 趋势过滤 / 回撤熔断已启用\n"
                              "📌 发送 /autotrade on 启动交易")
-                while True:
-                    await asyncio.sleep(30)
+                # 阻塞直到 updater 停止；polling 出错时 idle() 会返回，异常交由外层处理
+                await self.tg_app.updater.idle()
+                logger.warning("⚠️ Telegram updater 已停止，准备重连")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Bot 断开: {e}")
-                await asyncio.sleep(5)
+            finally:
+                # 无论正常停止还是异常，都彻底清理，避免反复 initialize 造成句柄泄漏
+                await self._shutdown_telegram()
+            await asyncio.sleep(5)
+
+    async def _shutdown_telegram(self):
+        """幂等关闭 Telegram 应用；任一步失败都不影响下一次重连。"""
+        try:
+            if self.tg_app.updater and self.tg_app.updater.running:
+                await self.tg_app.updater.stop()
+        except Exception as e:
+            logger.debug(f"updater 停止异常(可忽略): {e}")
+        try:
+            if self.tg_app.running:
+                await self.tg_app.stop()
+        except Exception as e:
+            logger.debug(f"app 停止异常(可忽略): {e}")
+        try:
+            await self.tg_app.shutdown()
+        except Exception as e:
+            logger.debug(f"app shutdown 异常(可忽略): {e}")
+
+    # ---------- 风控状态代理 ----------
+    # 历史代码直接读写 self._is_paused 等属性；改为代理到 RiskManager，
+    # 使风控状态有单一归属，同时不必改动全部调用点。
+    @property
+    def _is_paused(self):
+        return self.risk.is_paused
+
+    @_is_paused.setter
+    def _is_paused(self, v):
+        self.risk.is_paused = bool(v)
+
+    @property
+    def _drawdown_safe_flag(self):
+        return self.risk.drawdown_safe
+
+    @_drawdown_safe_flag.setter
+    def _drawdown_safe_flag(self, v):
+        self.risk.drawdown_safe = bool(v)
+
+    @property
+    def _drawdown_alerted(self):
+        return self.risk.drawdown_alerted
+
+    @_drawdown_alerted.setter
+    def _drawdown_alerted(self, v):
+        self.risk.drawdown_alerted = bool(v)
+
+    @property
+    def _last_drawdown(self):
+        return self.risk.last_drawdown
+
+    @_last_drawdown.setter
+    def _last_drawdown(self, v):
+        self.risk.last_drawdown = float(v)
+
+    @property
+    def peak_total_value(self):
+        return self.risk.peak_equity
+
+    @peak_total_value.setter
+    def peak_total_value(self, v):
+        self.risk.peak_equity = float(v)
+
+    @property
+    def _consecutive_losses(self):
+        return self.risk.consecutive_losses
+
+    @_consecutive_losses.setter
+    def _consecutive_losses(self, v):
+        self.risk.consecutive_losses = int(v)
+
+    @property
+    def _last_pause_time(self):
+        return self.risk.last_pause_time
+
+    @_last_pause_time.setter
+    def _last_pause_time(self, v):
+        self.risk.last_pause_time = float(v)
+
+    @property
+    def _today_loss_pct(self):
+        return self.risk.today_loss_pct
+
+    @_today_loss_pct.setter
+    def _today_loss_pct(self, v):
+        self.risk.today_loss_pct = float(v)
+
+    @property
+    def _today_loss_usdt(self):
+        return self.risk.today_loss_usdt
+
+    @_today_loss_usdt.setter
+    def _today_loss_usdt(self, v):
+        self.risk.today_loss_usdt = float(v)
+
+    @property
+    def _daily_start_equity(self):
+        return self.risk.daily_start_equity
+
+    @_daily_start_equity.setter
+    def _daily_start_equity(self, v):
+        self.risk.daily_start_equity = float(v)
+
+    @property
+    def daily_trades(self):
+        return self.risk.daily_trades
+
+    @daily_trades.setter
+    def daily_trades(self, v):
+        self.risk.daily_trades = int(v)
+
+        # 缓存
+        self._cached_balances = {}
+        self._cached_usdt_free = 0.0
+        self._balance_cache_time = 0
+        self._balance_cache_ttl = 15
+        self._tech_cache = {}
+        self._tech_cache_time = {}
+        self._tech_cache_ttl = 30
+        self._price_history = {}
+
+        # AI 分析（简化）
+        self.ai_insight = {"timestamp": 0, "summary": "等待分析", "recommendation": "观望", "score": 50}
+        self.ai_enabled = False
+
+        # 费率
+        self.taker_fee = settings.TAKER_FEE
+        self.maker_fee = settings.MAKER_FEE
+        self.min_profit_margin = settings.MIN_PROFIT_MARGIN
+        self.breakeven_pct = (self.taker_fee * 2) + self.min_profit_margin
+
+        # Telegram 权限
+        raw = settings.ALLOWED_USERS
+        self.allowed = {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()} if raw else set()
+        self.env_tag = "🧪 (模拟盘)" if settings.IS_SANDBOX else "🔴 (实盘)"
+        self.coin_configs = {}
+
+        # ---------- 新增：自适应参数 ----------
+        self._adaptive_state = 'neutral'
+        self._adaptive_tp_factor = 1.0
+        self._adaptive_sl_factor = 1.0
+        self._adaptive_score_offset = 0
+        self._adaptive_amount_factor = 1.0
+        self._adaptive_update_time = 0
+
+        # Telegram 应用
+        self.tg_app = None
+        if settings.TG_BOT_TOKEN:
+            self._init_telegram()
+
+    def _init_telegram(self):
+        self.tg_app = ApplicationBuilder().token(settings.TG_BOT_TOKEN).build()
+        handlers = [
+            CommandHandler("start", self.cmd_menu),
+            CommandHandler("menu", self.cmd_menu),
+            CommandHandler("status", self.cmd_status),
+            CommandHandler("check", self.cmd_check),
+            CommandHandler("holdings", self.cmd_holdings),
+            CommandHandler("panic", self.cmd_panic),
+            CommandHandler("autotrade", self.cmd_autotrade),
+            CommandHandler("settf", self.cmd_set_tf),
+            CommandHandler("addsymbol", self.cmd_add_symbol),
+            CommandHandler("delsymbol", self.cmd_del_symbol),
+            # 通用参数命令
+            CommandHandler("set", self.cmd_set),
+            CommandHandler("get", self.cmd_get),
+            CommandHandler("params", self.cmd_params),
+            # 网格
+            CommandHandler("grid", self.cmd_gridstatus),
+            CommandHandler("gridstatus", self.cmd_gridstatus),
+            CommandHandler("gridreset", self.cmd_gridreset),
+            CommandHandler("stats", self.cmd_stats),
+            CommandHandler("backup", self.cmd_backup),
+            CommandHandler("resume", self.cmd_resume),
+            CommandHandler("reconcile", self.cmd_reconcile),
+            CommandHandler("restore", self.cmd_restore),
+            CommandHandler("resetledger", self.cmd_resetledger),
+            CommandHandler("help", self.cmd_help),
+        ]
+        for h in handlers:
+            self.tg_app.add_handler(h)
+
+        # 旧命令别名（/settp /setsl /setlevels …）统一转发到 /set，
+        # 由 params 注册表的 ALIAS_MAP 声明，新增别名无需改动此处
+        from core.params import ALIAS_MAP
+        for alias in ALIAS_MAP:
+            self.tg_app.add_handler(CommandHandler(alias, self.cmd_alias))
+        self.tg_app.add_handler(CallbackQueryHandler(self.handle_button_click))
+        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))

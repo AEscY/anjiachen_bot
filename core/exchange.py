@@ -3,7 +3,6 @@ exchange.py - 多交易所管理器（优化：连接池 + 统一重试装饰器
 """
 import os
 import asyncio
-import traceback
 import ccxt.async_support as ccxt
 from config import settings, logger
 
@@ -95,13 +94,8 @@ class ExchangeManager:
         except Exception:
             return None
 
-    async def fetch_funding_rate(self, symbol):
-        if not self.exchange:
-            return None
-        try:
-            return await self._retry_call(self.exchange.fetch_funding_rate, symbol, max_retries=1)
-        except Exception:
-            return None
+    # 注：fetch_funding_rate 已删除 —— 资金费率是永续合约概念，
+    # 本项目为现货网格，该方法在全项目中 0 调用，且写库时恒为 0。
 
     async def fetch_balance(self):
         if not self.exchange:
@@ -138,6 +132,93 @@ class ExchangeManager:
             return amount
         except Exception:
             return 0.0
+
+    async def round_price(self, symbol, price) -> float:
+        """按交易所价格精度取整"""
+        if not self.exchange or price <= 0:
+            return 0.0
+        try:
+            if not self.exchange.markets:
+                await self.exchange.load_markets()
+            return float(self.exchange.price_to_precision(symbol, float(price)))
+        except Exception:
+            return float(price)
+
+    async def round_amount(self, symbol, amount) -> float:
+        """按交易所数量精度取整，并夹在最小/最大下单量之间"""
+        return await self._prepare_amount(symbol, amount)
+
+    async def create_limit_order(self, symbol, side, amount, price,
+                                 client_id: str = ""):
+        """
+        限价挂单（网格核心）。
+        client_id 作为幂等键透传给交易所：同一 id 重复提交不会产生第二张单，
+        这是「崩溃重启后不重复下单」的关键。
+        """
+        if not self.exchange:
+            return None
+        try:
+            amount = await self._prepare_amount(symbol, amount)
+            if amount <= 0:
+                return None
+            price = await self.round_price(symbol, price)
+            if price <= 0:
+                return None
+
+            params = {}
+            if client_id:
+                # ccxt 统一用 clientOrderId；OKX 底层字段为 clOrdId，ccxt 会自动映射
+                params['clientOrderId'] = client_id
+
+            order = await self._retry_call(
+                self.exchange.create_order, symbol, 'limit', side, amount, price,
+                params, max_retries=2)
+            if order and client_id:
+                order['clientOrderId'] = client_id
+            return order
+        except Exception as e:
+            logger.error(f"限价单失败 {symbol} {side}: {e}")
+            return None
+
+    async def fetch_open_orders(self, symbol):
+        """查询未成交挂单 —— 网格对账与成交检测的基础"""
+        if not self.exchange:
+            return []
+        try:
+            return await self._retry_call(
+                self.exchange.fetch_open_orders, symbol, max_retries=2) or []
+        except Exception as e:
+            logger.warning(f"查询未成交单失败 {symbol}: {e}")
+            return []
+
+    async def fetch_order(self, order_id, symbol):
+        """查询单张订单最终状态"""
+        if not self.exchange:
+            return None
+        try:
+            o = await self._retry_call(
+                self.exchange.fetch_order, order_id, symbol, max_retries=2)
+            if not o:
+                return None
+            fee = o.get('fee') or {}
+            o['_fee_cost'] = float(fee.get('cost') or 0)
+            o['_fee_currency'] = fee.get('currency') or ''
+            return o
+        except Exception as e:
+            logger.debug(f"查单失败 {order_id}: {e}")
+            return None
+
+    async def cancel_order(self, order_id, symbol) -> bool:
+        """撤销单张订单"""
+        if not self.exchange:
+            return False
+        try:
+            await self._retry_call(
+                self.exchange.cancel_order, order_id, symbol, max_retries=2)
+            return True
+        except Exception as e:
+            logger.debug(f"撤单失败 {order_id}: {e}")
+            return False
 
     async def _finalize_order(self, order, symbol):
         if not order:
