@@ -115,23 +115,83 @@ class ExchangeManager:
         except Exception:
             return {'USDT': {'free': 0}}
 
-    async def _prepare_amount(self, symbol, amount):
+    # 小额挂单告警节流：同一币种同一原因 5 分钟内只报一次，
+    # 避免监控循环每秒重试把日志刷爆
+    _min_amt_warned = {}
+
+    async def _prepare_amount(self, symbol, amount, price: float = 0.0):
+        """
+        按交易所精度取整，并校验最小/最大下单量与最小名义价值。
+
+        原实现有三个问题，小额账户会直接踩中：
+          1. 数量不足时静默返回 0.0，上层直接跳过 —— 用户看到"网格是空的"
+             却完全不知道原因，排查极其困难。现在会明确告警。
+          2. 只校验 limits.amount.min（最小数量），没校验 limits.cost.min
+            （最小名义价值/金额）。订单数量够但金额不够时，
+             交易所依然会拒单，而这里会放行。
+          3. 精度取整后可能归零（比如要求 0.001 ETH 而算出 0.0004），
+             同样静默失败。
+        """
         if not self.exchange or amount <= 0:
             return 0.0
         try:
             if not self.exchange.markets:
                 await self.exchange.load_markets()
+
             amount = float(self.exchange.amount_to_precision(symbol, amount))
             market = self.exchange.market(symbol)
-            min_amt = ((market.get('limits') or {}).get('amount') or {}).get('min')
-            max_amt = ((market.get('limits') or {}).get('amount') or {}).get('max')
+            limits = market.get('limits') or {}
+
+            min_amt = (limits.get('amount') or {}).get('min')
+            max_amt = (limits.get('amount') or {}).get('max')
+
+            # ── 1) 最小数量 ──
             if min_amt and amount < float(min_amt):
+                self._warn_once(
+                    symbol, "min_amount",
+                    f"⚠️ {symbol} 下单数量 {amount:.8g} 低于交易所最小 "
+                    f"{float(min_amt):.8g}，该单已跳过。"
+                    f"请提高单格金额（减少网格层数 / 提高 grid_capital_pct）"
+                    f"或换用最小门槛更低的币种")
                 return 0.0
+
             if max_amt and amount > float(max_amt):
                 amount = float(max_amt)
+
+            # ── 2) 精度取整后归零 ──
+            if amount <= 0:
+                self._warn_once(
+                    symbol, "precision_zero",
+                    f"⚠️ {symbol} 下单数量按交易所精度取整后为 0，该单已跳过。"
+                    f"单格金额太小，请加大")
+                return 0.0
+
+            # ── 3) 最小名义价值（原实现漏了这一步）──
+            min_cost = (limits.get('cost') or {}).get('min')
+            if min_cost and price > 0:
+                notional = amount * price
+                if notional < float(min_cost):
+                    self._warn_once(
+                        symbol, "min_cost",
+                        f"⚠️ {symbol} 订单金额 {notional:.2f} USDT 低于交易所最小 "
+                        f"{float(min_cost):.2f} USDT，该单已跳过。"
+                        f"请提高单格金额或换币种")
+                    return 0.0
+
             return amount
-        except Exception:
+        except Exception as e:
+            logger.warning(f"数量校验异常 {symbol}: {e}")
             return 0.0
+
+    def _warn_once(self, symbol: str, reason: str, msg: str, ttl: float = 300.0):
+        """同一币种同一原因，ttl 秒内只告警一次"""
+        import time as _t
+        key = f"{symbol}:{reason}"
+        now = _t.time()
+        last = self._min_amt_warned.get(key, 0)
+        if now - last >= ttl:
+            self._min_amt_warned[key] = now
+            logger.warning(msg)
 
     async def round_price(self, symbol, price) -> float:
         """按交易所价格精度取整"""
@@ -158,11 +218,12 @@ class ExchangeManager:
         if not self.exchange:
             return None
         try:
-            amount = await self._prepare_amount(symbol, amount)
-            if amount <= 0:
-                return None
             price = await self.round_price(symbol, price)
             if price <= 0:
+                return None
+            # 先算好价格再校验数量，这样才能同时检查最小名义价值
+            amount = await self._prepare_amount(symbol, amount, price)
+            if amount <= 0:
                 return None
 
             params = {}
@@ -252,7 +313,9 @@ class ExchangeManager:
         if not self.exchange:
             return None
         try:
-            amount = await self._prepare_amount(symbol, amount)
+            # 市价单成交价未知，无法可靠校验最小名义价值，
+            # 这里显式传 0.0 跳过该项（最小数量校验仍然生效）。
+            amount = await self._prepare_amount(symbol, amount, 0.0)
             if amount <= 0:
                 return None
             order = await self._retry_call(self.exchange.create_order, symbol, 'market', 'buy', amount)
@@ -265,7 +328,7 @@ class ExchangeManager:
         if not self.exchange:
             return None
         try:
-            amount = await self._prepare_amount(symbol, amount)
+            amount = await self._prepare_amount(symbol, amount, 0.0)
             if amount <= 0:
                 return None
             order = await self._retry_call(self.exchange.create_order, symbol, 'market', 'sell', amount)
