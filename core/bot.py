@@ -20,6 +20,10 @@ from storage import (
     export_db_to_json, save_runtime_state, load_runtime_state,
     get_total_fees, get_total_net_profit, now_parts
 )
+# 上面是"导入具体函数"，但模块本身也要导入：
+# 备份模块需要读 storage.DB_FILE（延迟读取，因为测试会改写它），
+# 只导入函数名是拿不到模块对象的，会导致 NameError。
+import storage
 
 CST = timezone(timedelta(hours=8))
 
