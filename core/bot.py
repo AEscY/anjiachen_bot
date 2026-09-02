@@ -13,6 +13,8 @@ from config import settings, logger
 from core.indicators import TechnicalEngine
 from core.risk import RiskManager
 from core.signals import SignalEngine, ScoreEngine
+from core.watchdog import Watchdog
+from core.trend import TrendWatcher
 from core.ws_manager import WSDataManager
 from storage import (
     init_db, load_config, save_config, load_trades, save_trade,
@@ -217,6 +219,11 @@ class QuantBot:
 
         # 按参数注册表补齐默认值（新增参数无需再改 __init__）
         self._ensure_param_defaults()
+
+        # 行为看门狗：纯观测，只报告不改参数
+        self.watchdog = Watchdog(self, alert=self._alert, logger=logger)
+        # 趋势退化检测：看"是不是在持续变差"，而非"有没有超阈值"
+        self.trend = TrendWatcher(self, logger=logger)
         if settings.TG_BOT_TOKEN:
             self._init_telegram()
 
@@ -557,6 +564,13 @@ class QuantBot:
             self.entries = state.get('entries', {})
             self._trailing_high = state.get('trailing_high', {})
             self.position_lots = state.get('position_lots', {})
+            # 恢复巡检状态：否则每次重启都会重新计时，
+            # "连续 N 小时未开仓"这类告警将永远触发不了
+            try:
+                self.watchdog.from_dict(state.get('watchdog') or {})
+                self.trend.from_dict(state.get('trend') or {})
+            except Exception as e:
+                logger.debug(f"巡检状态恢复跳过: {e}")
             self.entry_details = state.get('entry_details', {})
             # 风控状态交由 RiskManager 恢复
             self.risk.from_dict(state.get('risk', {}))
@@ -591,6 +605,7 @@ class QuantBot:
 
         # 启动后台定时备份
         self._start_backup_loop()
+        self._start_watchdog_loop()
 
         # 初始化全部完成，健康检查从现在起才报健康
         self._ready = True
@@ -792,6 +807,50 @@ class QuantBot:
 
         return await update.effective_message.reply_text(text, parse_mode="Markdown")
 
+    def _start_watchdog_loop(self):
+        """
+        启动行为巡检（每小时一次）。
+
+        目的：让机器人主动说出"没坏但不对劲"的状态。
+        静默地不干活比崩溃危险得多 —— 崩溃你立刻知道，
+        装死你能看三天。
+        """
+        try:
+            import asyncio as _aio
+
+            async def _loop():
+                await _aio.sleep(300)          # 启动 5 分钟后再开始
+                while True:
+                    try:
+                        if not self.is_running:
+                            await _aio.sleep(600)
+                            continue
+                        alerts = await self.watchdog.check_all()
+                        # 趋势退化：看"持续变差"，需查库，失败不影响主流程
+                        try:
+                            from storage import get_performance_windows
+                            w = await get_performance_windows(
+                                self.trend.RECENT_N, self.trend.BASELINE_N)
+                            alerts += await self.trend.check(w)
+                        except Exception as e:
+                            logger.debug(f"趋势检测跳过: {e}")
+                        for msg in alerts:
+                            await self._alert(msg, "warning")
+                            await _aio.sleep(2)   # 避免连续发送被限频
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.debug(f"巡检异常: {e}")
+                    await _aio.sleep(3600)
+            try:
+                loop = _aio.get_running_loop()
+            except RuntimeError:
+                return
+            loop.create_task(_loop())
+            logger.info("🔭 行为巡检已启动（每小时一次）")
+        except Exception as e:
+            logger.warning(f"行为巡检启动失败（不影响交易）: {e}")
+
     def _start_backup_loop(self):
         """启动后台定时备份（6 小时一次，滚动保留 7 份）"""
         try:
@@ -823,6 +882,8 @@ class QuantBot:
             'grid_states': {s: g.to_dict() for s, g in self.grid.states.items()},
             'entry_details': self.entry_details,
             'position_lots': self.position_lots,
+            'watchdog': self.watchdog.to_dict(),
+            'trend': self.trend.to_dict(),
         }
         await save_runtime_state(state)
 
@@ -1042,6 +1103,12 @@ class QuantBot:
                    f"FG:{fg_score:.0f}({'NA' if fg is None else int(fg)})",
                    f"趋势:{trend_strength:.2%}", f"惩罚:{trend_penalty}", f"状态:{ad['state']}"]
 
+        # 看门狗：记录评分分布（不管达不达标），用于判断"真没信号"还是"坏了"
+        try:
+            self.watchdog.record_score(sym, total_score)
+        except Exception:
+            pass
+
         return {
             'should_open': should_open,
             'score': total_score,
@@ -1060,6 +1127,10 @@ class QuantBot:
                 if not self.is_running or not self.auto_trade_enabled:
                     await asyncio.sleep(10)
                     continue
+
+                # 看门狗：证明循环还活着（用于区分"没信号"与"卡死"）
+                self.watchdog.tick()
+                self._watchdog_sample_data()
 
                 today = datetime.now(CST).date().isoformat()
                 if today != self.last_reset_day:
@@ -1147,6 +1218,7 @@ class QuantBot:
                         if not order:
                             continue
                         self.daily_trades += 1
+                        self.watchdog.record_open(sym)
                         filled = float(order.get('filled') or 0)
                         avg = float(order.get('average') or p)
                         fee = float(order.get('_fee_cost') or 0)
@@ -1563,6 +1635,10 @@ class QuantBot:
                 ad_lines.append(f"{sym.split('/')[0]}:{a['state']}"
                                 f"({a['offset']:+d}分,{a['amount_factor']:.2f}x)")
         lines.append("自适应: " + (" ".join(ad_lines) if ad_lines else "尚未计算"))
+        try:
+            lines.append(f"巡检: {self.watchdog.summary()}")
+        except Exception:
+            pass
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_check(self, update, context):
@@ -1858,6 +1934,30 @@ class QuantBot:
             logger.debug(f"交易对存在性校验跳过: {e}")
             return True, ""
 
+    def _watchdog_sample_data(self):
+        """
+        采样各币种行情新鲜度。
+
+        目的：检测"订阅悄悄断了"。WebSocket 断开往往不报错，
+        只是某个币再也收不到推送 —— 机器人会以为它一直没信号，
+        实际是根本没数据。
+        """
+        try:
+            wd = getattr(self, "watchdog", None)
+            ws = getattr(self, "ws", None)
+            if wd is None or ws is None:
+                return
+            for sym in self.symbols:
+                t = ws.get_ticker(sym)
+                if not t:
+                    continue
+                ts = float(t.get("timestamp") or 0)
+                # 只有新鲜数据才算"收到了行情"
+                if ts <= 0 or (time.time() - ts) <= float(self.data_max_age):
+                    wd.record_data(sym)
+        except Exception:
+            pass
+
     def _purge_symbol_state(self, sym: str):
         """
         彻底清掉某币种的全部运行时状态。
@@ -2019,6 +2119,7 @@ class QuantBot:
             "/history 交易记录  /brain 自检(查为什么不交易)\n"
             "/analysis 差距分析(手续费/胜率/期望)\n"
             "/preset 一键预设(small|standard|safe)\n"
+            "/patrol 行为巡检（查是不是静默不干活）\n"
             "/autotrade on|off  /backup 备份  /resume 解除熔断\n"
             "/reconcile 持仓对账（比对交易所余额与本地账本）\n"
             "/restore 从备份恢复（把备份文件发给机器人回复本命令）\n"
@@ -2223,6 +2324,53 @@ class QuantBot:
                 f"{mark} {t.get('symbol','?')} "
                 f"{t.get('entry',0):.4g}→{t.get('exit',0):.4g} "
                 f"{pnl:+.2f}%  {t.get('time','')}")
+        return await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_patrol(self, update, context):
+        """
+        /patrol —— 立即跑一次行为巡检。
+
+        机器人最大的风险不是崩溃，是【静默地不干活】：
+        崩溃你立刻知道，装死你能看三天。
+        本命令让你随时主动问一句"你是不是有什么不对劲"。
+        """
+        if not self._auth(update):
+            return
+        try:
+            alerts = await self.watchdog.check_all()
+            from storage import get_performance_windows
+            w = await get_performance_windows(self.trend.RECENT_N,
+                                              self.trend.BASELINE_N)
+            alerts += await self.trend.check(w)
+        except Exception as e:
+            return await update.effective_message.reply_text(
+                f"❌ 巡检失败: {e}")
+
+        lines = ["🔭 行为巡检", ""]
+        lines.append(f"状态: {self.watchdog.summary()}")
+        lines.append("")
+        if alerts:
+            lines.append("⚠️ 发现以下异常：")
+            lines.append("")
+            for a in alerts:
+                lines.append(a)
+                lines.append("")
+        else:
+            lines.append("✅ 未发现异常")
+            lines.append("")
+            lines.append("以下情况会被检测到：")
+            lines.append("  · 长时间未开仓（区分没信号 / 循环卡死）")
+            lines.append("  · 网格挂单长期不成交")
+            lines.append("  · 某币种长时间无行情（订阅断开）")
+            lines.append("  · 手续费占比持续上升（间距被侵蚀）")
+            lines.append("  · 胜率/单笔净利下滑（行情特征改变）")
+        try:
+            tr = self.trend.summary()
+            if tr and tr != "尚未采样":
+                lines.append("")
+                lines.append(f"绩效: {tr}")
+        except Exception:
+            pass
         return await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_preset(self, update, context):
@@ -2911,6 +3059,7 @@ class QuantBot:
             CommandHandler("analysis", self.cmd_analysis),
             CommandHandler("history", self.cmd_history),
             CommandHandler("preset", self.cmd_preset),
+            CommandHandler("patrol", self.cmd_patrol),
         ]
         for h in handlers:
             self.tg_app.add_handler(h)

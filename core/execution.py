@@ -44,6 +44,7 @@ class OrderExecutor:
         if not force and now - self._last_sync.get(symbol, 0) < self._sync_interval:
             return {"placed": 0, "cancelled": 0, "filled": []}
         self._last_sync[symbol] = now
+        self._cur_symbol = symbol
 
         result = {"placed": 0, "cancelled": 0, "filled": []}
 
@@ -79,6 +80,7 @@ class OrderExecutor:
                     self.live.pop(cid, None)
                     result["cancelled"] += 1
                     logger.info(f"🗑️  撤销多余挂单 {symbol} {oid}")
+                    self._clear_watch_order(symbol, cid)
 
         # 5) 补挂缺失的单
         for d in desired:
@@ -96,6 +98,23 @@ class OrderExecutor:
     def _track(self, cid, oid, side, level):
         """记录挂单的方向与档位，供成交回调使用"""
         self.live[str(cid)] = {"id": oid, "side": side, "level": int(level)}
+        # 看门狗：记录挂出时间，用于检测"长期不成交"
+        try:
+            wd = getattr(self.cfg, "watchdog", None)
+            sym = getattr(self, "_cur_symbol", None)
+            if wd is not None and sym:
+                wd.record_order(sym, cid)
+        except Exception:
+            pass
+
+    def _clear_watch_order(self, symbol, cid):
+        """通知看门狗：这张单已成交/撤销，不再计入"长期未成交" """
+        try:
+            wd = getattr(self.cfg, "watchdog", None)
+            if wd is not None:
+                wd.clear_order(symbol, cid)
+        except Exception:
+            pass
 
     # ─────────── 挂单 ───────────
 
@@ -163,6 +182,7 @@ class OrderExecutor:
 
             if not o:
                 self.live.pop(cid, None)
+                self._clear_watch_order(symbol, cid)
                 continue
 
             status = str(o.get("status") or "").lower()
@@ -171,8 +191,10 @@ class OrderExecutor:
                 await self._handle_fill(symbol, cid, o)
                 out.append({"client_id": cid, "order": o})
                 self.live.pop(cid, None)
+                self._clear_watch_order(symbol, cid)
             elif status in ("canceled", "cancelled", "expired", "rejected"):
                 self.live.pop(cid, None)
+                self._clear_watch_order(symbol, cid)
 
         return out
 
