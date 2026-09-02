@@ -114,6 +114,11 @@ _reg(
               aliases=("autoscore",), unit="分", group="单次模式"),
     ParamSpec("single_order_pct", 0.02, "单笔占总权益比例（单次模式）", float, 0.001, 0.20,
               scale=0.01, aliases=("setorderpct",), unit="%", group="单次模式"),
+    # 单笔固定额度：单次模式以此为基数按资金规模缩放（见 _calculate_dynamic_amount）。
+    # 原实现只在 __init__ 里硬编码为 1.0，既没有 /setamount 命令也无法调整，
+    # 而 Telegram 菜单里一直列着这个按钮 —— 点了没反应。
+    ParamSpec("single_order_usdt", 1.0, "单笔基础额度（单次模式，按资金缩放）",
+              float, 0.1, 1000, aliases=("setamount",), unit="U", group="单次模式"),
     ParamSpec("max_positions_per_coin", 8, "单币最大仓位数（单次模式）", int, 1, 100,
               aliases=("setmaxpos",), unit="个", group="单次模式"),
     ParamSpec("max_per_coin_usdt", 50, "单币最大持仓金额（单次模式）", float, 1, 1000000,

@@ -1676,6 +1676,9 @@ class QuantBot:
             "【基础】\n"
             "/menu 控制台  /status 状态  /stats 统计\n"
             "/check 信号  /holdings 持币  /panic 全平\n"
+            "/history 交易记录  /brain 自检(查为什么不交易)\n"
+            "/analysis 差距分析(手续费/胜率/期望)\n"
+            "/preset 一键预设(small|standard|safe)\n"
             "/autotrade on|off  /backup 备份  /resume 解除熔断\n"
             "/reconcile 持仓对账（比对交易所余额与本地账本）\n"
             "/restore 从备份恢复（把备份文件发给机器人回复本命令）\n"
@@ -1691,6 +1694,264 @@ class QuantBot:
             "/addsymbol ETH  /delsymbol ETH  /settf 5m\n\n"
             "💡 旧命令 /settp /setsl /setmaxdd 等仍可用，等价转发到 /set"
         )
+
+
+    # ---------- 诊断与分析 ----------
+
+    async def cmd_brain(self, update, context):
+        """
+        /brain —— 系统自检：逐项检查并列出"为什么不交易"。
+
+        小额测试时最常见的问题是"机器人开着但一单不下"，
+        而原因分散在七八个地方（余额底线、网格最小额、数据陈旧、熔断…），
+        逐个查要翻半天日志。这里一次性全列出来。
+        """
+        if not self._auth(update):
+            return
+        import time as _t
+        lines = [f"🧠 大脑自检 {self.env_tag}", ""]
+
+        ok_all = True
+
+        # 1) 运行开关
+        on = bool(self.is_running) and bool(self.auto_trade_enabled)
+        lines.append(f"{'✅' if on else '❌'} 交易开关: "
+                     f"运行={self.is_running} 自动={self.auto_trade_enabled}")
+        if not on:
+            ok_all = False
+            lines.append("     → /autotrade on 开启")
+
+        # 2) 行情数据新鲜度
+        stale = []
+        for sym in self.symbols:
+            t = self.ws.get_ticker(sym) if self.ws else None
+            if not t:
+                stale.append(f"{sym}(无数据)")
+                continue
+            ts = float(t.get('timestamp') or 0)
+            if ts > 0 and (_t.time() - ts) > float(self.data_max_age):
+                stale.append(f"{sym}({_t.time()-ts:.0f}s前)")
+        if stale:
+            ok_all = False
+            lines.append(f"❌ 行情陈旧: {', '.join(stale)}（阈值 {self.data_max_age}s）")
+        else:
+            lines.append(f"✅ 行情新鲜: {len(self.symbols)} 个币种")
+
+        # 3) 余额 vs 保留底线
+        try:
+            bal = await self.exchange.fetch_balance()
+            usdt = float(bal.get('USDT', {}).get('free', 0))
+        except Exception:
+            usdt = -1
+        if usdt >= 0:
+            okb = usdt >= float(self.reserve_bottom)
+            lines.append(f"{'✅' if okb else '❌'} 可用 {usdt:.2f}U / 底线 {self.reserve_bottom}U")
+            if not okb:
+                ok_all = False
+                lines.append(f"     → /setreserve 调低，或充值")
+                lines.append("       9U 账户建议 /setreserve 1")
+
+        # 4) 网格模式下的每格金额 vs 最小额
+        if self.grid_enabled:
+            capital = float(usdt if usdt > 0 else 0) * float(self.grid_capital_pct)
+            per = capital / max(1, int(self.grid_levels))
+            okp = per >= float(self.grid_min_order_usdt)
+            lines.append(f"{'✅' if okp else '❌'} 网格每格 {per:.2f}U / 下限 {self.grid_min_order_usdt}U")
+            if not okp:
+                ok_all = False
+                lines.append(f"     → 每格低于下限会全部跳过！")
+                lines.append(f"       /setminorder 1 或 /setlevels 减少层数")
+        else:
+            lines.append("ℹ️ 单次模式（/set grid_enabled true 切网格）")
+
+        # 5) 风控状态
+        if self.risk.is_paused:
+            ok_all = False
+            lines.append(f"❌ 风控已熔断: {getattr(self.risk,'pause_reason','未知原因')}")
+            lines.append("     → 确认仓位后 /resume 解除")
+        else:
+            lines.append("✅ 风控正常")
+
+        # 6) 对账阻塞
+        blocked = sorted(getattr(self.reconciler, "blocked", []) or [])
+        if blocked:
+            ok_all = False
+            lines.append(f"❌ 对账阻塞: {', '.join(blocked)}")
+            lines.append("     → 核对真实仓位后 /resume")
+        else:
+            lines.append("✅ 对账正常")
+
+        # 7) 今日额度
+        if self.max_daily_trades > 0 and self.daily_trades >= self.max_daily_trades:
+            ok_all = False
+            lines.append(f"❌ 今日已达上限 {self.daily_trades}/{self.max_daily_trades}")
+        else:
+            lines.append(f"✅ 今日 {self.daily_trades}/"
+                         f"{self.max_daily_trades if self.max_daily_trades>0 else '∞'} 笔")
+
+        lines.append("")
+        if ok_all:
+            lines.append("🎉 全部就绪，机器人应正常交易")
+        else:
+            lines.append("⚠️ 上面标 ❌ 的项会阻止交易，逐条处理即可")
+        return await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_analysis(self, update, context):
+        """
+        /analysis —— 差距分析：理论 vs 实际，找出钱漏在哪。
+
+        回答两个问题：
+          1. 手续费吃掉了多少利润（毛利润 vs 净利润的差距）
+          2. 信号评分到底有没有用（赢的分数 vs 亏的分数）
+        """
+        if not self._auth(update):
+            return
+        from storage import load_trades, get_recent_performance, get_total_fees
+        perf = await get_recent_performance(50)
+        fees = await get_total_fees()
+        lines = [f"📐 差距分析 {self.env_tag}", ""]
+
+        if not perf:
+            lines.append("暂无成交数据，先跑几笔再来看")
+            lines.append("")
+            lines.append("💡 若一直没成交，用 /brain 查原因")
+            return await update.effective_message.reply_text("\n".join(lines))
+
+        pnls = perf.get('pnls') or []
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        gross = sum(pnls)
+
+        lines.append(f"样本: {perf['total']} 笔（赢 {len(wins)} / 亏 {len(losses)}）")
+        lines.append(f"胜率: {perf['win_rate']*100:.0f}%")
+        lines.append(f"平均盈利: {perf['avg_win_pct']:+.3f}%")
+        lines.append(f"平均亏损: {perf['avg_loss_pct']:+.3f}%")
+        lines.append("")
+
+        # 盈亏比与期望
+        if wins and losses:
+            rr = abs(perf['avg_win_pct'] / perf['avg_loss_pct'])
+            exp = (perf['win_rate'] * perf['avg_win_pct']
+                   + (1 - perf['win_rate']) * perf['avg_loss_pct'])
+            lines.append(f"盈亏比: {rr:.2f} : 1")
+            lines.append(f"单笔期望: {exp:+.4f}%")
+            if exp > 0:
+                lines.append("  ✅ 期望为正，策略逻辑站得住")
+            else:
+                lines.append("  ❌ 期望为负 —— 继续跑只会稳定亏损")
+                lines.append("     → 放宽止盈或收紧止损再观察")
+            lines.append("")
+
+        # 手续费拖累
+        lines.append(f"累计手续费: {fees:.4f}U")
+        trades = await load_trades(50)
+        gross_sum = sum(float(t.get('pnl_pct') or 0) for t in trades)
+        net_sum = sum(float(t.get('net_pnl_pct') or 0) for t in trades)
+        if abs(gross_sum) > 1e-9:
+            drag = (gross_sum - net_sum) / abs(gross_sum) * 100
+            lines.append(f"毛利 {gross_sum:+.3f}% → 净利 {net_sum:+.3f}%")
+            lines.append(f"手续费拖累: {drag:.1f}%")
+            if drag > 30:
+                lines.append("  ⚠️ 手续费吃掉三成以上利润，间距太小了")
+                lines.append(f"     → 当前间距 {self.grid_spacing_pct*100:.2f}%，"
+                             f"建议 /setspacing 2 以上")
+
+        return await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_history(self, update, context):
+        """/history —— 最近交易记录"""
+        if not self._auth(update):
+            return
+        from storage import load_trades
+        n = 10
+        args = context.args or []
+        if args:
+            try:
+                n = max(1, min(50, int(args[0])))
+            except ValueError:
+                pass
+        trades = await load_trades(n)
+        if not trades:
+            return await update.effective_message.reply_text(
+                "📋 暂无交易记录\n\n💡 若机器人一直没成交，用 /brain 查原因")
+
+        lines = [f"📋 最近 {len(trades)} 笔", ""]
+        for t in trades:
+            pnl = float(t.get('net_pnl_pct') or t.get('pnl_pct') or 0)
+            mark = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+            lines.append(
+                f"{mark} {t.get('symbol','?')} "
+                f"{t.get('entry',0):.4g}→{t.get('exit',0):.4g} "
+                f"{pnl:+.2f}%  {t.get('time','')}")
+        return await update.effective_message.reply_text("\n".join(lines))
+
+    async def cmd_preset(self, update, context):
+        """
+        /preset —— 一键预设，避免逐条调参。
+
+        小额账户最容易踩的坑就是默认值全是大资金设定的
+        （reserve_bottom=10、grid_min_order_usdt=5），
+        9U 本金下一单都挂不出来。预设一次性改对。
+        """
+        if not self._auth(update):
+            return
+        args = context.args or []
+        name = (args[0].lower() if args else "")
+
+        PRESETS = {
+            "small": {   # 小额试水（≤50U）
+                "reserve_bottom": 1.0,
+                "grid_min_order_usdt": 1.0,
+                "grid_levels": 1,
+                "grid_spacing_pct": 0.02,
+                "grid_capital_pct": 0.8,
+                "single_order_pct": 0.02,
+                "max_daily_trades": 20,
+                "_desc": "小额试水（≤50U）：底线1U、单格最少1U、1层、间距2%",
+            },
+            "standard": {  # 标准（几百 U）
+                "reserve_bottom": 10.0,
+                "grid_min_order_usdt": 5.0,
+                "grid_levels": 8,
+                "grid_spacing_pct": 0.012,
+                "grid_capital_pct": 0.8,
+                "single_order_pct": 0.02,
+                "max_daily_trades": 20,
+                "_desc": "标准（数百U）：恢复出厂默认",
+            },
+            "safe": {  # 保守：大间距、少交易
+                "reserve_bottom": 1.0,
+                "grid_min_order_usdt": 1.0,
+                "grid_levels": 2,
+                "grid_spacing_pct": 0.03,
+                "grid_capital_pct": 0.5,
+                "single_order_pct": 0.01,
+                "max_daily_trades": 10,
+                "_desc": "保守：间距3%、只用5成资金、每日最多10笔",
+            },
+        }
+
+        if name not in PRESETS:
+            return await update.effective_message.reply_text(
+                "🎛️ 一键预设\n\n"
+                "/preset small     小额试水（≤50U）★推荐 9U 账户\n"
+                "/preset standard  标准（数百 U）\n"
+                "/preset safe      保守（大间距、低仓位）\n\n"
+                "⚠️ 会覆盖上面列出的参数，其他参数不变")
+
+        p = PRESETS[name]
+        desc = p.pop("_desc", "")
+        changed = []
+        for k, v in p.items():
+            old = getattr(self, k, None)
+            setattr(self, k, v)
+            changed.append(f"  {k}: {old} → {v}")
+        await self._save_config()
+
+        return await update.effective_message.reply_text(
+            f"✅ 已应用预设 {name}\n{desc}\n\n" + "\n".join(changed)
+            + "\n\n💡 /params 查看全部，/brain 检查是否就绪")
+
 
     # ---------- 按钮处理 ----------
     async def handle_button_click(self, update, context):
@@ -2171,6 +2432,10 @@ class QuantBot:
             CommandHandler("restore", self.cmd_restore),
             CommandHandler("resetledger", self.cmd_resetledger),
             CommandHandler("help", self.cmd_help),
+            CommandHandler("brain", self.cmd_brain),
+            CommandHandler("analysis", self.cmd_analysis),
+            CommandHandler("history", self.cmd_history),
+            CommandHandler("preset", self.cmd_preset),
         ]
         for h in handlers:
             self.tg_app.add_handler(h)
