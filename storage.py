@@ -238,6 +238,66 @@ async def get_recent_performance(num=50):
     except Exception as e:
         logger.error(f'获取近期表现失败: {e}'); return None
 
+async def get_performance_windows(recent_n=30, baseline_n=60):
+    """
+    取【近期窗口】与【基线窗口】的绩效，用于趋势性退化检测。
+
+    为什么需要两个窗口：
+      单看绝对值无法判断"变差"。手续费占比 19% 本身不说明问题，
+      但"从 8% 升到 19%"说明间距正在被侵蚀。
+
+    recent  : 最近的 recent_n 笔卖单
+    baseline: 再往前 baseline_n 笔卖单
+
+    手续费占比的推导（不依赖 fee 字段，因为它可能是币数）：
+      对卖单，net_pnl = revenue - cost - 总手续费
+      => 总手续费 = revenue - cost - net_pnl
+      => 占比 = 总手续费 / revenue
+    """
+    try:
+        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+            async with db.execute(
+                "SELECT real_cost, real_revenue, net_pnl_pct "
+                "FROM trade_details WHERE side='sell' "
+                "ORDER BY id DESC LIMIT ?",
+                (recent_n + baseline_n,)
+            ) as cur:
+                rows = await cur.fetchall()
+    except Exception as e:
+        logger.error(f'获取绩效窗口失败: {e}')
+        return None
+
+    def _agg(rs):
+        if not rs:
+            return None
+        pnls, fees, revs = [], 0.0, 0.0
+        for cost, revenue, pct in rs:
+            cost = float(cost or 0)
+            revenue = float(revenue or 0)
+            pct = float(pct or 0)
+            pnl = cost * pct / 100.0
+            pnls.append(pct)
+            revs += revenue
+            f = revenue - cost - pnl
+            if f > 0:
+                fees += f
+        if not pnls:
+            return None
+        wins = [p for p in pnls if p > 0]
+        return {
+            'count': len(pnls),
+            'win_rate': len(wins) / len(pnls),
+            'avg_pnl_pct': sum(pnls) / len(pnls),
+            'fee_ratio': (fees / revs) if revs > 0 else 0.0,
+        }
+
+    recent = _agg(rows[:recent_n])
+    baseline = _agg(rows[recent_n:recent_n + baseline_n])
+    if not recent or not baseline:
+        return None
+    return {'recent': recent, 'baseline': baseline}
+
+
 async def get_today_trades():
     # 用 ISO 列 ts 做日期过滤；SQLite 的 strftime 无法解析旧格式 'MM-DD HH:MM'
     today=datetime.now(CST).strftime('%Y-%m-%d')
