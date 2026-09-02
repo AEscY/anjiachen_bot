@@ -7,7 +7,7 @@ import aiohttp
 import json
 import time
 from datetime import datetime, timezone, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from config import settings, logger
 from core.indicators import TechnicalEngine
@@ -41,6 +41,19 @@ VALID_TIMEFRAMES = {
 #   ("param",  参数名, 提示语)   → 走 /set 的校验与换算
 #   ("timeframe", None, 提示语) → 走 /settf
 #   ("add_symbol"/"del_symbol", None, 提示语) → 走 增删币种
+# ── 快捷值：点一下就设好，不用手输 ──
+# 常用就那几个值，每次手打既慢又容易弄错单位。
+QUICK_VALUES = {
+    "tp_pct":           ["1", "1.5", "2", "3", "5", "8"],
+    "sl_pct":           ["0.5", "1", "2", "3", "5"],
+    "trailing_sl_pct":  ["0.3", "0.5", "1", "2"],
+    "trailing_tp_pct":  ["0.2", "0.3", "0.5", "1"],
+    "single_order_pct": ["1", "2", "5", "10"],
+    "reserve_bottom":   ["1", "5", "10"],
+    "max_daily_trades": ["5", "10", "20", "50"],
+    "timeframe":        ["5m", "15m", "1h", "4h"],
+}
+
 MENU_INPUT_SPEC = {
     "menu_set_tp":      ("param", "tp_pct",           "止盈百分比"),
     "menu_set_sl":      ("param", "sl_pct",           "止损百分比"),
@@ -2004,13 +2017,24 @@ class QuantBot:
             await self.cmd_stats(update, context)
         elif data == "backup":
             await self.cmd_backup(update, context)
+        elif data.startswith("q:"):
+            # 快捷值：q:<提示消息ID>:<值>，点一下直接应用，不用手输
+            await self._handle_quick_value(query, context, data)
+            answered = True
+        elif data.startswith("qcancel:"):
+            mid = data.split(":", 1)[1]
+            pend_map = context.user_data.get("pending_by_msg") or {}
+            pend_map.pop(int(mid), None) if str(mid).lstrip("-").isdigit() else None
+            context.user_data.pop("pending", None)
+            await query.answer("已取消")
+            try:
+                await query.edit_message_text("↩️ 已取消")
+            except Exception:
+                pass
+            answered = True
         elif data in MENU_INPUT_SPEC:
-            # 进入交互式输入：把待办存进 user_data，由 handle_text_input 消费
             kind, key, label = MENU_INPUT_SPEC[data]
-            context.user_data["pending"] = {"kind": kind, "key": key,
-                                            "label": label, "data": data}
-            hint = await self._pending_hint(kind, key, label)
-            await query.message.reply_text(hint)
+            await self._send_input_prompt(query, context, kind, key, label, data)
             answered = True
         elif data == "resume":
             self.risk.resume()
@@ -2039,6 +2063,101 @@ class QuantBot:
             await query.edit_message_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
         except:
             pass
+
+    async def _send_input_prompt(self, query, context, kind, key, label, src_data):
+        """
+        弹出输入：先发一条带常用值按钮的提示，再发一条 ForceReply 锚点。
+
+        ForceReply 是 Telegram 里最接近"弹窗输入"的机制 ——
+        客户端会自动把输入焦点锁在这条消息上（输入框顶部显示"回复该消息"），
+        用户打的字就是对它作答，不用自己去点输入框盲打。
+
+        两条消息的原因：一条消息上不能同时挂 InlineKeyboard 和 ForceReply，
+        所以按钮走提示消息、输入锚点走第二条；待办在两条 ID 下都注册，
+        无论用户回复哪一条都能命中。
+        """
+        from core.params import PARAMS
+
+        text = await self._pending_hint(kind, key, label)
+
+        # 常用值
+        if kind == "del_symbol":
+            quick = [x.split("/")[0] for x in self.symbols][:6]
+        elif kind == "add_symbol":
+            quick = [c for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
+                     if f"{c}/USDT" not in self.symbols][:6]
+        else:
+            quick = list(QUICK_VALUES.get(key if kind == "param" else kind, []) or [])
+
+        sent = await query.message.reply_text("⏳")
+        mid = sent.message_id
+
+        rows = []
+        if quick:
+            row = []
+            for v in quick:
+                row.append(InlineKeyboardButton(v, callback_data=f"q:{mid}:{v}"))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+        rows.append([InlineKeyboardButton("❌ 取消", callback_data=f"qcancel:{mid}")])
+
+        await sent.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+        # 输入栏灰字提示（键盘上方的 placeholder）
+        if kind == "param" and key in PARAMS:
+            unit = PARAMS[key].unit or ""
+            ph = f"输入{label}" + (f"（{unit}）" if unit else "")
+        elif kind == "timeframe":
+            ph = "如 15m"
+        elif kind in ("add_symbol", "del_symbol"):
+            ph = "如 BTC"
+        else:
+            ph = "输入新值"
+
+        anchor_msg = await sent.reply_text(
+            "⬆️ 在输入框直接输入，或点上方按钮选择",
+            reply_markup=ForceReply(selective=True,
+                                    input_field_placeholder=ph[:64]),
+        )
+
+        # 两条消息都注册待办，回复任一条都能命中
+        rec = {"kind": kind, "key": key, "label": label,
+               "data": src_data, "msg_id": mid}
+        pend = context.user_data.setdefault("pending_by_msg", {})
+        pend[mid] = rec
+        pend[anchor_msg.message_id] = rec
+        # 兼容非 reply 的普通输入
+        context.user_data["pending"] = rec
+
+    async def _handle_quick_value(self, query, context, data):
+        """快捷值按钮 q:<msg_id>:<值> —— 复用输入逻辑，校验规则保持一致"""
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            return await query.answer("数据格式错误", show_alert=True)
+        mid, val = parts[1], parts[2]
+        pend_map = (context.user_data or {}).get("pending_by_msg") or {}
+        try:
+            rec = pend_map.get(int(mid))
+        except (ValueError, TypeError):
+            rec = None
+        if not rec:
+            await query.answer("该输入已过期，请重新点按钮", show_alert=True)
+            return
+
+        # 构造最小 update 复用 handle_text_input，保证校验一致
+        class _U:
+            pass
+        fake = _U()
+        fake.effective_message = query.message
+        fake.effective_user = query.from_user
+        query.message.text = val
+        query.message.reply_to_message = type(
+            "M", (), {"message_id": int(mid)})()
+        await self.handle_text_input(fake, context)
+        await query.answer()
 
     async def _pending_hint(self, kind: str, key, label: str) -> str:
         """拼出交互式输入的提示语（含当前值、范围、可选项）"""
@@ -2075,20 +2194,38 @@ class QuantBot:
 
         没有待办输入时静默忽略，不打扰用户。
         """
-        pending = (context.user_data or {}).get("pending")
-        if not pending:
-            return
-        if not self._auth(update):
-            return
-
         msg = update.effective_message
         text = (msg.text or "").strip()
         if not text:
             return
 
+        # 精确匹配：用户是在"回复"哪一条提示？
+        # ForceReply 会把用户的输入标记为 reply_to_message，
+        # 据此取到对应待办 —— 这样可以同时挂多个待办而不串台。
+        pend_map = (context.user_data or {}).get("pending_by_msg") or {}
+        target_id = None
+        rm = getattr(msg, "reply_to_message", None)
+        if rm is not None:
+            target_id = getattr(rm, "message_id", None)
+
+        pending = pend_map.get(target_id) if target_id is not None else None
+        # 回退：没有 reply 标记（比如手动输入）时用最后一个待办
+        if pending is None:
+            pending = (context.user_data or {}).get("pending")
+        if not pending:
+            return
+        if not self._auth(update):
+            return
+
+        def _clear():
+            """清理该待办（按 ID 精确清理，不影响其他待办）"""
+            if target_id is not None:
+                pend_map.pop(target_id, None)
+            context.user_data.pop("pending", None)
+
         # 取消
         if text.lower() in ("/cancel", "cancel", "取消", "/取消"):
-            context.user_data.pop("pending", None)
+            _clear()
             return await msg.reply_text("↩️ 已取消输入")
 
         kind = pending.get("kind")
@@ -2106,7 +2243,7 @@ class QuantBot:
                 old = getattr(self, key, None)
                 setattr(self, key, val)
                 await self._save_config()
-                context.user_data.pop("pending", None)
+                _clear()
                 spec = PARAMS[key]
                 return await msg.reply_text(
                     f"✅ {spec.desc}\n"
@@ -2124,7 +2261,7 @@ class QuantBot:
                 self._tech_cache.clear()
                 self._tech_cache_time.clear()
                 await self._save_config()
-                context.user_data.pop("pending", None)
+                _clear()
                 return await msg.reply_text(f"✅ 周期: {old} → {tf}")
 
             if kind in ("add_symbol", "del_symbol"):
@@ -2140,7 +2277,7 @@ class QuantBot:
                     self.symbols.append(sym)
                     await self._resubscribe_symbols()
                     await self._save_config()
-                    context.user_data.pop("pending", None)
+                    _clear()
                     return await msg.reply_text(f"✅ 已添加 {sym}")
                 else:
                     if sym not in self.symbols:
@@ -2157,14 +2294,14 @@ class QuantBot:
                         self.grid.remove(sym)
                     await self._resubscribe_symbols()
                     await self._save_config()
-                    context.user_data.pop("pending", None)
+                    _clear()
                     return await msg.reply_text(f"✅ 已删除 {sym}")
         except Exception as e:
             logger.error(f"交互式输入处理失败: {e}")
             return await msg.reply_text(f"❌ 处理失败: {e}")
 
         await msg.reply_text("❌ 未知的输入类型，已取消")
-        context.user_data.pop("pending", None)
+        _clear()
 
     # ---------- 主运行循环 ----------
     async def run(self):
