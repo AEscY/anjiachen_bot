@@ -1361,8 +1361,20 @@ class QuantBot:
                             high = entry          # 部分成交后 high 被误置 0 会导致移动止盈永远失效
 
                         profit_pct = (p - entry) / entry * 100
+                        # 最高点盈利：移动止损的激活线要按【曾经到达过的高度】判定，
+                        # 而不是当前盈利 —— 否则回撤过程中当前盈利已低于激活线，
+                        # 移动止损永远启动不了（等于废掉这个功能）。
+                        peak_pct = (high - entry) / entry * 100 if high > 0 else 0.0
                         tsl = self._get_coin_param(sym, 'trailing_sl_pct', self.trailing_sl_pct)
                         ttp = self._get_coin_param(sym, 'trailing_tp_pct', self.trailing_tp_pct)
+                        tsl_arm = self._get_coin_param(sym, 'trailing_sl_arm_pct',
+                                                       self.trailing_sl_arm_pct)
+
+                        # 移动止盈/止损的卖出价不得低于【保本线】。
+                        # 否则"回撤卖出"会在扣完手续费后反而亏钱 ——
+                        # 移动止盈本意是锁定利润，不该锁出亏损。
+                        # 保本线 = 开仓价 × (1 + 往返手续费 + 最低利润要求)
+                        floor_price = entry * (1 + self.breakeven_pct)
 
                         # 判定顺序：先硬止损 → 完整止盈 → 移动止盈 → 移动止损
                         # （原实现把 'profit >= tp*0.5' 放在最前，导致 take_profit 分支永不执行）
@@ -1370,11 +1382,15 @@ class QuantBot:
                             reason, action = "stop_loss", 'sell'
                         elif profit_pct >= tp * 100:
                             reason, action = "take_profit", 'sell'
-                        elif profit_pct >= tp * 100 * 0.5 and p <= high * (1 - ttp):
-                            # 高盈利区回撤：锁定利润
+                        elif profit_pct >= tp * 100 * 0.5 and p <= max(high * (1 - ttp), floor_price):
+                            # 高盈利区回撤：锁定利润（但不锁出亏损）
                             reason, action = "trailing_tp", 'sell'
-                        elif profit_pct > 0 and tsl > 0 and p <= high * (1 - tsl):
-                            # 移动止损：此前 trailing_sl_pct 从未参与任何计算
+                        elif (tsl > 0 and peak_pct >= tsl_arm * 100
+                              and p <= max(high * (1 - tsl), floor_price)):
+                            # 移动止损：必须先盈利到激活线才启动，
+                            # 且卖出价不低于保本线。
+                            # 原实现 `profit_pct > 0` 会让币价随便波动 0.7%
+                            # 就被洗出去，扣完手续费是净亏的。
                             reason, action = "trailing_sl", 'sell'
                         else:
                             reason, action = "", 'hold'
