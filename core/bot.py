@@ -31,6 +31,28 @@ CST = timezone(timedelta(hours=8))
 VALID_TIMEFRAMES = {
     '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w'
 }
+
+# ── 面板按钮 → 交互式输入规格 ──
+# 原实现只提示 "请输入 amount 的新值，例如 /amount 1.2"，
+# 但一没有 /amount 这个命令，二 handle_text_input 是空的(pass)，
+# 用户照着提示输入后毫无反应 —— 这是面板按钮"点了没用"的根因。
+#
+# 这里声明每个按钮要收集什么，由 handle_text_input 统一消费：
+#   ("param",  参数名, 提示语)   → 走 /set 的校验与换算
+#   ("timeframe", None, 提示语) → 走 /settf
+#   ("add_symbol"/"del_symbol", None, 提示语) → 走 增删币种
+MENU_INPUT_SPEC = {
+    "menu_set_tp":      ("param", "tp_pct",           "止盈百分比"),
+    "menu_set_sl":      ("param", "sl_pct",           "止损百分比"),
+    "menu_set_tsl":     ("param", "trailing_sl_pct",  "移动止损百分比"),
+    "menu_set_tmpt":    ("param", "trailing_tp_pct",  "移动止盈百分比"),
+    "menu_set_amount":  ("param", "single_order_pct", "单笔占总资金百分比"),
+    "menu_set_reserve": ("param", "reserve_bottom",   "保留底线金额"),
+    "menu_set_trades":  ("param", "max_daily_trades", "每日最多交易次数"),
+    "menu_set_tf":      ("timeframe", None,           "K 线周期"),
+    "menu_add_symbol":  ("add_symbol", None,          "要添加的币种"),
+    "menu_del_symbol":  ("del_symbol", None,          "要删除的币种"),
+}
 # 监控币种上限：每个币种都会占用 WebSocket 订阅与 REST 轮询配额
 MAX_SYMBOLS = 20
 
@@ -1292,9 +1314,9 @@ class QuantBot:
         lines = [
             f"📊 状态 {self.env_tag}",
             f"💰 总资产: {total:.2f}U | 可用: {usdt:.2f}U",
-            f"📈 持仓:",
+            "📈 持仓:",
             *pos_lines,
-            f"━━━━━━━━━━",
+            "━━━━━━━━━━",
             f"止盈 {self.tp_pct:.1%} 止损 {self.sl_pct:.1%} 移损 {self.trailing_sl_pct:.1%} 移盈 {self.trailing_tp_pct:.1%}",
             f"今日交易 {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}",
             f"日亏损 {self._today_loss_pct*100:.1f}% / {self.max_daily_loss_pct*100:.0f}%",
@@ -1682,7 +1704,17 @@ class QuantBot:
 
         answered = False
         if data == "panic_confirm":
-            await query.answer("发送 /panic 确认", show_alert=True)
+            # 原实现只提示"发送 /panic 确认"，用户还得手动再打一遍命令，
+            # 面板按钮形同虚设。改为点一次弹确认、再点一次才真执行，
+            # 既保证二次确认的安全性，又不用手打命令。
+            if not context.user_data.get("panic_armed"):
+                context.user_data["panic_armed"] = True
+                await query.answer(
+                    "⚠️ 再点一次「紧急全平」确认执行全部清仓", show_alert=True)
+            else:
+                context.user_data["panic_armed"] = False
+                await query.answer("🚨 执行中…", show_alert=True)
+                await self.cmd_panic(update, context)
             answered = True
         elif data == "toggle_auto":
             self.auto_trade_enabled = not self.auto_trade_enabled
@@ -1711,9 +1743,14 @@ class QuantBot:
             await self.cmd_stats(update, context)
         elif data == "backup":
             await self.cmd_backup(update, context)
-        elif data.startswith("menu_set_"):
-            key = data.replace("menu_set_", "")
-            await query.message.reply_text(f"请输入 {key} 的新值，例如 /{key} 1.2")
+        elif data in MENU_INPUT_SPEC:
+            # 进入交互式输入：把待办存进 user_data，由 handle_text_input 消费
+            kind, key, label = MENU_INPUT_SPEC[data]
+            context.user_data["pending"] = {"kind": kind, "key": key,
+                                            "label": label, "data": data}
+            hint = await self._pending_hint(kind, key, label)
+            await query.message.reply_text(hint)
+            answered = True
         elif data == "resume":
             self.risk.resume()
             await self._save_runtime_state()
@@ -1723,8 +1760,13 @@ class QuantBot:
             await self.cmd_gridstatus(update, context)
         elif data == "params":
             await self.cmd_params(update, context)
+        elif data == "reconcile":
+            await self.cmd_reconcile(update, context)
+        elif data == "restore":
+            await self.cmd_restore(update, context)
         else:
-            await query.answer("功能待实现", show_alert=True)
+            # 兜底：不再笼统提示"功能待实现"，而是列出可用按钮便于排查
+            await query.answer("未知操作，请用 /menu 刷新面板", show_alert=True)
             answered = True
 
         # 只应答一次；Telegram 对同一 callback_query 重复 answer 会报错
@@ -1737,9 +1779,131 @@ class QuantBot:
         except:
             pass
 
+    async def _pending_hint(self, kind: str, key, label: str) -> str:
+        """拼出交互式输入的提示语（含当前值、范围、可选项）"""
+        from core.params import PARAMS, display, range_hint
+        if kind == "param" and key in PARAMS:
+            spec = PARAMS[key]
+            cur = display(key, getattr(self, key, spec.default))
+            return (f"✏️ 请输入新的{label}\n\n"
+                    f"   当前: {cur}\n"
+                    f"   范围: {range_hint(spec)}\n\n"
+                    f"直接发送数字即可，输入 /cancel 取消")
+        if kind == "timeframe":
+            return (f"✏️ 请输入新的{label}\n\n"
+                    f"   当前: {self.timeframe}\n"
+                    f"   可选: {', '.join(sorted(VALID_TIMEFRAMES))}\n\n"
+                    f"直接发送如 15m，输入 /cancel 取消")
+        if kind == "add_symbol":
+            return (f"✏️ 请输入{label}\n\n"
+                    f"   当前: {', '.join(self.symbols)}\n"
+                    f"   上限: {MAX_SYMBOLS} 个\n\n"
+                    f"直接发送如 BTC（自动补 /USDT），输入 /cancel 取消")
+        if kind == "del_symbol":
+            return (f"✏️ 请输入{label}\n\n"
+                    f"   当前: {', '.join(self.symbols)}\n\n"
+                    f"直接发送如 BTC，输入 /cancel 取消")
+        return f"✏️ 请输入新的{label}（输入 /cancel 取消）"
+
     async def handle_text_input(self, update, context):
-        # 简化输入处理，只记录
-        pass
+        """
+        处理面板按钮发起的交互式输入。
+
+        原实现是空的 pass —— 用户按提示输入后毫无反应，
+        面板里 10 个按钮等于全部失效。这里补上消费逻辑。
+
+        没有待办输入时静默忽略，不打扰用户。
+        """
+        pending = (context.user_data or {}).get("pending")
+        if not pending:
+            return
+        if not self._auth(update):
+            return
+
+        msg = update.effective_message
+        text = (msg.text or "").strip()
+        if not text:
+            return
+
+        # 取消
+        if text.lower() in ("/cancel", "cancel", "取消", "/取消"):
+            context.user_data.pop("pending", None)
+            return await msg.reply_text("↩️ 已取消输入")
+
+        kind = pending.get("kind")
+        key = pending.get("key")
+
+        try:
+            if kind == "param":
+                from core.params import PARAMS, parse, display, range_hint
+                val, err = parse(key, text)
+                if err:
+                    spec = PARAMS[key]
+                    return await msg.reply_text(
+                        f"❌ {err}\n范围: {range_hint(spec)}\n\n"
+                        f"请重新输入，或发送 /cancel 取消")
+                old = getattr(self, key, None)
+                setattr(self, key, val)
+                await self._save_config()
+                context.user_data.pop("pending", None)
+                spec = PARAMS[key]
+                return await msg.reply_text(
+                    f"✅ {spec.desc}\n"
+                    f"   {display(key, old)} → {display(key, val)}")
+
+            if kind == "timeframe":
+                tf = text.lower()
+                if tf not in VALID_TIMEFRAMES:
+                    return await msg.reply_text(
+                        f"❌ 不支持周期 {tf}\n"
+                        f"可选: {', '.join(sorted(VALID_TIMEFRAMES))}\n\n"
+                        f"请重新输入，或发送 /cancel 取消")
+                old = self.timeframe
+                self.timeframe = tf
+                self._tech_cache.clear()
+                self._tech_cache_time.clear()
+                await self._save_config()
+                context.user_data.pop("pending", None)
+                return await msg.reply_text(f"✅ 周期: {old} → {tf}")
+
+            if kind in ("add_symbol", "del_symbol"):
+                sym = text.strip().upper()
+                if "/" not in sym:
+                    sym += "/USDT"
+                if kind == "add_symbol":
+                    if sym in self.symbols:
+                        return await msg.reply_text(f"⚠️ {sym} 已存在")
+                    if len(self.symbols) >= MAX_SYMBOLS:
+                        return await msg.reply_text(
+                            f"⚠️ 最多 {MAX_SYMBOLS} 个币种")
+                    self.symbols.append(sym)
+                    await self._resubscribe_symbols()
+                    await self._save_config()
+                    context.user_data.pop("pending", None)
+                    return await msg.reply_text(f"✅ 已添加 {sym}")
+                else:
+                    if sym not in self.symbols:
+                        return await msg.reply_text(f"⚠️ {sym} 不存在")
+                    gst = self.grid.get_state(sym) if self.grid else None
+                    if gst and gst.lots:
+                        return await msg.reply_text(
+                            f"⛔ {sym} 网格尚有 {len(gst.lots)} 档持仓，请先清仓")
+                    if self._bot_position_amount(sym) > 1e-12:
+                        return await msg.reply_text(
+                            f"⛔ {sym} 尚有持仓，请先平仓再删除")
+                    self.symbols.remove(sym)
+                    if self.grid:
+                        self.grid.remove(sym)
+                    await self._resubscribe_symbols()
+                    await self._save_config()
+                    context.user_data.pop("pending", None)
+                    return await msg.reply_text(f"✅ 已删除 {sym}")
+        except Exception as e:
+            logger.error(f"交互式输入处理失败: {e}")
+            return await msg.reply_text(f"❌ 处理失败: {e}")
+
+        await msg.reply_text("❌ 未知的输入类型，已取消")
+        context.user_data.pop("pending", None)
 
     # ---------- 主运行循环 ----------
     async def run(self):
