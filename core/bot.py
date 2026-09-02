@@ -171,6 +171,12 @@ class QuantBot:
 
         # 市场自适应（按波动/趋势动态调阈值与仓位）
         # 这些是随行情推导出的运行中状态，不是用户配置，故不进参数注册表
+        #
+        # ⚠️ 必须按币种隔离：BTC 与 DOGE 的波动特性完全不同，
+        #    共用一个全局变量会让后处理的币种沿用先处理币种的状态。
+        #    实测四个币种会全部显示同一状态（见 test_adaptive.py）。
+        self._adaptive = {}          # {sym: {state,tp_factor,sl_factor,offset,amount_factor,ts}}
+        # 下面是"最后一次更新"的镜像，仅供外部读取兼容（signals.py / 老代码）
         self._adaptive_state = 'neutral'
         self._adaptive_tp_factor = 1.0
         self._adaptive_sl_factor = 1.0
@@ -203,9 +209,14 @@ class QuantBot:
                         if raw else set())
         self.env_tag = "🧪 (模拟盘)" if settings.IS_SANDBOX else "🔴 (实盘)"
         self.coin_configs = {}
+        # 启动时被判定无效的交易对 {sym: reason}，隔离而非删除
+        self._invalid_symbols = {}
 
         # Telegram 应用
         self.tg_app = None
+
+        # 按参数注册表补齐默认值（新增参数无需再改 __init__）
+        self._ensure_param_defaults()
         if settings.TG_BOT_TOKEN:
             self._init_telegram()
 
@@ -222,6 +233,54 @@ class QuantBot:
                 if sym not in self._symbol_locks:
                     self._symbol_locks[sym] = asyncio.Lock()
         return self._symbol_locks[sym]
+
+    def _ensure_param_defaults(self):
+        """
+        给所有注册参数补默认值兜底。
+
+        params.py 每新增一个参数，bot 必须自动获得同名属性。
+        原实现靠 __init__ 里一处集中赋值，漏写一个就会在运行到那行时
+        抛 AttributeError —— 而且是【只在特定行情分支下】才触发，
+        测试很难覆盖。改为按注册表自动补齐，永不遗漏。
+        """
+        from core.params import PARAMS
+        missing = []
+        for key, spec in PARAMS.items():
+            if not hasattr(self, key):
+                setattr(self, key, spec.default)
+                missing.append(key)
+        if missing:
+            logger.info(f"ℹ️ 已补齐 {len(missing)} 个参数默认值")
+
+    async def _sanitize_symbols(self):
+        """
+        启动时清洗监控列表。
+
+        场景：上次手滑加了个不存在的交易对，或者交易所把某个币下线了。
+        若不清理，WebSocket 订阅会【整体失败】—— 一个坏币种拖垮所有币种。
+
+        采取"隔离而非删除"：把无效交易对移到 self._invalid_symbols，
+        保留在配置里（万一交易所只是临时下线），但不参与订阅与交易。
+        """
+        bad = []
+        for sym in list(self.symbols):
+            ok, reason = self._validate_symbol(sym)
+            if not ok:
+                bad.append((sym, reason))
+                continue
+            exists, why = await self._market_exists(sym)
+            if not exists:
+                bad.append((sym, why))
+        if not bad:
+            return []
+        self._invalid_symbols = {s: r for s, r in bad}
+        for sym, _ in bad:
+            if sym in self.symbols:
+                self.symbols.remove(sym)
+        for sym, reason in bad:
+            logger.warning(f"⚠️ 已隔离无效交易对 {sym}: {reason}")
+        logger.warning(f"⚠️ 共隔离 {len(bad)} 个交易对，其余币种不受影响")
+        return bad
 
     def _get_coin_param(self, sym, key, default):
         return self.coin_configs.get(sym, {}).get(key, default)
@@ -241,17 +300,52 @@ class QuantBot:
         cost = sum(float(l.get('cost', 0)) for l in lots)
         return cost / amount if amount > 0 else 0.0
 
-    def _append_position_lot(self, sym, amount, price, cost, fee=0.0, currency=''):
+    def _append_position_lot(self, sym, amount, price, cost, fee=0.0,
+                             currency='', fee_usdt=None):
+        """
+        记一笔买入。
+
+        fee         原始手续费（数量随币种而定，可能是币数也可能是 USDT）
+        fee_usdt    折算成 USDT 后可安全参与盈亏计算的手续费
+                    · base 币扣费 → 0（已通过减少 amount 体现，不重复计）
+                    · quote 币扣费 → 面值
+                    · 旧数据无此字段 → None，回退按币种判断（见下）
+        """
+        if fee_usdt is None:
+            # 兼容旧账本：按币种推断
+            base = sym.split('/')[0] if '/' in sym else ''
+            fee_usdt = 0.0 if currency == base else float(fee)
         self._position_lots_for(sym).append({
             'amount': float(amount), 'price': float(price), 'cost': float(cost),
-            'fee': float(fee), 'fee_currency': currency, 'time': time.time()
+            'fee': float(fee), 'fee_currency': currency,
+            'fee_usdt': float(fee_usdt), 'time': time.time()
         })
         self.entries[sym] = self._weighted_entry(sym)
         self.position_counts[sym] = len(self.position_lots[sym])
         self._trailing_high[sym] = max(self._trailing_high.get(sym, self.entries[sym]), price)
 
     def _consume_position_lots(self, sym, amount, exit_price, exit_revenue, sell_fee=0.0):
+        """
+        FIFO 消耗账本。
+
+        ⚠️ 原子性修复：原实现边遍历边扣减，走到最后才发现数量不够，
+        此时 lot 已被消耗并 pop，再抛 ValueError —— 调用方 catch 后只
+        continue，不回滚，导致这部分持仓从账本永久消失，
+        而交易所里币还在，下次启动对账必然判「不一致」并暂停交易。
+
+        现改为【先预检查、后扣减】：不够就原样抛出，账本一个字节都不动。
+        """
         remaining = float(amount)
+
+        # ── 预检查：账本是否够扣（在修改任何状态之前）──
+        available = sum(float(l.get('amount', 0))
+                        for l in self.position_lots.get(sym, []))
+        # 容差对齐下面的循环判定，避免 1e-12 量级的浮点噪声误报
+        if available + 1e-8 < remaining:
+            raise ValueError(
+                f'{sym} 卖出数量超过账本: 需要{remaining:.8f}, '
+                f'可用{available:.8f}（账本未做任何修改）')
+
         realized_cost = 0.0
         realized_fee_buy = 0.0
         while remaining > 1e-12 and self.position_lots.get(sym):
@@ -260,14 +354,21 @@ class QuantBot:
             take = min(remaining, lot_amt)
             ratio = take / lot_amt if lot_amt else 0
             realized_cost += float(lot.get('cost', 0)) * ratio
-            realized_fee_buy += float(lot.get('fee', 0)) * ratio
+            # 用折算后的 fee_usdt，而不是原始 fee（原始值可能是币数）
+            realized_fee_buy += float(lot.get('fee_usdt', 0)) * ratio
             lot['amount'] = lot_amt - take
             lot['cost'] = float(lot.get('cost', 0)) * (1 - ratio)
             lot['fee'] = float(lot.get('fee', 0)) * (1 - ratio)
+            lot['fee_usdt'] = float(lot.get('fee_usdt', 0)) * (1 - ratio)
             remaining -= take
             if lot['amount'] <= 1e-12:
                 self.position_lots[sym].pop(0)
         if remaining > 1e-8:
+            # 预检查通过后这里理论上不会触发；若触发说明存在并发修改，
+            # 此时账本已被部分消耗，属于严重不一致，必须告警而非静默
+            logger.error(
+                f"🚨 {sym} 账本并发修改导致超卖 {remaining:.8f}，"
+                f"请立即 /reconcile 核对持仓")
             raise ValueError(f'{sym} 卖出数量超过账本: remaining={remaining}')
         self.position_counts[sym] = len(self.position_lots.get(sym, []))
         if self.position_lots.get(sym):
@@ -436,6 +537,17 @@ class QuantBot:
             if key in cfg:
                 setattr(self, key, cfg[key])
         self.symbols = cfg.get('symbols') or [settings.SYMBOL, "BTC/USDT", "SOL/USDT"]
+
+        # 启动自检：隔离无效交易对，防止一个坏币种拖垮整个 WebSocket 订阅
+        try:
+            bad = await self._sanitize_symbols()
+            if bad:
+                self._pending_symbol_warning = (
+                    f"⚠️ 已隔离 {len(bad)} 个无效交易对（其余币种不受影响）：\n"
+                    + "\n".join(f"  · {s} — {r}" for s, r in bad[:5])
+                    + (f"\n  ...等 {len(bad)} 个" if len(bad) > 5 else ""))
+        except Exception as e:
+            logger.warning(f"交易对自检跳过: {e}")
         self.coin_configs = json.loads(cfg.get('coin_configs', '{}')) if isinstance(cfg.get('coin_configs'), str) else cfg.get('coin_configs', {})
         self.trades = await load_trades()
 
@@ -468,6 +580,13 @@ class QuantBot:
         note = getattr(self, "_pending_restore_note", None)
         if note:
             await self._alert(f"♻️ **已从备份恢复数据库**\n\n{note}",
+                              level="warning")
+
+        # 无效交易对被隔离：必须告诉用户，否则他以为那个币还在监控
+        warn = getattr(self, "_pending_symbol_warning", None)
+        if warn:
+            await self._alert(f"⚠️ **部分交易对已被隔离**\n\n{warn}\n\n"
+                              f"剩余 {len(self.symbols)} 个币种正常监控",
                               level="warning")
 
         # 启动后台定时备份
@@ -734,14 +853,56 @@ class QuantBot:
         if tech:
             self._tech_cache[key] = tech
             self._tech_cache_time[key] = now
+            self._prune_tech_cache(now)
         return tech
+
+    def _prune_tech_cache(self, now=None, max_entries=200, max_age=300.0):
+        """
+        清理技术缓存。
+
+        原实现只在【切换 K 线周期】时 clear()，平时从不清 ——
+        删除币种后其条目会永久驻留。虽然上限很小（约 200KB，
+        不构成实际风险），但长期运行的进程不该有无界结构。
+
+        双条件剪枝：超过体积上限，或条目陈旧且超过上限一半。
+        """
+        now = now if now is not None else time.time()
+        cache, times = self._tech_cache, self._tech_cache_time
+        if not isinstance(cache, dict):
+            return
+        # 1) 清掉已失效的键（两个 dict 可能不同步）
+        for k in list(times):
+            if k not in cache:
+                times.pop(k, None)
+        if len(cache) <= max_entries:
+            return
+        # 2) 按年龄排序，先删最旧的
+        ordered = sorted(times.items(), key=lambda kv: kv[1])
+        target = len(cache) - max_entries // 2
+        removed = 0
+        for k, ts in ordered:
+            if removed >= target:
+                break
+            if (now - ts) > max_age:
+                cache.pop(k, None)
+                times.pop(k, None)
+                removed += 1
+        if removed:
+            logger.debug(f"🧹 技术缓存清理 {removed} 条，剩余 {len(cache)}")
 
     # ---------- 新增：自适应参数更新 ----------
     async def _update_market_adaptive_params(self, sym: str):
-        """根据技术指标更新自适应参数（每5分钟）"""
+        """
+        根据技术指标更新【该币种】的自适应参数（每5分钟）。
+
+        原实现用全局单例 + 全局节流，导致一轮循环里只有第一个币种真正计算，
+        后面所有币种沿用它的状态 —— 四个波动特性不同的币种会显示同一状态。
+        现改为按币种分别存储与节流。
+        """
         now = time.time()
-        if now - self._adaptive_update_time < 300:
-            return
+        rec = self._adaptive.get(sym)
+        if rec and (now - rec.get("ts", 0)) < 300:
+            return   # 该币种尚未过期，不重算
         tech = await self._get_cached_tech(sym, self.timeframe, 50)
         if not tech:
             return
@@ -777,13 +938,32 @@ class QuantBot:
         else:
             tp_f, sl_f, off, amt_f = 1.0, 1.0, 0, 1.0
 
+        self._adaptive[sym] = {
+            "state": state, "tp_factor": tp_f, "sl_factor": sl_f,
+            "offset": off, "amount_factor": amt_f, "ts": now,
+        }
+        # 镜像（仅用于外部兼容读取，内部逻辑一律用 _adaptive_of(sym)）
         self._adaptive_state = state
         self._adaptive_tp_factor = tp_f
         self._adaptive_sl_factor = sl_f
         self._adaptive_score_offset = off
         self._adaptive_amount_factor = amt_f
         self._adaptive_update_time = now
-        logger.info(f"📊 自适应状态: {state} (波动{volatility:.2%}, 趋势{trend:.2%})")
+        logger.info(f"📊 自适应状态 [{sym}]: {state} "
+                    f"(波动{volatility:.2%}, 趋势{trend:.2%})")
+
+    def _adaptive_of(self, sym: str) -> dict:
+        """
+        取【该币种】的自适应参数。未计算过则返回中性默认值（不影响交易）。
+
+        所有内部逻辑都必须走这里，不能直接读 _adaptive_xxx 全局属性，
+        否则又会退化成跨币种串用。
+        """
+        rec = self._adaptive.get(sym)
+        if rec:
+            return rec
+        return {"state": "neutral", "tp_factor": 1.0, "sl_factor": 1.0,
+                "offset": 0, "amount_factor": 1.0, "ts": 0.0}
 
     # ---------- 核心信号（精简5因子 + 自适应调节） ----------
     async def _should_open_position(self, sym, p, tech, funding, fg, usdt_free):
@@ -846,29 +1026,30 @@ class QuantBot:
                        vol_score * 0.15 + fg_score * 0.15) - trend_penalty
         total_score = max(0, min(100, total_score))
 
-        # 自适应阈值偏移
+        # 自适应阈值偏移 —— 必须用【本币种】的参数
+        ad = self._adaptive_of(sym)
         base_threshold = self._get_coin_param(sym, 'auto_min_score', self.auto_min_score)
-        threshold = base_threshold + self._adaptive_score_offset
+        threshold = base_threshold + ad["offset"]
         threshold = max(40, min(95, threshold))
 
         should_open = total_score >= threshold and trend_penalty < 30
 
-        # 自适应仓位
+        # 自适应仓位 —— 同样用【本币种】的系数
         base_amount = self._calculate_dynamic_amount(self._get_coin_param(sym, 'single_order_usdt', self.single_order_usdt))
-        adjusted_amount = base_amount * self._adaptive_amount_factor
+        adjusted_amount = base_amount * ad["amount_factor"]
 
         details = [f"RSI:{rsi:.0f}", f"BB:{bb_score:.0f}", f"OFI:{ofi_score:.0f}",
                    f"FG:{fg_score:.0f}({'NA' if fg is None else int(fg)})",
-                   f"趋势:{trend_strength:.2%}", f"惩罚:{trend_penalty}", f"状态:{self._adaptive_state}"]
+                   f"趋势:{trend_strength:.2%}", f"惩罚:{trend_penalty}", f"状态:{ad['state']}"]
 
         return {
             'should_open': should_open,
             'score': total_score,
             'details': details,
             'amount': adjusted_amount,
-            'state': self._adaptive_state,
-            'adaptive_offset': self._adaptive_score_offset,
-            'adaptive_factor': self._adaptive_amount_factor
+            'state': ad["state"],
+            'adaptive_offset': ad["offset"],
+            'adaptive_factor': ad["amount_factor"]
         }
         
         # ---------- 自动交易主循环 ----------
@@ -973,12 +1154,24 @@ class QuantBot:
                         base = sym.split('/')[0]
                         net_amount = filled - fee if fee_currency == base else filled
                         real_cost = filled * avg + (fee if fee_currency in ('', 'USDT') else 0)
+                        # ⚠️ 手续费折算：以【币的数量】计的手续费必须先换成 USDT。
+                        # 原实现直接把 lot['fee']（币数）当 USDT 从盈亏里减，
+                        # 而这部分已通过 net_amount 减少体现过一次 —— 重复扣。
+                        # 误差与币价成反比：ETH 可忽略，DOGE 每100U少算0.53U，
+                        # SHIB 这类极低价币会算出荒谬结果。
+                        if fee_currency == base:
+                            # base 币扣费：已体现在 net_amount 里，成本不再重复计
+                            fee_usdt = 0.0
+                        else:
+                            # quote 币（USDT）或未知币种：按面值计入
+                            fee_usdt = float(fee)
                         if net_amount <= 0 or real_cost <= 0:
                             # 原实现直接 _is_paused=True，单次下单抖动即导致机器人永久停摆
                             await self._alert(f"{sym} 买单异常(filled={filled})，跳过本轮", "critical")
                             continue
 
-                        self._append_position_lot(sym, net_amount, avg, filled * avg, fee, fee_currency)
+                        self._append_position_lot(sym, net_amount, avg, filled * avg,
+                                                  fee, fee_currency, fee_usdt=fee_usdt)
                         self.entry_details[sym] = {'signal_score': score, 'fear_greed': fg}
                         disp_t, iso_t = now_parts()
                         await save_trade_detail({
@@ -1029,16 +1222,42 @@ class QuantBot:
 
                         entry = self._weighted_entry(sym) or self.entries.get(sym, p)
                         detail = self.entry_details.get(sym, {})
-                        # 自适应止盈止损
+                        # 自适应止盈止损 —— 用【本币种】的因子
+                        adx = self._adaptive_of(sym)
                         base_tp = self._get_coin_param(sym, 'tp_pct', self.tp_pct)
                         base_sl = self._get_coin_param(sym, 'sl_pct', self.sl_pct)
-                        tp = base_tp * self._adaptive_tp_factor
-                        sl = base_sl * self._adaptive_sl_factor
+                        tp = base_tp * adx["tp_factor"]
+                        sl = base_sl * adx["sl_factor"]
                         # 限制范围
-                        tp = max(self.breakeven_pct, min(0.06, tp))
-                        sl = max(0.002, min(0.04, sl))
-                        if tp / sl < 1.2:
-                            tp = sl * 1.2
+                        # 安全边界：原为硬编码 0.06 / 0.002 / 0.04 / 1.2，
+                        # 用户设了更大的止盈会被静默吞掉且无任何提示。
+                        # 现改为可调参数，并在真正夹取时告警。
+                        tp_cap = self._get_coin_param(sym, 'tp_max_pct', self.tp_max_pct)
+                        sl_lo = self._get_coin_param(sym, 'sl_min_pct', self.sl_min_pct)
+                        sl_hi = self._get_coin_param(sym, 'sl_max_pct', self.sl_max_pct)
+                        min_ratio = self._get_coin_param(sym, 'tp_sl_min_ratio', self.tp_sl_min_ratio)
+
+                        clamped = []
+                        if tp > tp_cap:
+                            clamped.append(f"止盈 {tp*100:.2f}%→{tp_cap*100:.2f}%(上限)")
+                            tp = tp_cap
+                        if tp < self.breakeven_pct:
+                            clamped.append(f"止盈 {tp*100:.2f}%→{self.breakeven_pct*100:.2f}%(保本线)")
+                            tp = self.breakeven_pct
+                        if sl > sl_hi:
+                            clamped.append(f"止损 {sl*100:.2f}%→{sl_hi*100:.2f}%(上限)")
+                            sl = sl_hi
+                        if sl < sl_lo:
+                            clamped.append(f"止损 {sl*100:.2f}%→{sl_lo*100:.2f}%(下限)")
+                            sl = sl_lo
+                        if sl > 0 and tp / sl < min_ratio:
+                            new_tp = sl * min_ratio
+                            clamped.append(f"止盈 {tp*100:.2f}%→{new_tp*100:.2f}%(维持{sl_lo and min_ratio or min_ratio}倍比值)")
+                            tp = new_tp
+                        if clamped:
+                            logger.warning(
+                                f"⚠️ {sym} 止盈止损被安全边界夹取: {', '.join(clamped)}\n"
+                                f"   如需放宽: /set tpmax_pct <值> 或 /set slmax_pct <值>")
 
                         high = self._trailing_high.get(sym, entry)
                         if high <= 0:
@@ -1334,8 +1553,16 @@ class QuantBot:
             f"今日交易 {self.daily_trades}/{self.max_daily_trades if self.max_daily_trades>0 else '∞'}",
             f"日亏损 {self._today_loss_pct*100:.1f}% / {self.max_daily_loss_pct*100:.0f}%",
             f"回撤 {self.max_drawdown_pct*100:.0f}% | 暂停 {'是' if self._is_paused else '否'}",
-            f"自适应状态: {self._adaptive_state} (偏移{self._adaptive_score_offset:+d}分, 仓位{self._adaptive_amount_factor:.2f}x)",
         ]
+        # 自适应状态按币种分别显示 —— 原来只显示一个全局变量，
+        # 会让人误以为所有币种都处于同一状态（实际是串用的结果）。
+        ad_lines = []
+        for sym in self.symbols:
+            a = self._adaptive.get(sym)
+            if a:
+                ad_lines.append(f"{sym.split('/')[0]}:{a['state']}"
+                                f"({a['offset']:+d}分,{a['amount_factor']:.2f}x)")
+        lines.append("自适应: " + (" ".join(ad_lines) if ad_lines else "尚未计算"))
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_check(self, update, context):
@@ -1570,6 +1797,91 @@ class QuantBot:
         await self._save_config()
         return await update.effective_message.reply_text(f"✅ 周期: {self.timeframe}")
 
+    # ---------- 币种校验 ----------
+
+    # 稳定币：作为 base 时"低吸高卖"没有意义（价格恒定，赚不到差价）
+    STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE"}
+
+    def _validate_symbol(self, sym: str):
+        """
+        校验交易对是否可用于本策略。
+
+        原实现 /addsymbol 完全不校验：
+          1. 不存在的交易对会直接进入监控列表
+          2. WebSocket 订阅遇到坏交易对会【整体失败】
+             —— 一个坏币种拖垮所有币种的行情
+          3. 主循环每轮都对它重试，持续刷错误日志
+
+        返回 (ok: bool, reason: str)
+        """
+        if not sym or "/" not in sym:
+            return False, "格式应为 BASE/QUOTE，如 ETH/USDT"
+
+        parts = sym.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return False, "格式应为 BASE/QUOTE，如 ETH/USDT"
+
+        base, quote = parts[0].upper(), parts[1].upper()
+
+        # 合约/永续符号（如 ETH/USDT:USDT）
+        if ":" in quote or ":" in base:
+            return False, f"{sym} 是合约符号，本机器人只支持现货"
+
+        # 稳定币当 base
+        if base in self.STABLECOINS:
+            return False, f"{base} 是稳定币，价格恒定，低吸高卖无意义"
+
+        # 计价币种必须是 USDT（余额与下单都硬编码按 USDT 处理）
+        if quote != "USDT":
+            return False, (f"计价币种应为 USDT，当前是 {quote}\n"
+                           f"余额与下单逻辑按 USDT 计价实现，用 {quote} 会导致金额判断错误")
+
+        return True, ""
+
+    async def _market_exists(self, sym: str):
+        """
+        查交易所是否真有这个交易对。 markets 未加载时跳过（宽松放行），
+        网络异常也放行 —— 校验失败不该阻塞正常添加。
+        """
+        try:
+            ex = getattr(self.exchange, "exchange", None) or self.exchange
+            markets = getattr(ex, "markets", None)
+            if not markets:
+                return True, ""      # 无法校验，放行
+            if sym in markets:
+                m = markets[sym] or {}
+                if m.get("active") is False:
+                    return False, f"{sym} 在交易所已下线/不可交易"
+                return True, ""
+            return False, f"交易所在售列表中未找到 {sym}"
+        except Exception as e:
+            logger.debug(f"交易对存在性校验跳过: {e}")
+            return True, ""
+
+    def _purge_symbol_state(self, sym: str):
+        """
+        彻底清掉某币种的全部运行时状态。
+
+        原 cmd_del_symbol 只清了 grid，其余六个容器全部残留：
+            entries / position_lots / position_counts /
+            _trailing_high / entry_details / _adaptive / coin_configs
+        这些会随 _save_runtime_state 持久化到数据库，
+        反复增删币种会让 DB 里堆积无效数据；
+        若同名币种重新添加，还可能读到【上一次的旧状态】
+        （例如旧的持仓成本、旧的自适应参数）。
+        """
+        removed = []
+        for attr in ("entries", "position_lots", "position_counts",
+                     "_trailing_high", "entry_details",
+                     "_adaptive", "coin_configs"):
+            d = getattr(self, attr, None)
+            if isinstance(d, dict) and sym in d:
+                d.pop(sym, None)
+                removed.append(attr)
+        if removed:
+            logger.info(f"🧹 已清理 {sym} 的运行时状态: {', '.join(removed)}")
+        return removed
+
     async def cmd_add_symbol(self, update, context):
         """/addsymbol ETH —— 新增监控币种"""
         if not self._auth(update):
@@ -1582,6 +1894,18 @@ class QuantBot:
             sym += "/USDT"
         if sym in self.symbols:
             return await update.effective_message.reply_text("⚠️ 已存在")
+
+        # 格式与计价币种校验
+        ok, reason = self._validate_symbol(sym)
+        if not ok:
+            return await update.effective_message.reply_text(f"❌ {reason}")
+
+        # 交易所是否真有这个交易对
+        exists, why = await self._market_exists(sym)
+        if not exists:
+            return await update.effective_message.reply_text(
+                f"❌ {why}\n\n💡 请检查拼写，或在交易所确认该交易对是否已上线")
+
         if len(self.symbols) >= MAX_SYMBOLS:
             return await update.effective_message.reply_text(
                 f"⚠️ 最多 {MAX_SYMBOLS} 个币种（过多会拖慢轮询与 WebSocket）")
@@ -1613,9 +1937,12 @@ class QuantBot:
         self.symbols.remove(sym)
         if self.grid:
             self.grid.remove(sym)
+        self._purge_symbol_state(sym)
         await self._resubscribe_symbols()
         await self._save_config()
-        return await update.effective_message.reply_text(f"✅ 已删除 {sym}")
+        await self._save_runtime_state()
+        return await update.effective_message.reply_text(
+            f"✅ 已删除 {sym}（含其运行时状态）")
 
     async def _resubscribe_symbols(self):
         """币种变动后重建 WebSocket 订阅"""
@@ -2271,6 +2598,13 @@ class QuantBot:
                 if kind == "add_symbol":
                     if sym in self.symbols:
                         return await msg.reply_text(f"⚠️ {sym} 已存在")
+                    ok, reason = self._validate_symbol(sym)
+                    if not ok:
+                        return await msg.reply_text(f"❌ {reason}")
+                    exists, why = await self._market_exists(sym)
+                    if not exists:
+                        return await msg.reply_text(
+                            f"❌ {why}\n\n请重新输入，或发送 /cancel 取消")
                     if len(self.symbols) >= MAX_SYMBOLS:
                         return await msg.reply_text(
                             f"⚠️ 最多 {MAX_SYMBOLS} 个币种")
@@ -2292,10 +2626,13 @@ class QuantBot:
                     self.symbols.remove(sym)
                     if self.grid:
                         self.grid.remove(sym)
+                    self._purge_symbol_state(sym)
                     await self._resubscribe_symbols()
                     await self._save_config()
+                    await self._save_runtime_state()
                     _clear()
-                    return await msg.reply_text(f"✅ 已删除 {sym}")
+                    return await msg.reply_text(
+                        f"✅ 已删除 {sym}（含其运行时状态）")
         except Exception as e:
             logger.error(f"交互式输入处理失败: {e}")
             return await msg.reply_text(f"❌ 处理失败: {e}")
@@ -2528,7 +2865,8 @@ class QuantBot:
         self.env_tag = "🧪 (模拟盘)" if settings.IS_SANDBOX else "🔴 (实盘)"
         self.coin_configs = {}
 
-        # ---------- 新增：自适应参数 ----------
+        # ---------- 自适应参数（按币种隔离）----------
+        self._adaptive = {}
         self._adaptive_state = 'neutral'
         self._adaptive_tp_factor = 1.0
         self._adaptive_sl_factor = 1.0
