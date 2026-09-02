@@ -672,11 +672,28 @@ class QuantBot:
             logger.info(f"🔍 对账轻微偏差 {len(drift)} 项:\n" + self.reconciler.summary())
 
         if blocking:
+            # 区分两种不一致，给出对应的解锁路径。
+            # 原实现只说"去人工核对"，但没给工具 ——
+            # 在 Render 免费层（临时盘）上数据库会随重启丢失，
+            # 于是每次重启都阻塞，形成死锁。
+            only_missing_local = all(
+                float(getattr(r, "local_qty", 0) or 0) <= 0
+                and float(getattr(r, "exchange_qty", 0) or 0) > 0
+                for r in blocking)
+            if only_missing_local:
+                guide = ("本地账本为空，但交易所有真实持仓 ——\n"
+                         "多数是数据库随重启丢失（Render 免费层临时盘）。\n\n"
+                         "解锁方式：\n"
+                         "  `/import`  把交易所持仓导入账本（推荐）\n"
+                         "  `/resume`  若确认这些持仓与机器人无关，直接放行")
+            else:
+                guide = ("本地账本与交易所数量对不上。\n\n"
+                         "请先到交易所核对真实情况，然后：\n"
+                         "  `/import`  以交易所数据为准，重建本地账本\n"
+                         "  `/resume`  若已人工核对无误，解除暂停")
             msg = ("🚨 **启动对账发现持仓不一致**\n\n"
                    + self.reconciler.summary()
-                   + "\n\n已暂停上述币种交易。"
-                   "请人工核对后，用 `/reconcile` 重新对账，"
-                   "确认无误后用 `/resume` 解除。")
+                   + "\n\n已暂停上述币种交易。\n\n" + guide)
             await self._alert(msg, level="critical")
             logger.error(f"🚨 对账阻塞 {len(blocking)} 个币种，已暂停交易")
         else:
@@ -739,6 +756,215 @@ class QuantBot:
             return True
         except Exception as e:
             logger.warning(f"备份推送 Telegram 失败: {e}")
+            return False
+
+    # ---------- 从交易所导入持仓（解锁对账阻塞）----------
+
+    async def _derive_entry_from_trades(self, sym, amount_now):
+        """
+        从成交历史反推持仓成本。
+
+        为什么需要：本地账本丢失（Render 临时盘重置）时，
+        交易所仍有真实持仓，但机器人不知道成本价。
+        没有成本价就无法计算止盈止损 —— 这是"暂停"的根源。
+
+        做法：从最近成交往回做 FIFO 配对，
+        得到当前持仓量对应的加权平均成本。
+
+        返回 (avg_price, source)；推算不出时回退到当前价并标注来源。
+        """
+        base = sym.split('/')[0]
+        trades = await self.exchange.fetch_my_trades(sym, limit=100)
+        if not trades:
+            ticker = self.ws.get_ticker(sym)
+            px = float(ticker['last']) if ticker else 0.0
+            return px, "当前价（无成交历史，成本仅供参考）"
+
+        # 从最近往回，维护一个买入批次栈做 FIFO 配对
+        buy_lots = []          # [(qty, price)]
+        for t in trades:
+            try:
+                side = str(t.get('side', '')).lower()
+                qty = float(t.get('amount') or 0)
+                px = float(t.get('price') or 0)
+            except Exception:
+                continue
+            if qty <= 0 or px <= 0:
+                continue
+            if side == 'sell':
+                # FIFO：与主账本 _consume_position_lots 保持一致。
+                # 曾用 LIFO（pop 末尾），测试抓出偏差 ——
+                # 复杂买卖交错场景推算 132，正确应为 136。
+                need = qty
+                while need > 0 and buy_lots:
+                    lq, lp = buy_lots[0]
+                    take = min(lq, need)
+                    lq -= take
+                    need -= take
+                    if lq <= 1e-12:
+                        buy_lots.pop(0)
+                    else:
+                        buy_lots[0] = (lq, lp)
+            elif side == 'buy':
+                # 扣除手续费才是真正到手的数量
+                fee = t.get('fee') or {}
+                fcost = 0.0
+                try:
+                    fcost = float(fee.get('cost') or 0)
+                except Exception:
+                    pass
+                fcur = str(fee.get('currency') or '').upper()
+                net = qty - fcost if fcur == base else qty
+                if net > 0:
+                    buy_lots.append((net, px))
+
+        remain = amount_now
+        cost = 0.0
+        got = 0.0
+        while remain > 0 and buy_lots:
+            lq, lp = buy_lots.pop()
+            take = min(lq, remain)
+            cost += take * lp
+            got += take
+            remain -= take
+            if got >= amount_now - 1e-12:
+                break
+        # 必须【覆盖绝大部分持仓】才采用推算结果。
+        #
+        # 若只匹配到一部分就采用，会造成虚假盈利：
+        #   例：实有 5.0 ETH（真实成本 3000），历史只找到 0.1 @100
+        #       → 账本成本记 100 → 账面浮盈 +2900%
+        #       → 止盈线 1.5% 立刻触发 → 在错误价格卖出
+        #       → 账本记"大赚"，实际是平价卖出还要倒贴手续费
+        #
+        # 覆盖不足时宁可用当前价（浮盈归零，止盈止损从此刻正常起算），
+        # 也不要虚假盈利。
+        if got > 0 and got >= amount_now * 0.95:
+            return cost / got, "成交历史推算"
+
+        ticker = self.ws.get_ticker(sym)
+        px = float(ticker['last']) if ticker else 0.0
+        if got > 0:
+            return px, (f"当前价（历史仅覆盖 {got/amount_now*100:.0f}%，"
+                        f"成本仅供参考）")
+        return px, "当前价（无可用成交历史，成本仅供参考）"
+
+    async def cmd_import_position(self, update, context):
+        """
+        /import —— 把交易所真实持仓导入本地账本，解除对账阻塞。
+
+        为什么需要这个命令：
+          启动对账发现"本地空、交易所有币"时会暂停该币交易，
+          这是正确的保护 —— 防止重复买入。
+          但原实现只告诉用户"去核对"，没给解锁路径。
+          在 Render 免费层（临时盘）上，数据库会随重启丢失，
+          于是每次重启都要人工介入，形成死锁。
+
+          交易所是权威数据源。既然它知道真实持仓，
+          就应该允许把它导入账本，而不是永远阻塞。
+
+        用法：
+          /import          导入当前被阻塞的币种
+          /import ETH/USDT 导入指定币种
+          /import all      导入全部有持仓的币种
+
+        注意：导入后盈亏从【导入时刻】起算，
+        之前的浮盈浮亏不会体现。
+        """
+        if not self._auth(update):
+            return
+        args = list(getattr(context, "args", None) or [])
+        target = (args[0].strip() if args else "").upper()
+
+        blocked = set(getattr(self.reconciler, "blocked", set()) or set())
+        if target in ("", "ALL"):
+            syms = sorted(blocked) if blocked else list(self.symbols)
+            if target == "ALL":
+                syms = list(self.symbols)
+        else:
+            syms = [target if "/" in target else target + "/USDT"]
+            if syms[0] not in self.symbols:
+                await update.effective_message.reply_text(
+                    f"❌ {syms[0]} 不在监控列表中")
+                return
+
+        if not syms:
+            await update.effective_message.reply_text(
+                "ℹ️ 当前没有被阻塞的币种，无需导入")
+            return
+
+        await update.effective_message.reply_text(
+            f"⏳ 正在从交易所导入 {len(syms)} 个币种的持仓…")
+
+        try:
+            bal = await self.exchange.fetch_balance()
+        except Exception as e:
+            await update.effective_message.reply_text(
+                f"❌ 读取交易所余额失败: {e}")
+            return
+
+        lines = []
+        imported = 0
+        for sym in syms:
+            base = sym.split('/')[0]
+            info = bal.get(base) or {}
+            free = float(info.get('free') or 0)
+            locked = float(info.get('used') or 0)
+            total = free + locked
+            if total <= 0:
+                continue
+
+            ticker = self.ws.get_ticker(sym)
+            cur = float(ticker['last']) if ticker else 0.0
+            avg, source = await self._derive_entry_from_trades(sym, total)
+
+            # 写入账本
+            self.position_lots[sym] = [{
+                'qty': total, 'price': avg, 'cost_usdt': total * avg,
+                'fee': 0.0, 'fee_currency': '', 'fee_usdt': 0.0,
+                'time': time.time(),
+            }]
+            self.entries[sym] = avg
+            self.position_counts[sym] = 1
+            self._trailing_high[sym] = max(cur, avg)
+            self.entry_details[sym] = {'imported': True, 'source': source}
+            imported += 1
+
+            # 解除阻塞
+            if hasattr(self.reconciler, "unblock"):
+                self.reconciler.unblock(sym)
+
+            pnl = ((cur - avg) / avg * 100) if avg > 0 else 0.0
+            lines.append(
+                f"✅ {base}  {total:.6f} @ {avg:.4f}\n"
+                f"     现价 {cur:.4f}  浮盈 {pnl:+.2f}%\n"
+                f"     成本来源：{source}")
+
+        if imported:
+            await self._save_runtime_state()
+            # 立即推送一份备份，避免下次重启再次丢失
+            try:
+                await self._push_backup_now()
+            except Exception:
+                pass
+            await update.effective_message.reply_text(
+                f"📥 已导入 {imported} 个币种\n\n"
+                + "\n".join(lines)
+                + "\n\n⚠️ 盈亏从【此刻】起算，之前的浮盈浮亏不计入。"
+                "\n已自动推送一份备份到本对话，供以后 /restore 恢复。")
+        else:
+            await update.effective_message.reply_text(
+                "ℹ️ 未发现可导入的持仓（交易所余额均为 0）")
+
+    async def _push_backup_now(self):
+        """立即导出并推送一份备份（不等 6 小时）"""
+        try:
+            path = await self.backup_mgr.export()
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read()
+            return await self._upload_backup(path, data)
+        except Exception as e:
+            logger.warning(f"即时备份推送失败: {e}")
             return False
 
     async def cmd_restore(self, update, context):
@@ -1391,6 +1617,10 @@ class QuantBot:
                         await self._refresh_balance_cache(force=True)
                         usdt_free = self._cached_usdt_free
                         await self._save_runtime_state()
+                        # 持仓变化后立刻异地备份。
+                        # 原实现等 6 小时，而 Render 随时可能重启，
+                        # 于是多数情况下备份还没攒下第一份就丢了。
+                        asyncio.create_task(self._push_backup_now())
                         opened.add(sym)
                         if settings.TG_CHAT_ID and self.tg_app:
                             try:
@@ -1566,6 +1796,7 @@ class QuantBot:
                             else:
                                 self._trailing_high.pop(sym, None)
                             await self._save_runtime_state()
+                            asyncio.create_task(self._push_backup_now())
                             if settings.TG_CHAT_ID and self.tg_app:
                                 try:
                                     await self.tg_app.bot.send_message(chat_id=settings.TG_CHAT_ID,
@@ -1758,6 +1989,7 @@ class QuantBot:
             [InlineKeyboardButton("🕸️ 网格", callback_data="grid"), InlineKeyboardButton("⚙️ 参数", callback_data="params")],
             [InlineKeyboardButton("📈 仪表盘", callback_data="stats"), InlineKeyboardButton("💾 备份", callback_data="backup")],
             [InlineKeyboardButton("✅ 解除熔断", callback_data="resume"), InlineKeyboardButton("🔄 刷新", callback_data="refresh")],
+            [InlineKeyboardButton("📥 导入交易所持仓", callback_data="import_pos")],
         ])
 
     async def cmd_status(self, update, context):
@@ -2684,6 +2916,19 @@ class QuantBot:
             kind, key, label = MENU_INPUT_SPEC[data]
             await self._send_input_prompt(query, context, kind, key, label, data)
             answered = True
+        elif data == "import_pos":
+            blocked = sorted(getattr(self.reconciler, "blocked", set()) or set())
+            if not blocked:
+                await update.effective_message.reply_text(
+                    "ℹ️ 当前没有币种被对账阻塞，无需导入。\n"
+                    "若需导入其他币种：/import ETH/USDT")
+                return
+            await update.effective_message.reply_text(
+                f"⏳ 正在导入 {len(blocked)} 个被阻塞币种的持仓…\n"
+                f"   {', '.join(x.split('/')[0] for x in blocked)}")
+            context.args = []
+            await self.cmd_import_position(update, context)
+            return
         elif data == "resume":
             self.risk.resume()
             await self._save_runtime_state()
@@ -3231,6 +3476,7 @@ class QuantBot:
             CommandHandler("resume", self.cmd_resume),
             CommandHandler("reconcile", self.cmd_reconcile),
             CommandHandler("restore", self.cmd_restore),
+            CommandHandler("import", self.cmd_import_position),
             CommandHandler("resetledger", self.cmd_resetledger),
             CommandHandler("help", self.cmd_help),
             CommandHandler("brain", self.cmd_brain),

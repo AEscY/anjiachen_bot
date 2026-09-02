@@ -433,6 +433,24 @@ class ExchangeManager:
             logger.error(f"市价卖单失败 {symbol}: {e}")
             return None
 
+    async def fetch_my_trades(self, symbol, limit=100):
+        """
+        查该交易对的最近成交，用于从交易所【反推持仓成本】。
+
+        用途：本地账本丢失（Render 临时盘重置）时，
+        交易所仍有真实持仓，但机器人不知道成本价。
+        与其永远阻塞，不如从成交历史把成本算回来。
+        """
+        if not self.exchange:
+            return []
+        try:
+            return await self._retry_call(
+                self.exchange.fetch_my_trades, symbol, None, limit,
+                max_retries=2)
+        except Exception as e:
+            logger.warning(f"查询成交历史失败 {symbol}: {e}")
+            return []
+
     async def cancel_all_orders(self, symbol):
         if not self.exchange:
             return False
