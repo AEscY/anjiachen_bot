@@ -110,6 +110,17 @@ _reg(
               scale=0.01, aliases=("settsl",), unit="%", group="单次模式"),
     ParamSpec("trailing_tp_pct", 0.003, "移动止盈（单次模式）", float, 0.0, 0.20,
               scale=0.01, aliases=("settmpt",), unit="%", group="单次模式"),
+    # 止盈止损的安全边界。原实现硬编码为 0.06 / 0.002 / 0.04 / 1.2，
+    # 用户 /settp 8 设了 8% 却只生效 6%，且毫无提示 —— 配置形同虚设。
+    # 现改为可调参数，并在触发夹取时明确告警。
+    ParamSpec("tp_max_pct", 0.06, "止盈上限（超过则夹到此值）", float, 0.01, 1.0,
+              scale=0.01, aliases=("settpmax",), unit="%", group="单次模式"),
+    ParamSpec("sl_min_pct", 0.002, "止损下限（低于则抬到此值）", float, 0.0005, 0.20,
+              scale=0.01, aliases=("setslmin",), unit="%", group="单次模式"),
+    ParamSpec("sl_max_pct", 0.04, "止损上限（超过则夹到此值）", float, 0.005, 0.50,
+              scale=0.01, aliases=("setslmax",), unit="%", group="单次模式"),
+    ParamSpec("tp_sl_min_ratio", 1.2, "止盈/止损最小比值", float, 1.0, 5.0,
+              aliases=("settpslratio",), unit="倍", group="单次模式"),
     ParamSpec("auto_min_score", 65, "自动开仓评分阈值（单次模式）", int, 50, 95,
               aliases=("autoscore",), unit="分", group="单次模式"),
     ParamSpec("single_order_pct", 0.02, "单笔占总权益比例（单次模式）", float, 0.001, 0.20,
