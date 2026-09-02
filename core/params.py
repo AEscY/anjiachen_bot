@@ -128,6 +128,17 @@ _reg(
     # 单笔固定额度：单次模式以此为基数按资金规模缩放（见 _calculate_dynamic_amount）。
     # 原实现只在 __init__ 里硬编码为 1.0，既没有 /setamount 命令也无法调整，
     # 而 Telegram 菜单里一直列着这个按钮 —— 点了没反应。
+    # 权益上限：机器人按 min(实际权益, 本值) 计算所有仓位。
+    # 0 表示不限制。
+    # 两个用途：
+    #   1) 模拟盘模拟目标资金规模 —— OKX 模拟盘给 10 万 U 虚拟资金，
+    #      而实盘只有 9U。仓位算法按权益比例缩放，
+    #      不限制的话单笔会差一万倍，模拟盘根本测不出
+    #      小额会撞上的各种下限（最小交易额、最小交易量）。
+    #   2) 实盘资金隔离 —— 大账户只拿一部分试水。
+    ParamSpec("equity_cap_usdt", 0.0, "权益上限（0=不限，按此值计算仓位）",
+              float, 0.0, 10_000_000.0, aliases=("setcap",),
+              unit="U", group="单次模式"),
     ParamSpec("single_order_usdt", 1.0, "单笔基础额度（单次模式，按资金缩放）",
               float, 0.1, 1000, aliases=("setamount",), unit="U", group="单次模式"),
     ParamSpec("max_positions_per_coin", 8, "单币最大仓位数（单次模式）", int, 1, 100,

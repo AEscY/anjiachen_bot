@@ -413,12 +413,37 @@ class QuantBot:
                 total += float(val.get('free', 0)) * float(ticker.get('last', 0))
         return total
 
+    def _effective_equity_usdt(self) -> float:
+        """
+        用于仓位计算的有效权益 = min(实际权益, equity_cap_usdt)。
+
+        为什么要这一层：
+          仓位算法按权益【比例】缩放。OKX 模拟盘给 10 万 U 虚拟资金，
+          而实盘只有 9U —— 不加上限的话单笔金额会差一万倍，
+          模拟盘永远不会撞上交易所的最小交易额/最小交易量。
+          结果是：模拟盘跑得很顺，一切到实盘就"一单都不下"。
+
+          加了上限，模拟盘就能精确复现目标资金规模下的行为，
+          验证出的参数可直接平移到实盘。
+
+        实盘同样有用：大账户只拿一部分资金试水。
+
+        注意：余额【显示】仍用真实值，只影响仓位计算。
+        """
+        real = self._total_equity_usdt()
+        cap = float(getattr(self, 'equity_cap_usdt', 0) or 0)
+        if cap <= 0:
+            return real
+        if real > cap:
+            return cap
+        return real
+
     def _calculate_dynamic_amount(self, base_amount=1.0):
         """
         单笔额度 = max(下限, 总权益 × 单笔占比)，并受单笔占比上限约束。
         原实现是阶梯常量：资金 100U 与 100000U 都只买 2U，大资金利用率极低。
         """
-        total_balance = self._total_equity_usdt()
+        total_balance = self._effective_equity_usdt()
         if total_balance < 10:
             return max(0.1, base_amount * 0.3)
         proportional = total_balance * self.single_order_pct
@@ -433,7 +458,7 @@ class QuantBot:
         return max(0.0, used)
 
     async def _can_allocate(self, additional_usdt):
-        balance = self._total_equity_usdt()
+        balance = self._effective_equity_usdt()
         if balance <= 0:
             return False
         used = await self._allocation_used_usdt()
@@ -1440,7 +1465,7 @@ class QuantBot:
                     continue
 
                 await self._refresh_balance_cache()
-                equity = self._total_equity_usdt()
+                equity = self._effective_equity_usdt()
                 if equity <= 0:
                     await asyncio.sleep(15)
                     continue
@@ -1637,6 +1662,16 @@ class QuantBot:
         lines.append("自适应: " + (" ".join(ad_lines) if ad_lines else "尚未计算"))
         try:
             lines.append(f"巡检: {self.watchdog.summary()}")
+        except Exception:
+            pass
+        try:
+            cap = float(getattr(self, 'equity_cap_usdt', 0) or 0)
+            if cap > 0:
+                real = self._total_equity_usdt()
+                eff = self._effective_equity_usdt()
+                if abs(real - eff) > 0.01:
+                    lines.append(f"权益: 实际 {real:.2f}U → 按 {eff:.2f}U 计算仓位"
+                                 f"（上限 {cap:.0f}U）")
         except Exception:
             pass
         await update.effective_message.reply_text("\n".join(lines))

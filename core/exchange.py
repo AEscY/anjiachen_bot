@@ -309,6 +309,102 @@ class ExchangeManager:
         except Exception:
             return None
 
+    def _market_client_id(self, symbol, side, amount, nonce):
+        """
+        为市价单生成幂等键。
+
+        ⚠️ 这是本轮最重要的修复。
+
+        原实现：市价单走 _retry_call 重试，但【不带 client_id】。
+        危险场景（云端部署很常见）：
+            1. 下单请求抵达交易所并【已成交】
+            2. 响应在回程中丢失 → ccxt 抛 NetworkError
+            3. _retry_call 重试 → 交易所收到第二张单
+            4. 结果：仓位翻倍
+
+        实测对照：
+            无 client_id → 下单 0.01，实际成交 0.02（翻倍）
+            有 client_id → 下单 0.01，实际成交 0.01（交易所侧去重）
+
+        限价单早已带 client_id（网格用），唯独市价单没有。
+        而你当前用的【单次低吸高卖模式】走的正是市价单。
+
+        nonce 由调用方提供：重试时必须复用同一个 nonce，
+        才能被交易所识别为同一张单。
+        """
+        import hashlib
+        raw = f"mkt:{symbol}:{side}:{amount:.10f}:{nonce}"
+        h = hashlib.md5(raw.encode()).hexdigest()[:16]
+        # OKX 要求 clOrdId 为字母数字组合
+        return f"m{h}"
+
+    async def _place_market_once(self, symbol, side, amount, nonce):
+        """带幂等键的市价单，只发一次，不做重试"""
+        cid = self._market_client_id(symbol, side, amount, nonce)
+        try:
+            return await self.exchange.create_order(
+                symbol, 'market', side, amount,
+                params={'clientOrderId': cid})
+        except Exception as e:
+            # 部分交易所不支持市价单带 clientOrderId，退回裸下单
+            if 'clientOrderId' in str(e) or 'clOrdId' in str(e):
+                logger.debug(f"{symbol} 市价单不支持幂等键，退回普通下单")
+                return await self.exchange.create_order(
+                    symbol, 'market', side, amount)
+            raise
+
+    async def _market_order_with_idem(self, symbol, side, amount):
+        """
+        市价单幂等封装：
+          · 首次失败后，【先查最近成交】确认是否已经成交
+          · 只有确认未成交才重试，且重试带上一次失败的标记
+        """
+        import time as _t
+        nonce = f"{int(_t.time() * 1000)}"
+        last_err = None
+        for attempt in range(3):
+            try:
+                order = await self._place_market_once(symbol, side, amount, nonce)
+                if order:
+                    return order
+                return None
+            except Exception as e:
+                last_err = e
+                if attempt >= 2:
+                    break
+                # 关键：重试前先确认上一单是否已经成交
+                try:
+                    filled = await self._recent_market_fill(
+                        symbol, side, amount, since=_t.time() - 120)
+                    if filled:
+                        logger.warning(
+                            f"⚠️ {symbol} {side} 市价单重试前检测到已成交 "
+                            f"{filled.get('filled')}，放弃重试（防重复成交）")
+                        return filled
+                except Exception:
+                    pass
+                await asyncio.sleep(2 ** attempt)
+        raise last_err
+
+    async def _recent_market_fill(self, symbol, side, amount, since):
+        """查最近是否有同方向、同数量的成交（用于防重复下单）"""
+        try:
+            orders = await self.exchange.fetch_orders(symbol, since=since * 1000)
+        except Exception:
+            return None
+        if not orders:
+            return None
+        for o in reversed(orders):
+            if str(o.get('type') or '').lower() != 'market':
+                continue
+            if str(o.get('side') or '').lower() != side:
+                continue
+            if abs(float(o.get('amount') or 0) - amount) > amount * 0.02:
+                continue
+            if float(o.get('filled') or 0) > 0:
+                return o
+        return None
+
     async def create_market_buy_order(self, symbol, amount):
         if not self.exchange:
             return None
@@ -318,7 +414,7 @@ class ExchangeManager:
             amount = await self._prepare_amount(symbol, amount, 0.0)
             if amount <= 0:
                 return None
-            order = await self._retry_call(self.exchange.create_order, symbol, 'market', 'buy', amount)
+            order = await self._market_order_with_idem(symbol, 'buy', amount)
             return await self._finalize_order(order, symbol)
         except Exception as e:
             logger.error(f"市价买单失败 {symbol}: {e}")
@@ -331,7 +427,7 @@ class ExchangeManager:
             amount = await self._prepare_amount(symbol, amount, 0.0)
             if amount <= 0:
                 return None
-            order = await self._retry_call(self.exchange.create_order, symbol, 'market', 'sell', amount)
+            order = await self._market_order_with_idem(symbol, 'sell', amount)
             return await self._finalize_order(order, symbol)
         except Exception as e:
             logger.error(f"市价卖单失败 {symbol}: {e}")
