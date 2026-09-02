@@ -1,4 +1,5 @@
 """SQLite persistence with schema migration and atomic runtime-state updates."""
+import asyncio
 import aiosqlite
 import json
 from datetime import datetime, timezone, timedelta
@@ -393,15 +394,36 @@ async def import_db_from_json(data):
         logger.error(f'导入数据库失败: {e}')
         return False
 
-async def save_runtime_state(state):
-    try:
-        async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
-            await db.execute('BEGIN IMMEDIATE')
-            for key,value in state.items():
-                value=json.dumps(value,separators=(',',':')) if isinstance(value,(dict,list)) else str(value)
-                await db.execute('INSERT OR REPLACE INTO runtime_state(key,value) VALUES(?,?)',(key,value))
-            await db.commit()
-    except Exception as e: logger.error(f'保存运行时状态失败: {e}')
+async def save_runtime_state(state, retries=2) -> bool:
+    """
+    保存运行时状态，返回是否成功。
+
+    ⚠️ 原实现吞掉异常、不返回任何值，调用方无法感知失败。
+    后果：数据库写不进去（磁盘满、锁超时、表损坏）时，
+    机器人继续运行且毫无异常表现，直到下次重启从【旧状态】
+    恢复，才以"对账不一致"的形式暴露 —— 此时已无法追溯。
+
+    改为：失败重试一次，仍失败则返回 False，由调用方告警。
+    """
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            async with aiosqlite.connect(DB_FILE, timeout=30.0) as db:
+                await db.execute('BEGIN IMMEDIATE')
+                for key, value in state.items():
+                    value = (json.dumps(value, separators=(',', ':'))
+                             if isinstance(value, (dict, list)) else str(value))
+                    await db.execute(
+                        'INSERT OR REPLACE INTO runtime_state(key,value) VALUES(?,?)',
+                        (key, value))
+                await db.commit()
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(0.5 * (attempt + 1))
+    logger.error(f'保存运行时状态失败（已重试{retries}次）: {last_err}')
+    return False
 
 async def load_runtime_state():
     state={}

@@ -69,6 +69,13 @@ class Watchdog:
         # ── C. 行情相关 ──
         self._last_data_ts = {}         # {sym: ts}
 
+        # ── D. 后台任务存活 ──
+        # 每个 task 各自记录心跳。任一 task 死亡时，
+        # 机器人表面仍活着（HTTP 健康检查 200、Telegram 能响应），
+        # 但对应功能已彻底停止 —— 这是最难发现的一类故障。
+        self._task_beat = {}            # {task_name: ts}
+        self._task_expected = set()     # 预期应持续运行的 task
+
         # 节流：{key: last_sent_ts}
         self._sent = {}
 
@@ -112,6 +119,57 @@ class Watchdog:
         """该币种拿到了行情"""
         self._last_data_ts[sym] = time.time()
 
+    # ---------- D. 后台任务存活 ----------
+
+    def expect_task(self, name):
+        """登记一个预期应持续运行的后台任务"""
+        self._task_expected.add(name)
+        self._task_beat.setdefault(name, time.time())
+
+    def beat(self, name):
+        """后台任务每轮调用，证明自己还活着"""
+        self._task_beat[name] = time.time()
+
+    async def _check_dead_tasks(self):
+        """
+        检测死掉的后台任务。
+
+        为什么需要：
+          四个 task 都有 try/except 兜底，理论上不会死。
+          但"兜底自身抛异常""初始化阶段出错""asyncio 内部错误"
+          都可能让 task 静默终止，而外部健康检查完全看不出来。
+
+          而 task 死后：
+            HTTP 健康检查 → 仍返回 200（服务没挂）
+            Telegram       → 仍能响应命令（Bot 是独立的）
+            只有交易       → 彻底停止
+        """
+        if not self._task_expected:
+            return None
+        if not self._can_send("dead_task"):
+            return None
+
+        now = time.time()
+        dead = []
+        for name in self._task_expected:
+            ts = self._task_beat.get(name)
+            if ts is None:
+                continue
+            age = now - ts
+            if age > 300:               # 各 task 轮次不同，统一用 5 分钟
+                dead.append((name, age))
+        if not dead:
+            return None
+
+        lines = ["🚨 后台任务已停止运行"]
+        for name, age in sorted(dead, key=lambda x: -x[1]):
+            lines.append(f"   · {name} — 已 {_fmt_dur(age)}无心跳")
+        lines.append("")
+        lines.append("   表现：健康检查仍正常、Telegram 仍能响应，")
+        lines.append("   但对应功能已彻底停止。")
+        lines.append("   → 请查看日志定位异常原因，必要时重启服务")
+        return "\n".join(lines)
+
     # ---------- 节流 ----------
 
     def _can_send(self, key):
@@ -128,7 +186,8 @@ class Watchdog:
         out = []
         for fn in (self._check_no_open,
                    self._check_stale_orders,
-                   self._check_no_data):
+                   self._check_no_data,
+                   self._check_dead_tasks):
             try:
                 r = await fn()
                 if r:
@@ -310,6 +369,7 @@ class Watchdog:
             "sent": self._sent,
             "order_times": {s: dict(o) for s, o in self._order_times.items()},
             "last_data_ts": dict(self._last_data_ts),
+            "task_beat": dict(self._task_beat),
         }
 
     def from_dict(self, d):
@@ -322,6 +382,7 @@ class Watchdog:
         self._order_times = {s: dict(o) for s, o in
                              (d.get("order_times") or {}).items()}
         self._last_data_ts = dict(d.get("last_data_ts") or {})
+        self._task_beat = dict(d.get("task_beat") or {})
 
     def summary(self):
         """给 /status 用的一行摘要"""

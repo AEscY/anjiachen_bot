@@ -214,6 +214,10 @@ class QuantBot:
         # 启动时被判定无效的交易对 {sym: reason}，隔离而非删除
         self._invalid_symbols = {}
 
+        # 持久化失败告警节流（每轮都保存，失败时不能每轮都告警）
+        self._last_persist_alert = 0.0
+        self._persist_fail_count = 0
+
         # Telegram 应用
         self.tg_app = None
 
@@ -631,6 +635,12 @@ class QuantBot:
         # 启动后台定时备份
         self._start_backup_loop()
         self._start_watchdog_loop()
+        self._check_mode_conflict()
+
+        # 模式冲突：两个买循环并发会超配，必须让用户知道
+        mode_warn = getattr(self, "_pending_mode_warning", None)
+        if mode_warn:
+            await self._alert(mode_warn, level="critical")
 
         # 初始化全部完成，健康检查从现在起才报健康
         self._ready = True
@@ -832,6 +842,78 @@ class QuantBot:
 
         return await update.effective_message.reply_text(text, parse_mode="Markdown")
 
+    def _grid_has_state(self, sym) -> bool:
+        """该币种是否处于网格管理之下（有网格状态或挂单）"""
+        try:
+            st = self.grid.states.get(sym)
+            if st is not None and (getattr(st, "lots", None)
+                                   or getattr(st, "pending_client_ids", None)):
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _guard_task(self, name, coro_fn):
+        """
+        包裹后台任务：记录心跳，并在意外退出时告警。
+
+        四个 task 内部都有 try/except 兜底，理论上不会退出。
+        但"兜底自身抛异常""初始化阶段出错""asyncio 内部错误"
+        都可能让它静默终止，而外部健康检查完全看不出来。
+        """
+        try:
+            await coro_fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ 后台任务【{name}】异常退出: {e}", exc_info=True)
+            await self._alert(
+                f"🚨 后台任务异常退出\n"
+                f"   任务: {name}\n"
+                f"   错误: {e}\n"
+                f"   该任务对应的功能已停止，其余功能不受影响。\n"
+                f"   → 建议重启服务", "critical")
+
+    def _check_mode_conflict(self):
+        """
+        检测交易模式冲突。
+
+        ⚠️ 三个监控任务是独立的 asyncio task，各看各的标志位：
+
+            _auto_trade_monitor  买（单次模式）  条件 auto_trade_enabled
+            _grid_monitor        买（网格模式）  条件 grid_enabled
+            _trailing_monitor    卖（单次模式）  条件 仅 is_running
+
+        前两者互不看对方的开关，同时开启会并发消费同一份余额。
+        第三者更隐蔽：它只判断"有没有持仓"，不判断这个持仓是谁建的。
+        于是网格挂单成交后，_trailing_monitor 会用【单次模式的
+        tp/sl】去平仓 —— 网格策略被破坏，而网格引擎还以为自己
+        持仓完好，下一轮继续挂卖单，状态彻底错乱。
+
+        原实现完全没有这层检查。
+        """
+        try:
+            auto = bool(getattr(self, "auto_trade_enabled", False))
+            grid = bool(getattr(self, "grid_enabled", False))
+        except Exception:
+            return
+
+        if auto and grid:
+            self._pending_mode_warning = (
+                "⚠️ 检测到模式冲突：自动交易与网格【同时开启】\n"
+                "   两个买循环会并发消费同一份余额，且\n"
+                "   网格持仓可能被单次模式的止盈止损平掉。\n"
+                "   请二选一：\n"
+                "     /autotrade off   仅用网格\n"
+                "     /gridmode false  仅用单次模式")
+            logger.warning("⚠️ 模式冲突：auto_trade 与 grid 同时开启")
+            return
+
+        if grid and not auto:
+            # 网格模式下提醒止盈参数的归属，避免误调
+            logger.info("ℹ️ 网格模式：/settp /setsl 属单次模式参数，"
+                        "网格止盈用 /set grid_stop_loss_pct")
+
     def _start_watchdog_loop(self):
         """
         启动行为巡检（每小时一次）。
@@ -899,6 +981,19 @@ class QuantBot:
         await update.message.reply_text(text, parse_mode="Markdown")
 
     async def _save_runtime_state(self):
+        """
+        持久化运行时状态（持仓、网格、风控、巡检）。
+
+        ⚠️ 原实现的问题：storage.save_runtime_state 内部 try/except 只
+        logger.error，失败时这里毫无感知。后果链：
+
+            保存失败 → 内存状态仍正常，用户完全看不到异常
+                     → Render 休眠/重启 → 从库恢复 → 读到【旧状态】
+                     → 启动对账发现与交易所不一致 → 🚨 暂停交易
+
+        也就是说：故障在几小时甚至几天后才以"对账失败"的形式暴露，
+        而那时已经无法追溯原因。改为失败时立即告警。
+        """
         state = {
             'position_counts': self.position_counts,
             'entries': self.entries,
@@ -910,7 +1005,22 @@ class QuantBot:
             'watchdog': self.watchdog.to_dict(),
             'trend': self.trend.to_dict(),
         }
-        await save_runtime_state(state)
+        ok = await save_runtime_state(state)
+        if not ok:
+            # 节流：持久化每轮都调用，失败时不能每轮都告警
+            now = time.time()
+            if now - self._last_persist_alert > 1800:      # 30 分钟
+                self._last_persist_alert = now
+                await self._alert(
+                    "💾 状态保存失败（已重试）\n"
+                    "   持仓/网格状态未能写入数据库。\n"
+                    "   机器人在内存中仍正常运行，但一旦重启\n"
+                    "   将从【旧状态】恢复，导致对账不一致并暂停交易。\n"
+                    "   请检查磁盘空间或数据库连接，并及时 /backup 导出。",
+                    "critical")
+            return False
+        self._persist_fail_count = 0
+        return True
 
     async def _save_config(self):
         """
@@ -1155,6 +1265,7 @@ class QuantBot:
 
                 # 看门狗：证明循环还活着（用于区分"没信号"与"卡死"）
                 self.watchdog.tick()
+                self.watchdog.beat("自动交易")
                 self._watchdog_sample_data()
 
                 today = datetime.now(CST).date().isoformat()
@@ -1303,10 +1414,19 @@ class QuantBot:
                     continue
 
                 await self._refresh_balance_cache()
+                self.watchdog.beat("移动止盈止损")
                 for sym in self.symbols:
                     try:
                         if self.position_counts.get(sym, 0) <= 0:
                             continue
+                        # ⚠️ 网格模式下不得插手：本任务用的是【单次模式】的
+                        # tp/sl/移动止损，而网格持仓应由网格引擎自己的
+                        # 间距与区间止损管理。若在此用单次参数平仓，
+                        # 会在网格预期之外卖出，且网格仍以为持仓完好，
+                        # 下一轮继续挂卖单 —— 状态错乱。
+                        if getattr(self, "grid_enabled", False):
+                            if self._grid_has_state(sym):
+                                continue
                         ticker = self.ws.get_ticker(sym)
                         if not ticker:
                             continue
@@ -1476,6 +1596,7 @@ class QuantBot:
                 if not self.is_running or not self.grid_enabled:
                     await asyncio.sleep(10)
                     continue
+                self.watchdog.beat("网格交易")
                 if not self.auto_trade_enabled:
                     await asyncio.sleep(10)
                     continue
@@ -1565,6 +1686,7 @@ class QuantBot:
         while self.is_running:
             try:
                 await self._refresh_balance_cache(force=True)
+                self.watchdog.beat("风控监控")
                 equity = self._cached_usdt_free
                 for sym in self.symbols:
                     ticker = self.ws.get_ticker(sym)
@@ -2853,10 +2975,15 @@ class QuantBot:
 
         await self.tg_app.bot.delete_webhook(drop_pending_updates=True)
 
-        asyncio.create_task(self._auto_trade_monitor())
-        asyncio.create_task(self._trailing_monitor())
-        asyncio.create_task(self._risk_monitor_task())
-        asyncio.create_task(self._grid_monitor())
+        # 登记后台任务并包一层监护：
+        # task 静默死亡时，健康检查仍 200、Telegram 仍能响应，
+        # 只有交易彻底停止 —— 这是最难发现的一类故障。
+        for name, coro_fn in (("自动交易", self._auto_trade_monitor),
+                              ("移动止盈止损", self._trailing_monitor),
+                              ("风控监控", self._risk_monitor_task),
+                              ("网格交易", self._grid_monitor)):
+            self.watchdog.expect_task(name)
+            asyncio.create_task(self._guard_task(name, coro_fn))
 
         # 启动对账：把持久化的网格状态与交易所实际挂单对齐。
         # 声明式执行的好处 —— 只需重算目标状态，差异会在下一轮 sync 自动补齐。
