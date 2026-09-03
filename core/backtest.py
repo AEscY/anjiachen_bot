@@ -68,6 +68,30 @@ class BTConfig:
         self.max_positions_per_coin = 3
         self.max_per_coin_usdt = 3.0
         self.reserve_bottom = 1.0
+        # ⚠️ OFI(订单簿) 与 FG(恐惧贪婪) 各占 20%/15% 权重，
+        # 但两者都是【实时数据】：OFI 需要盘口深度快照，
+        # FG 是外部指数 —— 历史 K 线里都没有。
+        #
+        # 这意味着单次模式【无法被完整回测】，只能取近似：
+        #   "neutral"   两者取中性 50（最保守，评分上限被压到 78）
+        #   "favorable" 两者取有利值（OFI 90 / FG 100，最乐观）
+        #   "random"    在合理区间随机采样（较接近真实分布）
+        #
+        # 用 neutral 得到的结论是【下界】，不能直接等同于实盘表现。
+        self.ofi_fg_mode = "neutral"    # neutral | favorable | random
+        self.trend_filter_enabled = True
+        self.trend_threshold = 0.02
+
+        # ── 混合模式：网格执行 + 趋势择时 ──
+        # 网格的死穴是单边下跌一路接刀。
+        # 用长周期趋势判据在下跌期【停止布网】，
+        # 已有持仓仍按止盈/止损正常处理（不强制平仓，
+        # 避免卖在最低点）。
+        self.hybrid_enabled = False
+        self.hybrid_slope_n = 240        # 趋势判据回看窗口
+        self.hybrid_slope_thr = -0.015   # 低于此斜率则停止布网
+        self.hybrid_ma_n = 0             # >0 时附加"价格低于MA"条件
+        self.hybrid_force_close = False  # True=撤网即市价清仓
 
         # ── 网格 ──
         self.grid_enabled = True
@@ -439,6 +463,9 @@ class Backtester:
             if tech is None:
                 continue
 
+            # 收盘价序列（供混合模式撤网判据使用）
+            closes_so_far = [b.close for b in bars[:i + 1]]
+
             # ── 先处理已有挂单的成交 ──
             self._fill_orders(bar, i)
 
@@ -462,9 +489,21 @@ class Backtester:
 
             # ── 网格逻辑 ──
             if c.grid_enabled:
-                self._grid_step(bar, i, tech)
+                # 混合模式：下跌趋势中停止布网（已有持仓继续持有）
+                halted = self._grid_halted(closes_so_far, bar)
+                if halted and c.hybrid_force_close and self.position_qty > 0:
+                    self._place_sell(bar.close, self.position_qty, i,
+                                     "hybrid_halt")
+                if not halted:
+                    self._grid_step(bar, i, tech)
+            else:
+                # ── 单次模式：评分开仓 ──
+                # 原实现只有 _exit_step，从不主动开仓，
+                # 导致 grid_enabled=False 时 n_trades 恒为 0
+                # —— 单次模式从未被回测验证过。
+                self._single_step(bar, i, tech)
 
-            # ── 单次模式：止盈止损 ──
+            # ── 止盈止损 ──
             self._exit_step(bar, i, tech)
 
             # 会计恒等式自检
@@ -521,6 +560,133 @@ class Backtester:
                              "grid_stop_loss")
             self.open_orders = []
             self.grid_center = price
+
+    # ─────────── 单次模式（低吸高卖）───────────
+
+    def _adaptive_params(self, tech):
+        """与实盘 _update_market_adaptive_params 完全一致的状态判定"""
+        atr = (tech or {}).get("atr", 0)
+        bb_mid = (tech or {}).get("bb_middle", 0)
+        bb_width = (tech or {}).get("bandwidth_pct", 0) / 100.0
+        trend = (tech or {}).get("trend_strength", 0)
+        volatility = atr / bb_mid if bb_mid > 0 else 0.0
+        if volatility > 0.05:
+            state = "volatile"
+        elif volatility < 0.01 and bb_width < 0.02:
+            state = "ultra_low"
+        elif abs(trend) > 0.02:
+            state = "trending"
+        else:
+            state = "ranging"
+        M = {"volatile": (1.2, 1.5, 8, 0.6),
+             "trending": (1.5, 1.2, 10, 0.5),
+             "ranging": (1.0, 1.0, 0, 1.0),
+             "ultra_low": (0.8, 0.7, -5, 0.8)}
+        return state, M[state]
+
+    def _ofi_fg_scores(self):
+        """生成 OFI / FG 分数（回测中无法取得真实值）"""
+        m = self.cfg.ofi_fg_mode
+        if m == "favorable":
+            return 90.0, 100.0
+        if m == "random":
+            import random
+            return random.uniform(30, 70), random.uniform(20, 80)
+        return 50.0, 50.0
+
+    def _entry_score(self, tech, price):
+        """
+        与实盘 _should_open_position 完全一致的评分。
+
+        ⚠️ 注意：实盘里 OFI 来自 WS 订单簿、FG 来自外部 API，
+        两者合计占 35% 权重，回测中只能用近似值替代。
+        """
+        c = self.cfg
+        rsi = tech.get("rsi", 50)
+        rsi_score = max(0, min(100, 50 + (50 - rsi) * 0.8))
+
+        bl, bu = tech.get("bb_lower", 0), tech.get("bb_upper", 0)
+        if bu > bl and price > 0:
+            bb_score = max(0, min(100, 100 - (price - bl) / (bu - bl) * 100))
+        else:
+            bb_score = 50
+
+        ofi_score, fg_score = self._ofi_fg_scores()
+        vol_score = 70.0          # 回测无成交量维度，取实盘上限
+        trend = tech.get("trend_strength", 0)
+
+        if c.trend_filter_enabled and trend > c.trend_threshold:
+            penalty = 30
+        elif c.trend_filter_enabled and trend < -c.trend_threshold:
+            penalty = 15
+        else:
+            penalty = 0
+
+        total = (rsi_score * 0.25 + bb_score * 0.25 + ofi_score * 0.20 +
+                 vol_score * 0.15 + fg_score * 0.15) - penalty
+        total = max(0, min(100, total))
+
+        state, (_tp_f, _sl_f, offset, _amt_f) = self._adaptive_params(tech)
+        threshold = max(40, min(95, c.auto_min_score + offset))
+        return total, threshold, state, penalty
+
+    def _single_step(self, bar, i, tech):
+        """单次低吸高卖的开仓判定 —— 回测此前完全没有这一块"""
+        c = self.cfg
+        if c.grid_enabled:
+            return
+        if self.position_qty > 0:
+            return                       # 单仓串行，持仓时不开新仓
+        if not tech:
+            return
+        price = bar.close
+        score, threshold, state, penalty = self._entry_score(tech, price)
+        if score < threshold or penalty >= 30:
+            return
+        usdt = min(c.single_order_usdt, self._avail_cash())
+        if usdt <= 0:
+            return
+        self._place_buy(price, usdt, i, "single_buy")
+
+    def _slope(self, closes, n):
+        """线性回归斜率 / 均值 —— 与 build_tech.trend_strength 同算法，但窗口可调"""
+        if len(closes) < n:
+            n = len(closes)
+        if n < 10:
+            return 0.0
+        seg = closes[-n:]
+        m = sum(seg) / n
+        if m <= 0:
+            return 0.0
+        xs = list(range(n))
+        xm = sum(xs) / n
+        num = sum((xs[k] - xm) * (seg[k] - m) for k in range(n))
+        den = sum((xs[k] - xm) ** 2 for k in range(n))
+        return (num / den * n / m) if den > 0 else 0.0
+
+    def _grid_halted(self, closes, bar):
+        """
+        混合模式的撤网判据。
+
+        设计原则：
+          1. 只在【下跌】撤网 —— 网格在上涨里也赚钱(+47U)，
+             撤早了等于自断一臂
+          2. 撤网【不清仓】—— 已有持仓继续等止盈/止损，
+             强制清仓会卖在最低点
+          3. 用长周期斜率 —— 短周期噪声大，区分度不足
+        """
+        c = self.cfg
+        if not c.hybrid_enabled:
+            return False
+        sl = self._slope(closes, c.hybrid_slope_n)
+        if sl >= c.hybrid_slope_thr:
+            return False
+        if c.hybrid_ma_n > 0:
+            n = min(c.hybrid_ma_n, len(closes))
+            ma = sum(closes[-n:]) / n
+            if bar.close >= ma:
+                return False          # 价格仍在MA上方，不撤
+        return True
 
     def _grid_step(self, bar, i, tech):
         c = self.cfg

@@ -2072,11 +2072,27 @@ class QuantBot:
                 # 风险监控更新峰值与回撤
                 self.risk.update_equity(equity)
 
-                for sym in self.symbols:
+                # ⚠️ 多币种资金预算：原来给每个币种都传【全额 equity】，
+                # 导致 N 个币种的总挂单需求 = N × equity × 80%。
+                # 实测（2层/80%仓位）：
+                #     1 币  需求 0.8x 可动用  ✅
+                #     2 币  需求 1.6x         ❌ 超额
+                #     3 币  需求 2.4x         ❌ 超额
+                # 交易所只认真实余额，先挂的拿到钱，
+                # 后面的币种余额不足 → 静默挂单失败。
+                #
+                # 改为按币种数平分预算：
+                #     每个币种的网格预算 = (权益-底线) / 币种数
+                # 这样 N 个币种的总需求 = 权益 - 底线，不会超额。
+                symbols_now = list(self.symbols or [])
+                n_sym = max(1, len(symbols_now))
+                share = max(0.0, equity) / n_sym
+
+                for sym in symbols_now:
                     try:
                         if self.reconciler.is_blocked(sym):
                             continue
-                        await self._grid_step(sym, equity)
+                        await self._grid_step(sym, share)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -2980,9 +2996,11 @@ class QuantBot:
         pnls = perf.get('pnls') or []
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p < 0]
-        gross = sum(pnls)
 
         lines.append(f"样本: {perf['total']} 笔（赢 {len(wins)} / 亏 {len(losses)}）")
+        if pnls:
+            # 累计已实现盈亏（百分比之和）—— 原先算了却没用
+            lines.append(f"累计盈亏: {sum(pnls):+.3f}%")
         lines.append(f"胜率: {perf['win_rate']*100:.0f}%")
         lines.append(f"平均盈利: {perf['avg_win_pct']:+.3f}%")
         lines.append(f"平均亏损: {perf['avg_loss_pct']:+.3f}%")

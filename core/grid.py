@@ -215,8 +215,27 @@ class GridEngine:
         upper_band = buys[0] * (1 + float(self.cfg.grid_upper_buffer_pct))
 
         # 每档金额
-        per_usdt = equity_usdt * float(self.cfg.grid_capital_pct) / max(1, levels)
+        # ⚠️ 边界：原实现用【全额 equity】，不动用保留底线之外的判断；
+        # 但回测引擎用的是 (cash - reserve_bottom)，两者不一致，
+        # 导致回测显示"一单不挂"而实盘却挂了（或反之）。
+        #
+        # 统一为与回测一致的保守口径：先扣除保留底线再算每格。
+        # reserve_bottom 的意义本就是"这钱不能动"，
+        # 网格不应该把它算进可分配资金。
+        budget = float(equity_usdt or 0.0) - float(
+            getattr(self.cfg, "reserve_bottom", 0.0) or 0.0)
+        budget = max(0.0, budget)
+        per_usdt = budget * float(self.cfg.grid_capital_pct) / max(1, levels)
         min_order = float(self.cfg.grid_min_order_usdt)
+
+        # 静默失败可视化：原来每格不达标时直接 continue，
+        # 用户看到"网格是空的"却查不到原因。
+        if per_usdt > 0 and per_usdt < min_order:
+            logger.warning(
+                f"⚠️ {symbol} 网格每格 {per_usdt:.4f}U < 下限 {min_order:.4f}U，"
+                f"该币种本轮不挂单。"
+                f"（预算 {budget:.2f}U / {levels}层 × 仓位{float(self.cfg.grid_capital_pct)*100:.0f}%）"
+                f" 可调 /setminorder 或 /setlevels 或减少币种数")
 
         orders = []
         for i in range(levels):

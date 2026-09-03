@@ -446,12 +446,25 @@ def build_tech(bars, i, lookback=50):
     if len(closes) < 20:
         return None
     lo, mid, up = bollinger(closes, 20, 2.0)
+    p = closes[-1]
+    ratio = atr_pct(seg, 14)
+    # 绝对 ATR —— 实盘 indicators.py 给的 'atr' 是绝对值，
+    # 而自适应参数 volatility = atr / bb_middle 依赖它。
+    # 若这里沿用 atr_pct（已是比例）再除以 bb_middle，
+    # 会把"比例"当成"绝对额"再除一次价格，量纲全错。
+    atr_abs = ratio * p if p > 0 else 0.0
+    bwidth = ((up - lo) / mid * 100.0) if mid > 0 else 0.0
     return {
+        # ── 与实盘 indicators.py 完全对齐的键名 ──
         "rsi": rsi(closes, 14),
         "bb_lower": lo,
-        "bb_mid": mid,
+        "bb_middle": mid,     # 实盘键名（自适应参数读它）
         "bb_upper": up,
-        "atr_pct": atr_pct(seg, 14),
+        "atr": atr_abs,       # 实盘键名：绝对 ATR
+        "atr_pct": ratio,     # 比例形式，网格间距自适应读它
+        "bandwidth_pct": bwidth,
         "trend_strength": trend_strength(closes, 20),
-        "close": closes[-1],
+        "close": p,
+        # ── 旧键名，保留兼容 ──
+        "bb_mid": mid,
     }
