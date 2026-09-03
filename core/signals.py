@@ -112,12 +112,21 @@ class ScoreEngine:
                  vol_score * 0.15 + fg_score * 0.15) - trend_penalty
         total = max(0.0, min(100.0, total))
 
-        offset = int(getattr(cfg, "_adaptive_score_offset", 0) or 0)
+        # 自适应参数必须按币种取。
+        # cfg._adaptive 是 {sym: {...}}；取不到时回退到镜像属性，
+        # 再不行才用中性默认值（0 偏移 / 1.0 系数）。
+        rec = (getattr(cfg, "_adaptive", None) or {}).get(sym)
+        if rec:
+            offset = int(rec.get("offset", 0) or 0)
+            amount_factor = float(rec.get("amount_factor", 1.0) or 1.0)
+        else:
+            offset = int(getattr(cfg, "_adaptive_score_offset", 0) or 0)
+            amount_factor = float(getattr(cfg, "_adaptive_amount_factor", 1.0) or 1.0)
+
         threshold = max(40, min(95, int(cfg.auto_min_score) + offset))
         should = total >= threshold and trend_penalty < 30
 
-        amount = float(cfg.single_order_usdt) * float(
-            getattr(cfg, "_adaptive_amount_factor", 1.0) or 1.0)
+        amount = float(cfg.single_order_usdt) * amount_factor
 
         return {
             "should_open": should,
