@@ -3045,6 +3045,154 @@ class QuantBot:
                 f"{pnl:+.2f}%  {t.get('time','')}")
         return await update.effective_message.reply_text("\n".join(lines))
 
+    async def cmd_backtest(self, update, context):
+        """
+        /backtest [币种] [天数] —— 用真实历史行情回测当前参数。
+
+        为什么做成 Telegram 命令而不是本地脚本：
+          1. 开发沙盒访问不了境外交易所（OKX/Binance 全部 403）
+          2. 手机上跑不了命令行
+          3. 服务器能连交易所，结果直接发回手机
+        三者叠加，这是唯一可行的路径。
+
+        报告不只看总收益，还会分段检验 ——
+        避免"整段行情恰好上涨，任何策略都显得不错"的假象。
+        """
+        if not self._auth(update):
+            return
+        args = list(context.args or [])
+        sym = args[0].upper() if args else (self.symbols[0]
+                                            if self.symbols else "ETH/USDT")
+        if "/" not in sym:
+            sym += "/USDT"
+        days = 30
+        if len(args) > 1:
+            try:
+                days = max(3, min(365, int(args[1])))
+            except ValueError:
+                pass
+
+        msg = update.effective_message
+        await msg.reply_text(
+            "🔬 正在回测 " + sym + "（近 " + str(days) + " 天）…\n"
+            "   拉取真实 K 线，请稍候")
+
+        try:
+            from core.backtest import (BTConfig, Backtester, fetch_bars,
+                                       run_regime_report,
+                                       min_samples_for_significance,
+                                       _new_public_exchange)
+            tf = self.timeframe
+            # 15m K 线：一天 96 根
+            per_day = 96 if tf == "15m" else (24 if tf == "1h" else 96)
+            limit = min(1500, days * per_day)
+            # 用独立的公开实例拉行情 —— 沙盒模式下主 exchange
+            # 可能返回模拟行情，那样整个回测就是建立在假数据上
+            pub = _new_public_exchange()
+            bars = await fetch_bars(self.exchange, sym, tf, limit,
+                                    public_exchange=pub)
+        except Exception as e:
+            return await msg.reply_text(f"❌ 回测失败：{e}")
+
+        if len(bars) < 200:
+            return await msg.reply_text(
+                f"❌ K 线不足（仅 {len(bars)} 根），至少需要 200 根")
+
+        def make_cfg():
+            return BTConfig(
+                initial_cash=max(9.0, float(self.equity_cap or 0)
+                                 or float(self._cached_usdt_free or 9.0)),
+                order_type="limit" if self.grid_enabled else "market",
+                grid_enabled=bool(self.grid_enabled),
+                grid_levels=int(self.grid_levels),
+                grid_spacing_pct=float(self.grid_spacing_pct),
+                grid_spacing_mode=str(self.grid_spacing_mode),
+                grid_capital_pct=float(self.grid_capital_pct),
+                grid_min_order_usdt=float(self.grid_min_order_usdt),
+                grid_stop_loss_pct=float(self.grid_stop_loss_pct),
+                tp_pct=float(self.tp_pct),
+                sl_pct=float(self.sl_pct),
+                reserve_bottom=float(self.reserve_bottom),
+                max_drawdown_pct=float(self.max_drawdown_pct),
+                max_positions_per_coin=int(self.max_positions_per_coin),
+                max_per_coin_usdt=float(self.max_per_coin_usdt),
+            )
+
+        try:
+            full = Backtester(make_cfg()).run(bars)
+            segs = run_regime_report(bars, make_cfg)
+        except Exception as e:
+            return await msg.reply_text(f"❌ 回测执行失败：{e}")
+
+        need = min_samples_for_significance(0.55, 0.018, 0.010, 0.95)
+
+        lines = [
+            f"🔬 回测报告 {sym}",
+            f"周期 {tf} | {len(bars)} 根 K 线 | 本金 {full.initial_cash:.2f}U",
+        ]
+
+        # 数据真实性校验 —— 防止沙盒返回模拟行情导致回测失真
+        # 拿回测最后一根 K 线的价格，与机器人实时看到的价格比对
+        try:
+            tk = self.ws.get_ticker(sym) if getattr(self, "ws", None) \
+                else None
+            live = float((tk or {}).get("last") or 0)
+            if live > 0 and bars:
+                last_bt = bars[-1].close
+                drift = abs(last_bt - live) / live
+                if drift < 0.05:
+                    pass            # 一致，不额外占用报告篇幅
+                else:
+                    lines.append(
+                        f"⚠️ 数据源存疑：回测末价 {last_bt:.4f} "
+                        f"vs 实时 {live:.4f}（差 {drift*100:.1f}%）")
+                    lines.append(
+                        "   可能是沙盒模拟行情，结论仅供参考")
+        except Exception:
+            pass
+
+        lines += [
+            f"交易 {full.n_trades} 笔 | 胜率 {full.win_rate*100:.0f}%",
+            f"净利 {full.net_pnl:+.4f} U（{full.roi*100:+.2f}%）",
+            f"最大回撤 {full.max_drawdown*100:.1f}%",
+            f"手续费 {full.total_fee:.4f} U",
+        ]
+        if full.n_trades:
+            lines.append(f"单笔期望 {full.expectancy:+.4f} U")
+
+        # 样本量判定 —— 回答"是运气还是实力"
+        lines.append("")
+        if full.n_trades < (need or 62):
+            lines.append(
+                f"⚠️ 样本不足：{full.n_trades} 笔 < 建议 {need or 62} 笔")
+            lines.append("   当前结果【不能】判定策略是否有效")
+        else:
+            lines.append(f"✅ 样本充足：{full.n_trades} 笔 ≥ {need} 笔")
+
+        # 分段检验 —— 回答"收益来自策略还是行情"
+        if segs:
+            lines.append("")
+            lines.append("分段检验：")
+            for sg in segs:
+                lines.append(
+                    f"  {sg['label']} {sg['change']*100:+6.1f}% → "
+                    f"{sg['n_trades']:>3}笔 "
+                    f"{sg['net_pnl']:+.3f}U")
+
+            # 幸存者偏差警示
+            losing = [x for x in segs if x["net_pnl"] < 0]
+            if len(losing) == len(segs) and len(segs) > 1:
+                lines.append("")
+                lines.append("🚨 所有行情段都亏损 —— 策略本身可能不成立")
+
+        lines.append("")
+        lines.append("—— 回测为历史模拟，不代表未来收益 ——")
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n…(已截断)"
+        return await msg.reply_text(text)
+
     async def cmd_patrol(self, update, context):
         """
         /patrol —— 立即跑一次行为巡检。
@@ -3839,6 +3987,7 @@ class QuantBot:
             CommandHandler("history", self.cmd_history),
             CommandHandler("preset", self.cmd_preset),
             CommandHandler("patrol", self.cmd_patrol),
+            CommandHandler("backtest", self.cmd_backtest),
         ]
         for h in handlers:
             self.tg_app.add_handler(h)
