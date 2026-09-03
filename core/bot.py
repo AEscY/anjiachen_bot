@@ -300,6 +300,28 @@ class QuantBot:
         return self.position_lots.setdefault(sym, [])
 
     @staticmethod
+    def _lot_cost(lot):
+        """
+        读取单条持仓记录的成本（USDT 计价）。
+
+        ⚠️ 与 _lot_amount 同理，键名历史上出现过两种：
+            买入写入 'cost'，v14 的 /import 误写 'cost_usdt'。
+
+        v17 我只统一了数量读取，漏了成本 —— _bot_position_cost
+        只读 'cost'，旧记录返回 0，导致 _weighted_entry 均价算成 0，
+        止盈止损判断全部失真。
+
+        凡是要读持仓成本的地方，一律调用本函数。
+        """
+        try:
+            v = lot.get('cost')
+            if v is None:
+                v = lot.get('cost_usdt')
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def _lot_amount(lot):
         """
         读取单条持仓记录的数量。
@@ -338,12 +360,12 @@ class QuantBot:
         return sum(self._lot_amount(l) for l in self.position_lots.get(sym, []))
 
     def _bot_position_cost(self, sym):
-        return sum(float(l.get('cost', 0)) for l in self.position_lots.get(sym, []))
+        return sum(self._lot_cost(l) for l in self.position_lots.get(sym, []))
 
     def _weighted_entry(self, sym):
         lots = self.position_lots.get(sym, [])
-        amount = sum(float(l.get('amount', 0)) for l in lots)
-        cost = sum(float(l.get('cost', 0)) for l in lots)
+        amount = sum(self._lot_amount(l) for l in lots)
+        cost = sum(self._lot_cost(l) for l in lots)
         return cost / amount if amount > 0 else 0.0
 
     def _append_position_lot(self, sym, amount, price, cost, fee=0.0,

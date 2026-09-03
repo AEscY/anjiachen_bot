@@ -91,8 +91,23 @@ class Reconciler:
         total = 0.0
         # 单次模式：FIFO 账本
         for lot in self.bot.position_lots.get(sym, []):
+            # ⚠️ 跨文件遗漏：v17 只统一了 bot.py 内部的读取，
+            # 忘了 reconcile.py —— 这里是【对账】读本地持仓量的地方。
+            # 若读成 0 而交易所有持仓，会误判 mismatch 并阻塞交易。
+            # 必须走 bot 的统一辅助函数，与下单/平仓口径保持一致。
+            get_amt = getattr(self.bot, "_lot_amount", None)
             try:
-                total += float(lot.get("amount", 0) or 0)
+                if get_amt is not None:
+                    total += float(get_amt(lot) or 0)
+                else:
+                    # KEYCONTRACT-OK: 有意保留的降级分支。
+                    # 正常路径走 bot._lot_amount；此处仅用于
+                    # Reconciler 被单独实例化（无 bot 辅助函数）时，
+                    # 与统一函数保持同样的兼容语义。
+                    v = lot.get("amount")
+                    if v is None:
+                        v = lot.get("qty")
+                    total += float(v or 0)
             except (TypeError, ValueError):
                 continue
         # 网格模式：每档持仓
