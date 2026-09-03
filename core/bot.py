@@ -15,6 +15,8 @@ from core.risk import RiskManager
 from core.signals import SignalEngine, ScoreEngine
 from core.watchdog import Watchdog
 from core.trend import TrendWatcher
+from core.guardian import PriceGuard, Retirement
+from core.reporter import DailyReporter
 from core.ws_manager import WSDataManager
 from storage import (
     init_db, load_config, save_config, load_trades, save_trade,
@@ -220,6 +222,10 @@ class QuantBot:
 
         # Telegram 应用
         self.tg_app = None
+        # Telegram 断连自保（原实现完全没有这个状态，
+        # 于是 Telegram 是单点：它一挂，用户就彻底失联且不知情）
+        self._tg_down_since = None      # 断连起始时间戳
+        self._tg_fatal_reported = False # 致命错误是否已告警过
 
         # 按参数注册表补齐默认值（新增参数无需再改 __init__）
         self._ensure_param_defaults()
@@ -228,6 +234,12 @@ class QuantBot:
         self.watchdog = Watchdog(self, alert=self._alert, logger=logger)
         # 趋势退化检测：看"是不是在持续变差"，而非"有没有超阈值"
         self.trend = TrendWatcher(self, logger=logger)
+        # 价格守卫：突变拦截（下单前）+ 滑点检测（成交后）
+        self.price_guard = PriceGuard(self, alert=self._alert, logger=logger)
+        # 退役线：全局累计亏损底线，触发后不自动恢复
+        self.retirement = Retirement(self, alert=self._alert, logger=logger)
+        # 日报：兼作心跳证明 —— 收到即说明机器人活着
+        self.reporter = DailyReporter(self, alert=self._alert, logger=logger)
         if settings.TG_BOT_TOKEN:
             self._init_telegram()
 
@@ -583,6 +595,56 @@ class QuantBot:
 
         return True
 
+    # ---------- Telegram 错误分级 ----------
+
+    # 永久性错误：重试一万次也不会成功，继续重试只是浪费资源，
+    # 更糟的是让用户以为"系统在自愈"，实际永远连不上。
+    _TG_FATAL_PATTERNS = (
+        "invalidtoken", "unauthorized",      # token 失效/被 revoke
+        "forbidden", "bot was blocked",      # 用户拉黑机器人
+        "chat not found",                    # TG_CHAT_ID 填错
+    )
+
+    @classmethod
+    def _classify_tg_error(cls, e):
+        """
+        判断 Telegram 错误是【临时性】还是【永久性】。
+
+        为什么必须区分（这是真实事故场景）：
+          用户 revoke token 后，机器人每 60 秒重试一次，
+          永远失败、永不停止。而 Telegram 是唯一的通知渠道，
+          于是用户【完全不知情】，交易却仍在跑 ——
+          /panic 发不出去，持仓彻底失控。
+
+        临时性（可重试）：
+          NetworkError / Bad Gateway / TimedOut / Conflict
+        永久性（不可重试，必须立刻告知）：
+          InvalidToken / Unauthorized / Forbidden / chat not found
+        """
+        name = type(e).__name__.lower()
+        msg = str(e).lower()
+        blob = name + " " + msg
+        for pat in cls._TG_FATAL_PATTERNS:
+            if pat in blob:
+                return "fatal"
+        if "conflict" in blob:
+            return "conflict"
+        return "transient"
+
+    def _note_tg_down(self):
+        """记录 Telegram 断连起点，用于计算持续时长"""
+        if self._tg_down_since is None:
+            self._tg_down_since = time.time()
+
+    def _note_tg_up(self):
+        """Telegram 恢复，清除断连状态并返回持续秒数"""
+        down = 0.0
+        if self._tg_down_since is not None:
+            down = time.time() - self._tg_down_since
+        self._tg_down_since = None
+        self._tg_fatal_reported = False
+        return down
+
     async def _alert(self, message, level="warning"):
         emoji = {"info":"ℹ️","warning":"⚠️","critical":"🚨"}
         # 无论推送成功与否都落日志，避免告警在推送失败时被完全吞掉
@@ -659,6 +721,13 @@ class QuantBot:
             try:
                 self.watchdog.from_dict(state.get('watchdog') or {})
                 self.trend.from_dict(state.get('trend') or {})
+                # 退役线必须恢复：否则 Render 重启后清零，
+                # 退役线形同虚设（这是它最容易失效的地方）
+                self.retirement.from_dict(state.get('retirement') or {})
+                self.reporter.from_dict(state.get('reporter') or {})
+                # 价格守卫的"暂停到何时"需要恢复，但价格历史不恢复 ——
+                # 重启后行情可能已变，用旧数据判定反而危险
+                self.price_guard.from_dict(state.get('price_guard') or {})
             except Exception as e:
                 logger.debug(f"巡检状态恢复跳过: {e}")
             self.entry_details = state.get('entry_details', {})
@@ -797,6 +866,11 @@ class QuantBot:
             "ready": bool(getattr(self, "_ready", False)),
             "heartbeat_age": None if age is None else round(age, 1),
             "telegram": tg_up,
+            # 断连时长：让 UptimeRobot 这类外部监控也能看到
+            # "Telegram 挂了但交易还在跑"这个危险状态。
+            # 命令收不到、告警发不出，必须能被外部发现。
+            "tg_down_sec": (round(time.time() - self._tg_down_since)
+                            if self._tg_down_since else 0),
             "mode": "grid" if self.grid_enabled else "single",
             "sandbox": bool(settings.IS_SANDBOX),
             "blocked": sorted(self.reconciler.blocked) if hasattr(self, "reconciler") else [],
@@ -1285,6 +1359,11 @@ class QuantBot:
                         for msg in alerts:
                             await self._alert(msg, "warning")
                             await _aio.sleep(2)   # 避免连续发送被限频
+                        # 日报（兼心跳证明：收到即说明机器人活着）
+                        try:
+                            await self.reporter.maybe_send()
+                        except Exception as e:
+                            logger.debug(f"日报跳过: {e}")
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -1345,6 +1424,9 @@ class QuantBot:
             'position_lots': self.position_lots,
             'watchdog': self.watchdog.to_dict(),
             'trend': self.trend.to_dict(),
+            'retirement': self.retirement.to_dict(),
+            'reporter': self.reporter.to_dict(),
+            'price_guard': self.price_guard.to_dict(),
         }
         ok = await save_runtime_state(state)
         if not ok:
@@ -1622,6 +1704,19 @@ class QuantBot:
                     await asyncio.sleep(10)
                     continue
 
+                # 退役线：全局累计亏损底线。
+                # 与 _check_risk_limits 的区别：那个是局部/周期性的
+                # （日内上限、连亏冷却、回撤熔断），会随时间自动恢复；
+                # 退役线是【累计、不自动恢复】的最后一道底线。
+                try:
+                    _net = await get_total_net_profit()
+                    _eq = float(self._cached_usdt_free or 0)
+                    if not await self.retirement.evaluate(_net, _eq):
+                        await asyncio.sleep(60)
+                        continue
+                except Exception as e:
+                    logger.debug(f"退役线检测跳过: {e}")
+
                 if not await self._check_risk_limits():
                     await asyncio.sleep(10)
                     continue
@@ -1643,6 +1738,12 @@ class QuantBot:
                         if not ticker:
                             continue
                         p = ticker['last']
+
+                        # 价格突变保护：拦截 API 抽风 / 瞬时插针推送的错误价格。
+                        # 原代码只有"行情陈旧"检测（时间戳），
+                        # 识别不了【数据是新鲜的错误值】这种情况。
+                        if not await self.price_guard.check(sym, p):
+                            continue
 
                         tech = await self._get_cached_tech(sym, self.timeframe, 50)
                         if not tech:
@@ -1698,6 +1799,14 @@ class QuantBot:
                         self.watchdog.record_open(sym)
                         filled = float(order.get('filled') or 0)
                         avg = float(order.get('average') or p)
+                        # 滑点检测：市价单无法事前限价，
+                        # 只能事后比对"下单时看到的价格"与"实际成交均价"。
+                        # 偏离过大说明盘口深度不足或行情剧变。
+                        try:
+                            await self.price_guard.check_slippage(
+                                sym, p, avg, side="buy")
+                        except Exception as e:
+                            logger.debug(f"滑点检测跳过 {sym}: {e}")
                         fee = float(order.get('_fee_cost') or 0)
                         fee_currency = order.get('_fee_currency', '')
                         base = sym.split('/')[0]
@@ -1877,6 +1986,13 @@ class QuantBot:
                                     continue
                                 sell_filled = float(sell_order.get('filled') or 0)
                                 sell_avg = float(sell_order.get('average') or p)
+                                # 滑点检测（卖出方向）：
+                                # 卖便宜了同样是真金白银的损失
+                                try:
+                                    await self.price_guard.check_slippage(
+                                        sym, p, sell_avg, side="sell")
+                                except Exception as e:
+                                    logger.debug(f"滑点检测跳过 {sym}: {e}")
                                 sell_revenue = sell_filled * sell_avg
                                 sell_fee = float(sell_order.get('_fee_cost') or 0)
                                 try:
@@ -2662,6 +2778,9 @@ class QuantBot:
             f"连续亏损: {self.risk.consecutive_losses}",
             f"回撤: {self.risk.last_drawdown*100:.2f}% / 上限{self.max_drawdown_pct*100:.0f}%",
             f"状态: {'⛔ 暂停' if self.risk.is_paused else '✅ 正常'}",
+            # 新增三项保护的状态，让用户一眼看到它们在不在工作
+            self.price_guard.summary(),
+            self.retirement.summary(),
         ]
         if self.grid_enabled:
             lines.append("")
@@ -2697,8 +2816,15 @@ class QuantBot:
         reconciled = len(self.reconciler.blocked)
         if reconciled:
             self.reconciler.clear()
+        # 解除退役线（这是唯一的人工恢复途径 ——
+        # 退役线刻意不自动恢复，自动恢复等于没有底线）
+        was_retired = self.retirement.retired
+        if was_retired:
+            self.retirement.reset()
         await self._save_runtime_state()
         extra = f"，并解除 {reconciled} 个币种的对账暂停" if reconciled else ""
+        if was_retired:
+            extra += "，并解除策略退役状态"
         return await update.effective_message.reply_text(
             f"✅ 已解除熔断，回撤峰值已重置{extra}")
 
@@ -3463,24 +3589,65 @@ class QuantBot:
                     self.mark_alive()
                     await asyncio.sleep(1)
                 consecutive_failures = 0  # 成功启动，重置退避计数
+                down_for = self._note_tg_up()
+                if down_for > 60:
+                    logger.info(
+                        f"✅ Telegram 已恢复（此前断连 {down_for/60:.1f} 分钟）")
                 logger.warning("⚠️ Telegram updater 已停止，准备重连")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 consecutive_failures += 1
-                is_conflict = "Conflict" in type(e).__name__ or "Conflict" in str(e)
-                if is_conflict:
+                kind = self._classify_tg_error(e)
+
+                if kind == "fatal":
+                    # 永久性错误：token 失效 / 机器人被拉黑 / chat_id 填错。
+                    # 重试一万次也不会成功。原实现不区分，
+                    # 于是每 60 秒重试一次、永不停止，
+                    # 而 Telegram 是唯一通知渠道 —— 用户完全不知情，
+                    # 交易却还在跑，/panic 发不出去，持仓失控。
+                    #
+                    # 这里立刻大声报错（日志 + 健康检查），
+                    # 给出明确的修复指引，然后放慢重试等待人工介入。
+                    self._note_tg_down()
+                    if not self._tg_fatal_reported:
+                        self._tg_fatal_reported = True
+                        logger.error(
+                            "🚨 Telegram 连接发生【永久性错误】，重试无法恢复！\n"
+                            f"   错误: {e}\n"
+                            "   请检查：\n"
+                            "     · TG_BOT_TOKEN 是否失效或被 revoke\n"
+                            "     · 机器人是否被拉黑\n"
+                            "     · TG_CHAT_ID 是否正确\n"
+                            "   在 Render 面板修正后重新部署。")
+                    wait = 300      # 5 分钟一次，避免刷日志
+                elif kind == "conflict":
                     # 另一个实例正在 getUpdates（常见于 Render 滚动重启时
                     # 新旧实例短暂重叠）。此时狂试毫无意义 —— 只会让两边
                     # 互相踢对方，陷入死循环。必须退避，等旧实例彻底退出。
+                    self._note_tg_down()
                     wait = min(30 * consecutive_failures, 180)
                     logger.warning(
                         f"⚠️ 检测到多实例冲突(Conflict)：另一个进程正在轮询。"
                         f"第 {consecutive_failures} 次，退避 {wait}s 后重试。"
                         f"若持续出现，请确认只有一个实例在运行。")
                 else:
+                    # 临时性错误（NetworkError / Bad Gateway / 超时等）。
+                    # Telegram 服务端或网络抖动，通常几秒~几分钟自愈。
+                    self._note_tg_down()
+                    down_for = time.time() - (self._tg_down_since or time.time())
                     wait = min(5 * consecutive_failures, 60)
-                    logger.error(f"Bot 断开: {e}（第 {consecutive_failures} 次，{wait}s 后重连）")
+                    logger.error(
+                        f"Bot 断开: {e}（第 {consecutive_failures} 次，"
+                        f"{wait}s 后重连）")
+                    # 断连超过 5 分钟要特别提示：此时用户已失去对
+                    # 机器人的控制（命令发不进来、告警发不出去），
+                    # 但交易仍在继续 —— 这是需要人知道的状态。
+                    if down_for > 300 and int(down_for) % 300 < 6:
+                        logger.error(
+                            f"🚨 Telegram 已断连 {down_for/60:.0f} 分钟，"
+                            f"命令与告警均无法收发，但交易仍在运行。"
+                            f"如需紧急停止，请到 Render 面板手动 Suspend。")
             finally:
                 # 无论正常停止还是异常，都彻底清理，避免反复 initialize 造成句柄泄漏
                 await self._shutdown_telegram()

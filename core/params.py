@@ -186,6 +186,56 @@ _reg(
               aliases=("setadaptint",), unit="秒", group="自适应"),
 )
 
+# ---------- 价格守卫 ----------
+# 补齐缺口：原代码只有"行情陈旧"检测（时间戳），
+# 无法识别【数据是新鲜的错误值】这种情况 ——
+# 交易所 API 抽风、瞬时插针都会推送错误的当前价，
+# 照常下单就会以离谱的价格成交。
+_reg(
+    ParamSpec("price_guard_enabled", True, "启用价格突变保护（异常价格不下单）", bool,
+              aliases=("setpriceguard",), group="价格守卫"),
+    ParamSpec("price_guard_max_dev", 0.08, "价格突变阈值：偏离近期中位数超过此值即拦截",
+              float, 0.01, 0.50, scale=0.01,
+              aliases=("setpricedev",), unit="%", group="价格守卫"),
+    ParamSpec("price_guard_window", 20, "价格中位数窗口大小（样本数）", int, 5, 200,
+              aliases=("setpricewin",), unit="条", group="价格守卫"),
+    ParamSpec("price_guard_halt_sec", 300, "触发突变后暂停该币时长", int, 60, 3600,
+              aliases=("setpricehalt",), unit="秒", group="价格守卫"),
+    ParamSpec("slippage_guard_enabled", True, "启用滑点检测（成交后比对预期价）", bool,
+              aliases=("setslipguard",), group="价格守卫"),
+    ParamSpec("slippage_max_pct", 0.01, "滑点告警阈值：成交均价偏离预期超过此值告警",
+              float, 0.001, 0.10, scale=0.01,
+              aliases=("setslipmax",), unit="%", group="价格守卫"),
+)
+
+# ---------- 退役线 ----------
+# 补齐缺口：原有风控全是局部/周期性的（单笔止损、日内上限、
+# 连亏冷却、回撤熔断），缺一条【全局累计】底线。
+# 没有它可能出现：每天亏一点，每天都"没触发风控"，
+# 但一个月累计亏损已经很可观。
+_reg(
+    ParamSpec("retire_enabled", False, "启用策略退役线（累计亏损达线则彻底停止）", bool,
+              aliases=("setretire",), group="退役线"),
+    ParamSpec("retire_max_loss_usdt", 20.0, "退役线：启用以来最大累计亏损（U）",
+              float, 0.0, 100000.0, aliases=("setretireloss",),
+              unit="U", group="退役线"),
+    ParamSpec("retire_max_loss_pct", 0.20, "退役线：累计亏损占权益上限",
+              float, 0.01, 1.0, scale=0.01,
+              aliases=("setretirepct",), unit="%", group="退役线"),
+)
+
+# ---------- 日报 ----------
+# 补齐缺口：原有告警全是事件驱动的，出事才说话。
+# 于是"没消息"有两种可能（正常 / 死了）且无法区分。
+# 日报提供心跳证明 —— 收到即说明它活着。
+_reg(
+    ParamSpec("daily_report_enabled", True, "启用每日报告（也是心跳证明）", bool,
+              aliases=("setdaily",), group="日报"),
+    ParamSpec("daily_report_hour", 9, "每日报告发送时间（24小时制，UTC+8）",
+              int, 0, 23, aliases=("setdailyhour",),
+              unit="点", group="日报"),
+)
+
 # ══════════════════════════════════════════════════════════════
 #  索引
 # ══════════════════════════════════════════════════════════════

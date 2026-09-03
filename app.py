@@ -53,6 +53,10 @@ def _health_payload():
         f"mode={st['mode']} sandbox={int(st['sandbox'])} "
         f"hb={st['heartbeat_age']} tg={int(st['telegram'])} "
         f"blocked={','.join(st['blocked']) or '-'}"
+        # Telegram 断连时长。命令收不到、告警发不出，
+        # 但交易仍在跑 —— 这个状态必须能被外部监控看到。
+        + (f" tgdown={st.get('tg_down_sec', 0)}s"
+           if st.get("tg_down_sec") else "")
     ).encode()
     return (200 if st["healthy"] else 503), body
 
