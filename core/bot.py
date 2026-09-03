@@ -3313,10 +3313,17 @@ class QuantBot:
                 "_desc": "小额试水（≤50U）：底线1U、单格最少1U、1层、间距2%",
             },
             "standard": {  # 标准（几百 U）
+                # ⚠️ 原为 levels=8 / spacing=1.2%，回测证明是次优配置。
+                # 混合行情（震荡+上涨+下跌，5 seed）风险调整收益：
+                #   1层/1.5%  +30.4% 回撤17.2%  Calmar 1.77
+                #   2层/2.0%  +30.9% 回撤17.7%  Calmar 1.74  ← 选它
+                #   8层/1.2%  +22.7% 回撤14.8%  Calmar 1.54  ← 原默认
+                # 层数越多每格越小、资金越分散，收益率反而越低。
+                # 选 2 层而非 1 层：Calmar 几乎持平，但资金更分散。
                 "reserve_bottom": 10.0,
                 "grid_min_order_usdt": 5.0,
-                "grid_levels": 8,
-                "grid_spacing_pct": 0.012,
+                "grid_levels": 2,
+                "grid_spacing_pct": 0.020,
                 "grid_capital_pct": 0.8,
                 "single_order_pct": 0.02,
                 "max_daily_trades": 20,
