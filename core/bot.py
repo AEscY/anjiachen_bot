@@ -299,8 +299,43 @@ class QuantBot:
     def _position_lots_for(self, sym):
         return self.position_lots.setdefault(sym, [])
 
+    @staticmethod
+    def _lot_amount(lot):
+        """
+        读取单条持仓记录的数量。
+
+        ⚠️ 必须统一走这里。键名历史上出现过两种：
+            买入写入 'amount'，v14 的 /import 误写 'qty'。
+
+        v16 我只修了 _bot_position_amount，漏了
+        _consume_position_lots —— 结果能读到数量、能下单，
+        但扣减账本时预检查失败抛 ValueError。
+        后果比原问题更糟：
+            原问题：没卖（账本与交易所都还在）
+            新问题：真卖了，但账本没扣 → 对账不一致 → 阻塞
+
+        凡是要读持仓数量的地方，一律调用本函数。
+        """
+        try:
+            v = lot.get('amount')
+            if v is None:
+                v = lot.get('qty')
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
     def _bot_position_amount(self, sym):
-        return sum(float(l.get('amount', 0)) for l in self.position_lots.get(sym, []))
+        """
+        读取本地账本持仓量。
+
+        ⚠️ 键名兼容：买入写入 'amount'，但 v14 的 /import 误写 'qty'。
+        结果本函数恒返回 0，导致 /panic 静默跳过 ——
+        不下单、不报错，只回复"全平完成"。
+        用户以为平了，交易所持仓纹丝不动。
+
+        此处同时兼容两种键名，数据库中已有的旧记录也能正常处理。
+        """
+        return sum(self._lot_amount(l) for l in self.position_lots.get(sym, []))
 
     def _bot_position_cost(self, sym):
         return sum(float(l.get('cost', 0)) for l in self.position_lots.get(sym, []))
@@ -349,7 +384,7 @@ class QuantBot:
         remaining = float(amount)
 
         # ── 预检查：账本是否够扣（在修改任何状态之前）──
-        available = sum(float(l.get('amount', 0))
+        available = sum(self._lot_amount(l)
                         for l in self.position_lots.get(sym, []))
         # 容差对齐下面的循环判定，避免 1e-12 量级的浮点噪声误报
         if available + 1e-8 < remaining:
@@ -361,13 +396,17 @@ class QuantBot:
         realized_fee_buy = 0.0
         while remaining > 1e-12 and self.position_lots.get(sym):
             lot = self.position_lots[sym][0]
-            lot_amt = float(lot.get('amount', 0))
+            lot_amt = self._lot_amount(lot)
             take = min(remaining, lot_amt)
             ratio = take / lot_amt if lot_amt else 0
             realized_cost += float(lot.get('cost', 0)) * ratio
             # 用折算后的 fee_usdt，而不是原始 fee（原始值可能是币数）
             realized_fee_buy += float(lot.get('fee_usdt', 0)) * ratio
             lot['amount'] = lot_amt - take
+            # 若原记录用的是 qty（v14 旧数据），同步扣减，
+            # 否则 amount 归零但 qty 仍是原值，读取端会误判
+            if 'qty' in lot:
+                lot['qty'] = lot_amt - take
             lot['cost'] = float(lot.get('cost', 0)) * (1 - ratio)
             lot['fee'] = float(lot.get('fee', 0)) * (1 - ratio)
             lot['fee_usdt'] = float(lot.get('fee_usdt', 0)) * (1 - ratio)
@@ -874,7 +913,15 @@ class QuantBot:
         if not self._auth(update):
             return
         args = list(getattr(context, "args", None) or [])
-        target = (args[0].strip() if args else "").upper()
+        # 成本基准模式：
+        #   now     以当前价建账（默认）—— 浮盈归零，止盈止损从此刻起算
+        #   history 以成交历史推算的成本建账 —— 会带出历史浮盈
+        mode = "now"
+        words = [a.strip().upper() for a in args]
+        if "HISTORY" in words:
+            mode = "history"
+            words = [w for w in words if w != "HISTORY"]
+        target = (words[0] if words else "")
 
         blocked = set(getattr(self.reconciler, "blocked", set()) or set())
         if target in ("", "ALL"):
@@ -887,6 +934,14 @@ class QuantBot:
                 await update.effective_message.reply_text(
                     f"❌ {syms[0]} 不在监控列表中")
                 return
+
+        if mode == "history":
+            await update.effective_message.reply_text(
+                "⚠️ 你选择了【历史成本】模式。\n\n"
+                "这会把很久以前的买入价写入账本，\n"
+                "账面浮盈可能远超止盈线，\n"
+                "导致机器人【立即自动卖出】这些持仓。\n\n"
+                "如果这不是你的意图，请改用 /import（默认当前价）。")
 
         if not syms:
             await update.effective_message.reply_text(
@@ -916,18 +971,49 @@ class QuantBot:
 
             ticker = self.ws.get_ticker(sym)
             cur = float(ticker['last']) if ticker else 0.0
-            avg, source = await self._derive_entry_from_trades(sym, total)
+            hist_avg, source = await self._derive_entry_from_trades(sym, total)
+
+            # ⚠️ 关键：默认以【当前价】建账，而不是历史成本。
+            #
+            # 原因（实测）：历史成本会带出巨额账面浮盈 ——
+            #   ETH 成本 1930.85，现价 2384.06 → 浮盈 +23.47%
+            #   SOL 成本  77.86，现价   99.92 → 浮盈 +28.34%
+            # 而止盈线只有 1.5%，_trailing_monitor 每 5 秒一轮，
+            # 于是导入后【立刻自动全平】—— 用户完全没预期。
+            #
+            # 用户 /import 的意图是"解锁阻塞、让机器人接管"，
+            # 不是"立刻套现"。所以默认浮盈归零，
+            # 止盈止损从【此刻】正常起算。
+            #
+            # 历史成本只用于展示参考，不参与止盈计算。
+            if mode == "history" and hist_avg > 0:
+                avg = hist_avg
+                basis = f"历史成本（{source}）"
+            else:
+                avg = cur if cur > 0 else (hist_avg if hist_avg > 0 else 0.0)
+                basis = "当前价（盈亏从此刻起算）"
+            if avg <= 0:
+                lines.append(f"⚠️ {base}  无法取得价格，跳过")
+                continue
 
             # 写入账本
+            # 键名必须与买入时一致用 'amount'。
+            # v14 误用 'qty'，导致 _bot_position_amount 读不到数量，
+            # /panic 静默跳过（不下单、不报错，只回复"全平完成"）。
+            # 此处修正，并同时写 qty 作冗余。
             self.position_lots[sym] = [{
-                'qty': total, 'price': avg, 'cost_usdt': total * avg,
+                'amount': total, 'qty': total, 'price': avg,
+                'cost': total * avg, 'cost_usdt': total * avg,
                 'fee': 0.0, 'fee_currency': '', 'fee_usdt': 0.0,
                 'time': time.time(),
             }]
             self.entries[sym] = avg
             self.position_counts[sym] = 1
-            self._trailing_high[sym] = max(cur, avg)
-            self.entry_details[sym] = {'imported': True, 'source': source}
+            # 移动止盈的高点也从此刻起算，否则历史高点会立即触发回撤卖出
+            self._trailing_high[sym] = cur if cur > 0 else avg
+            self.entry_details[sym] = {
+                'imported': True, 'basis': basis,
+                'hist_cost': hist_avg, 'source': source}
             imported += 1
 
             # 解除阻塞
@@ -935,10 +1021,14 @@ class QuantBot:
                 self.reconciler.unblock(sym)
 
             pnl = ((cur - avg) / avg * 100) if avg > 0 else 0.0
+            hist_pnl = (((cur - hist_avg) / hist_avg * 100)
+                        if hist_avg > 0 else 0.0)
             lines.append(
-                f"✅ {base}  {total:.6f} @ {avg:.4f}\n"
-                f"     现价 {cur:.4f}  浮盈 {pnl:+.2f}%\n"
-                f"     成本来源：{source}")
+                f"✅ {base}  {total:.6f}\n"
+                f"     建账基准：{basis}\n"
+                f"     现价 {cur:.4f}  记账浮盈 {pnl:+.2f}%\n"
+                + (f"     参考：历史成本 {hist_avg:.4f}（约 {hist_pnl:+.2f}%）\n"
+                   if hist_avg > 0 and mode != "history" else ""))
 
         if imported:
             await self._save_runtime_state()
@@ -947,10 +1037,13 @@ class QuantBot:
                 await self._push_backup_now()
             except Exception:
                 pass
+            tip = ("⚠️ 盈亏从【此刻】起算，机器人将按当前价管理这些持仓。"
+                   if mode != "history" else
+                   "⚠️ 已按【历史成本】建账，账面浮盈可能立即触发止盈卖出。")
             await update.effective_message.reply_text(
                 f"📥 已导入 {imported} 个币种\n\n"
                 + "\n".join(lines)
-                + "\n\n⚠️ 盈亏从【此刻】起算，之前的浮盈浮亏不计入。"
+                + f"\n\n{tip}"
                 "\n已自动推送一份备份到本对话，供以后 /restore 恢复。")
         else:
             await update.effective_message.reply_text(
@@ -1943,30 +2036,54 @@ class QuantBot:
 
     # ---------- Panic Sell ----------
     async def panic_sell_all(self):
+        """
+        紧急全平。返回每个币种的结果明细。
+
+        ⚠️ 原实现无条件回复「🚨 全平完成」，
+        无论是否真的卖出过。实测问题链：
+          /import 写入键名 'qty' → _bot_position_amount 读 'amount'
+          → amount = 0 → continue（静默跳过）
+          → 用户看到"全平完成"，交易所持仓纹丝不动
+
+        改为逐币种记录结果，由调用方如实汇报。
+        """
         self._is_paused = True
+        results = []
         for sym in self.symbols:
             try:
                 await self.exchange.cancel_all_orders(sym)
                 amount = self._bot_position_amount(sym)
                 if amount <= 0:
+                    results.append((sym, "skip", 0.0, "账本无持仓"))
                     continue
                 rounded = await self._round_amount_by_precision(sym, amount)
-                if rounded > 0:
-                    order = await self.exchange.create_market_sell_order(sym, rounded)
-                    if order:
-                        filled = float(order.get('filled') or 0)
-                        avg = float(order.get('average') or 0)
-                        revenue = filled * avg
-                        fee = float(order.get('_fee_cost') or 0)
-                        try:
-                            self._consume_position_lots(sym, filled, avg, revenue, fee)
-                        except ValueError:
-                            logger.error(f"Panic Sell 账本不一致 {sym}")
+                if rounded <= 0:
+                    results.append((sym, "fail", amount,
+                                    "数量低于交易所最小精度，已跳过"))
+                    continue
+                order = await self.exchange.create_market_sell_order(sym, rounded)
+                if not order:
+                    results.append((sym, "fail", rounded, "下单未返回结果"))
+                    continue
+                filled = float(order.get('filled') or 0)
+                avg = float(order.get('average') or 0)
+                revenue = filled * avg
+                fee = float(order.get('_fee_cost') or 0)
+                if filled <= 0:
+                    results.append((sym, "fail", rounded, "订单未成交"))
+                    continue
+                try:
+                    self._consume_position_lots(sym, filled, avg, revenue, fee)
+                except ValueError:
+                    logger.error(f"Panic Sell 账本不一致 {sym}")
                 if self._bot_position_amount(sym) <= 1e-12:
                     self.position_counts[sym] = 0
+                results.append((sym, "sold", filled, f"均价 {avg:.4f}"))
             except Exception as e:
                 logger.error(f"Panic Sell {sym} 失败: {e}")
+                results.append((sym, "error", 0.0, str(e)[:60]))
         await self._save_runtime_state()
+        return results
 
     # ---------- Telegram 命令（精简） ----------
     async def cmd_menu(self, update, context):
@@ -2049,6 +2166,7 @@ class QuantBot:
     async def cmd_check(self, update, context):
         if not self._auth(update): return
         lines = ["📈 信号检查\n"]
+        shown = 0
         for sym in self.symbols:
             ticker = self.ws.get_ticker(sym)
             if not ticker:
@@ -2062,6 +2180,19 @@ class QuantBot:
             lines.append(f"{sym}: {p:.2f} | 评分{decision['score']:.0f} | {status}")
             lines.append(f"   {', '.join(decision['details'])}")
             lines.append(f"   偏移{decision.get('adaptive_offset',0):+d}分, 仓位{decision.get('adaptive_factor',1.0):.2f}x")
+            shown += 1
+
+        # 原实现：无数据时只输出"📈 信号检查"四个字，
+        # 用户分不清是【没配置币种】还是【行情没到】，无从下手。
+        if shown == 0:
+            if not self.symbols:
+                lines.append("⚠️ 监控列表为空。")
+                lines.append("   用 /addsymbol ETH/USDT 添加币种")
+            else:
+                lines.append("⚠️ 暂无行情数据。可能原因：")
+                lines.append("   · WebSocket 尚未连接（刚启动，稍等片刻）")
+                lines.append("   · K 线数据未就绪")
+                lines.append("   持续无数据请发 /patrol 或查看日志")
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_holdings(self, update, context):
@@ -2083,8 +2214,43 @@ class QuantBot:
 
     async def cmd_panic(self, update, context):
         if not self._auth(update): return
-        await self.panic_sell_all()
-        await update.effective_message.reply_text("🚨 全平完成")
+        results = await self.panic_sell_all()
+
+        sold, failed, skipped = [], [], []
+        for sym, status, qty, note in results:
+            base = sym.split('/')[0]
+            if status == "sold":
+                sold.append(f"✅ {base}  卖出 {qty:.6f}  {note}")
+            elif status in ("fail", "error"):
+                failed.append(f"❌ {base}  {note}")
+            else:
+                skipped.append(f"· {base}  {note}")
+
+        sold_n = len(sold)
+        if sold_n:
+            head = f"🚨 全平完成 —— 已卖出 {sold_n} 个币种"
+        elif failed:
+            head = "🚨 全平失败 —— 没有任何持仓被卖出"
+        else:
+            head = "🚨 全平完成 —— 但账本中本就无持仓"
+
+        lines = [head, ""]
+        lines += sold
+        if failed:
+            lines.append("")
+            lines += failed
+        if skipped:
+            lines.append("")
+            lines.append("未处理：")
+            lines += skipped
+
+        # 存在失败时明确提示，避免"显示完成实际没卖"
+        if failed:
+            lines.append("")
+            lines.append("⚠️ 交易所可能仍有持仓，请到交易所确认，")
+            lines.append("   必要时手动卖出或用 /reconcile 核对")
+
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_autotrade(self, update, context):
         if not self._auth(update): return

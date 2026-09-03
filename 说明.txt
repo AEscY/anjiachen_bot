@@ -1,0 +1,88 @@
+热修 v16：/panic 显示"全平完成"但一单没下
+==========================================
+
+现象
+----
+  用户手动发 /panic，机器人回复「🚨 全平完成」，
+  但模拟盘的 ETH / SOL 持仓纹丝不动。
+
+根因：键名不匹配
+----------------
+  买入时写入：  position_lots[sym] = [{'amount': 0.008275, ...}]
+  v14 /import：position_lots[sym] = [{'qty':    0.008275, ...}]   ← 错
+
+  而 _bot_position_amount 读的是：
+      sum(l.get('amount', 0) for l in lots)
+      → qty 键读不到 → 返回 0.0
+
+  panic_sell_all 里：
+      amount = self._bot_position_amount(sym)   # = 0
+      if amount <= 0: continue                  # 静默跳过
+
+  不下单、不报错、不告警，
+  然后无条件回复「🚨 全平完成」。
+
+  → 用户以为平了，交易所持仓完全没动
+  → 更糟：账本与交易所不一致，下次对账再次阻塞
+
+修复
+----
+1. /import 写入改用 'amount'（与买入一致），同时写 qty 作冗余
+
+2. _bot_position_amount 兼容两种键名
+   这样数据库里【已有的旧 qty 记录】也能正常读出，
+   不需要手工修数据。
+
+3. panic_sell_all 改为返回逐币种结果明细
+   sold / fail / error / skip 四种状态
+
+4. cmd_panic 如实汇报，不再无条件说"完成"
+
+   修复前：
+      🚨 全平完成
+
+   修复后（成功）：
+      🚨 全平完成 —— 已卖出 2 个币种
+      ✅ ETH  卖出 0.008275  均价 2384.06
+      ✅ SOL  卖出 0.179813  均价 99.92
+      未处理：· BTC  账本无持仓
+
+   修复后（失败）：
+      🚨 全平失败 —— 没有任何持仓被卖出
+      ❌ ETH  订单未成交
+      ❌ SOL  数量低于交易所最小精度，已跳过
+      ⚠️ 交易所可能仍有持仓，请到交易所确认
+
+为什么之前没发现
+------------------
+  test_import 只验证了：成本推算、建账基准、命令注册
+  没有验证：导入后的持仓能否被正常卖出
+
+  单点测试全绿，链路断裂无人察觉。
+  这跟 v15 是同一类问题 —— 只测了"写入"，没测"写入后怎么用"。
+
+  现在补了端到端检查：
+    "导入的持仓可被 /panic 读到（不再静默跳过）"
+
+你现在该怎么处理那两个持仓
+----------------------------
+  它们是 /import 导入的，键名是旧格式。
+  传 v16 后 _bot_position_amount 能兼容读到，
+  所以直接再发一次 /panic 即可正常卖出。
+
+  或者先 /resetledger 清空账本重来（如果持仓已在交易所手动处理过）。
+
+上传清单（替换 8 个）
+----------------------
+  config.py            → 根目录
+  storage.py           → 根目录
+  core/bot.py          → core/
+  core/execution.py    → core/
+  core/exchange.py     → core/
+  core/params.py       → core/
+  core/watchdog.py     → core/
+  core/trend.py        → core/
+
+测试
+----
+  425 项全绿（test_import 扩充至 35 项）
