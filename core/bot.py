@@ -3045,6 +3045,71 @@ class QuantBot:
                 f"{pnl:+.2f}%  {t.get('time','')}")
         return await update.effective_message.reply_text("\n".join(lines))
 
+    def _bt_kwargs(self):
+        """
+        把 bot 当前参数转换成回测配置，供 /backtest 使用。
+
+        ⚠️ 曾经在这里踩过大坑：直接写 self.equity_cap，
+        而真实参数名是 equity_cap_usdt —— 少了个后缀。
+        QuantBot 没有 __getattr__ 兜底，直接抛
+            AttributeError: 'QuantBot' object has no attribute 'equity_cap'
+        结果三个币种的回测全部失败。
+
+        更值得警惕的是：同文件另外两处（_effective_equity、
+        网格仓位计算）早就用了 getattr(..., 'equity_cap_usdt', 0)
+        安全访问，只有我新写的这行用了裸属性访问。
+
+        现在改为：
+          1. 全部走 getattr 兜底，缺省值取自 params.PARAMS 注册表
+          2. 参数名写错时不崩溃，但记录告警日志
+          3. 参数表改名自动同步，无需改这里
+        """
+        from core.params import PARAMS
+
+        def g(key, cast=None):
+            spec = PARAMS.get(key)
+            default = spec.default if spec is not None else None
+            if not hasattr(self, key):
+                if spec is not None:
+                    logger.warning(
+                        f"⚠️ 回测参数缺失: {key}，回退默认值 {default}")
+                return default
+            v = getattr(self, key)
+            if cast and v is not None:
+                try:
+                    return cast(v)
+                except (TypeError, ValueError):
+                    return default
+            return v
+
+        # 本金：优先用权益上限（若设置），否则用实际可用余额
+        cap = g("equity_cap_usdt", float) or 0.0
+        free = float(getattr(self, "_cached_usdt_free", 0) or 0)
+        initial = cap if cap > 0 else free
+        if initial <= 0:
+            initial = 9.0
+
+        return dict(
+            initial_cash=max(9.0, float(initial)),
+            order_type="limit" if g("grid_enabled") else "market",
+            grid_enabled=bool(g("grid_enabled", bool)),
+            grid_levels=int(g("grid_levels", int) or 1),
+            grid_spacing_pct=float(g("grid_spacing_pct", float) or 0),
+            grid_spacing_mode=str(g("grid_spacing_mode") or "fixed"),
+            grid_capital_pct=float(g("grid_capital_pct", float) or 0),
+            grid_min_order_usdt=float(
+                g("grid_min_order_usdt", float) or 0),
+            grid_stop_loss_pct=float(
+                g("grid_stop_loss_pct", float) or 0),
+            tp_pct=float(g("tp_pct", float) or 0),
+            sl_pct=float(g("sl_pct", float) or 0),
+            reserve_bottom=float(g("reserve_bottom", float) or 0),
+            max_drawdown_pct=float(g("max_drawdown_pct", float) or 0),
+            max_positions_per_coin=int(
+                g("max_positions_per_coin", int) or 1),
+            max_per_coin_usdt=float(g("max_per_coin_usdt", float) or 0),
+        )
+
     async def cmd_backtest(self, update, context):
         """
         /backtest [币种] [天数] —— 用真实历史行情回测当前参数。
@@ -3099,24 +3164,7 @@ class QuantBot:
                 f"❌ K 线不足（仅 {len(bars)} 根），至少需要 200 根")
 
         def make_cfg():
-            return BTConfig(
-                initial_cash=max(9.0, float(self.equity_cap or 0)
-                                 or float(self._cached_usdt_free or 9.0)),
-                order_type="limit" if self.grid_enabled else "market",
-                grid_enabled=bool(self.grid_enabled),
-                grid_levels=int(self.grid_levels),
-                grid_spacing_pct=float(self.grid_spacing_pct),
-                grid_spacing_mode=str(self.grid_spacing_mode),
-                grid_capital_pct=float(self.grid_capital_pct),
-                grid_min_order_usdt=float(self.grid_min_order_usdt),
-                grid_stop_loss_pct=float(self.grid_stop_loss_pct),
-                tp_pct=float(self.tp_pct),
-                sl_pct=float(self.sl_pct),
-                reserve_bottom=float(self.reserve_bottom),
-                max_drawdown_pct=float(self.max_drawdown_pct),
-                max_positions_per_coin=int(self.max_positions_per_coin),
-                max_per_coin_usdt=float(self.max_per_coin_usdt),
-            )
+            return BTConfig(**self._bt_kwargs())
 
         try:
             full = Backtester(make_cfg()).run(bars)

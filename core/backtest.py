@@ -750,11 +750,9 @@ async def fetch_bars(exchange, symbol, timeframe="15m", limit=1000,
     # 数据源也被绕过了。必须保留完整回退链。
     candidates = [public_exchange, _new_public_exchange(), exchange]
     raw = None
-    used = None
     for cand in candidates:
         raw = await _try_fetch(cand)
         if raw:
-            used = cand
             break
 
     # 释放临时实例
