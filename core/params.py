@@ -84,6 +84,12 @@ _reg(
               scale=0.01, aliases=("setgridstop",), unit="%", group="网格·风控"),
     ParamSpec("grid_hard_stop_loss_pct", 0.0, "网格硬止损：浮亏达此值无条件清仓，无视区间下界（0=关闭）", float, 0.0, 0.9),
 
+    ParamSpec("grid_follow_sell", True, "卖单价跟随：持仓深套且老化后下移卖单价，避免死挂（on/off）", bool),
+    ParamSpec("grid_follow_sell_hours", 24.0, "卖单价下移的时间门槛：持仓超过此小时数才允许（0=不限）", float, 0, 720),
+    ParamSpec("grid_follow_sell_max_loss", 0.06, "卖单价下移的让利底线：最低不低于成本×(1-此值)", float, 0.0, 0.5),
+
+    ParamSpec("single_max_hold_hours", 48.0, "单次模式持仓超时：超过此小时数且已达保本线则离场（0=关闭）", float, 0, 720),
+
     ParamSpec("grid_lower_buffer_pct", 0.06, "区间下限缓冲（最低档之下再加此缓冲）", float, 0.0, 0.30,
               scale=0.01, aliases=("setlowerbuf",), unit="%", group="网格·风控"),
     ParamSpec("grid_upper_buffer_pct", 0.06, "区间上限缓冲（最高档之上）", float, 0.0, 0.30,

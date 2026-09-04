@@ -2019,6 +2019,58 @@ class QuantBot:
                 await asyncio.sleep(30)
 
     # ---------- 移动止盈止损 ----------
+    def _hold_expired(self, sym, price, floor_price) -> bool:
+        """
+        单次模式：持仓是否超时应离场。
+
+        只在【卖出不亏钱】时才返回 True —— 即价格已达保本线
+        （成本 x (1+往返手续费)）。
+
+        为什么不在浮亏时也强制离场：
+            主动割肉会把浮亏变成实亏。持仓横盘时，等待回本
+            或等硬止损触发，都比在亏损位卖出更合理。
+            "资金占用"的代价 < "锁定亏损"的代价。
+
+        超时时间取最早那笔 lot 的 time（分批买入时按第一笔算）。
+        """
+        hours = float(getattr(self, "single_max_hold_hours", 0) or 0)
+        if hours <= 0:
+            return False                      # 0 = 关闭
+
+        lots = self.position_lots.get(sym) or []
+        if not lots:
+            return False
+        try:
+            t0 = min(float(l.get("time") or 0) for l in lots
+                     if isinstance(l, dict))
+        except Exception:
+            return False
+        if t0 <= 0:
+            return False
+
+        age_h = (time.time() - t0) / 3600.0
+        if age_h < hours:
+            return False
+
+        # 必须不亏钱才离场
+        if floor_price > 0 and price < floor_price:
+            return False
+        return True
+
+    def _position_age_hours(self, sym) -> float:
+        """持仓年龄（小时），用于 /positions 显示。无持仓返回 0"""
+        lots = self.position_lots.get(sym) or []
+        if not lots:
+            return 0.0
+        try:
+            t0 = min(float(l.get("time") or 0) for l in lots
+                     if isinstance(l, dict) and float(l.get("time") or 0) > 0)
+        except Exception:
+            return 0.0
+        if t0 <= 0:
+            return 0.0
+        return (time.time() - t0) / 3600.0
+
     async def _trailing_monitor(self):
         await asyncio.sleep(5)
         while True:
@@ -2130,6 +2182,17 @@ class QuantBot:
                             # 原实现 `profit_pct > 0` 会让币价随便波动 0.7%
                             # 就被洗出去，扣完手续费是净亏的。
                             reason, action = "trailing_sl", 'sell'
+                        elif self._hold_expired(sym, p, floor_price):
+                            # 持仓超时：资金被长期占用但既不止盈也不止损。
+                            #
+                            # 单次模式原本【没有任何持有时间上限】：
+                            # 买入后横盘的持仓会永久挂在账上，
+                            # 资金无法重新部署到其他机会。
+                            #
+                            # 只在【不亏钱】时才强制离场（p >= 保本线）。
+                            # 若仍在浮亏，继续持有等待回本或硬止损 ——
+                            # 主动割肉只会把浮亏变成实亏，对账户没有好处。
+                            reason, action = "hold_expired", 'sell'
                         else:
                             reason, action = "", 'hold'
 
@@ -2972,6 +3035,109 @@ class QuantBot:
         # 复用 /set 的处理逻辑
         context.args = [key, args[0]]
         return await self.cmd_set(update, context)
+
+    async def cmd_positions(self, update, context):
+        """
+        /positions —— 持仓诊断。
+
+        核心价值：暴露【持仓年龄】。
+
+        两套模式都缺少"这笔持了多久"的可观测性：
+          · 网格：卖单价被锁死，深套时永远挂着（v34 已加跟随）
+          · 单次：完全没有持有时间上限（v34 已加超时）
+
+        看不到年龄，就无法判断持仓是"正常等待"还是"僵尸占用资金"。
+        """
+        if not self._auth(update):
+            return
+        lines = [f"📊 持仓诊断 {self.env_tag}", ""]
+        mode = self.trade_mode
+        follow_on = bool(getattr(self, "grid_follow_sell", True))
+        hold_h = float(getattr(self, "single_max_hold_hours", 0) or 0)
+        follow_h = float(getattr(self, "grid_follow_sell_hours", 24) or 0)
+
+        any_pos = False
+
+        # ── 网格持仓 ──
+        if mode == "grid":
+            for sym in (self.symbols or []):
+                st = self.grid.get_state(sym)
+                if not st or not st.lots:
+                    continue
+                any_pos = True
+                ticker = self.ws.get_ticker(sym) if self.ws else None
+                p = float(ticker["last"]) if ticker else 0.0
+                tq = sum(float(l.get("qty") or 0) for l in st.lots.values())
+                tc = sum(float(l.get("cost_usdt") or 0) for l in st.lots.values())
+                if tq <= 0:
+                    continue
+                avg = tc / tq
+                pnl_pct = ((p - avg) / avg * 100) if avg > 0 and p > 0 else 0.0
+
+                ages = [float(l.get("buy_time") or 0) for l in st.lots.values()
+                        if float(l.get("buy_time") or 0) > 0]
+                age_h = ((time.time() - min(ages)) / 3600.0) if ages else 0.0
+
+                lines.append(f"🕸️ {sym}")
+                lines.append(f"   数量 {tq:.6f}  均价 {avg:.4f}")
+                lines.append(f"   现价 {p:.4f}  浮盈亏 {pnl_pct:+.2f}%")
+                lines.append(f"   年龄 {age_h:.1f}h")
+                if follow_on and follow_h > 0:
+                    if age_h >= follow_h:
+                        cur = self.grid.effective_sell_price(sym, 0, p) if p > 0 else 0
+                        locked = 0.0
+                        for l in st.lots.values():
+                            if float(l.get("sell_price") or 0) > 0:
+                                locked = float(l["sell_price"]); break
+                        if locked > 0 and cur > 0 and cur < locked - 1e-9:
+                            lines.append(
+                                f"   ⚠️ 已老化，卖单价可下移 {locked:.4f} → {cur:.4f}")
+                        else:
+                            lines.append(f"   ⚠️ 已老化（≥{follow_h:.0f}h），监控卖单死挂")
+                    else:
+                        lines.append(f"   卖单价保护中（{follow_h:.0f}h 内不下移）")
+                else:
+                    lines.append("   ⚠️ 卖单跟随已关闭，深套时可能死挂")
+                lines.append("")
+
+        # ── 单次持仓 ──
+        if mode == "single":
+            for sym in (self.symbols or []):
+                if self.position_counts.get(sym, 0) <= 0:
+                    continue
+                any_pos = True
+                ticker = self.ws.get_ticker(sym) if self.ws else None
+                p = float(ticker["last"]) if ticker else 0.0
+                entry = self._weighted_entry(sym) or self.entries.get(sym, 0) or p
+                amount = self._bot_position_amount(sym)
+                pnl_pct = ((p - entry) / entry * 100) if entry > 0 and p > 0 else 0.0
+                age_h = self._position_age_hours(sym)
+
+                lines.append(f"📈 {sym}")
+                lines.append(f"   数量 {amount:.6f}  成本 {entry:.4f}")
+                lines.append(f"   现价 {p:.4f}  浮盈亏 {pnl_pct:+.2f}%")
+                lines.append(f"   年龄 {age_h:.1f}h")
+                if hold_h > 0:
+                    if age_h >= hold_h:
+                        floor = entry * (1 + self.breakeven_pct)
+                        if p >= floor:
+                            lines.append(f"   ⚠️ 超过 {hold_h:.0f}h 且已达保本线，将离场")
+                        else:
+                            lines.append(
+                                f"   ⚠️ 超过 {hold_h:.0f}h，但仍浮亏 → 继续持有"
+                                f"（保本线 {floor:.4f}）")
+                    else:
+                        lines.append(f"   超时阈值 {hold_h:.0f}h，剩余 {hold_h-age_h:.1f}h")
+                else:
+                    lines.append("   ⚠️ 持仓超时未启用，横盘可能永久占用资金")
+                lines.append("")
+
+        if not any_pos:
+            lines.append("当前无持仓。")
+            if mode == "off":
+                lines.append("（机器人已停止，/puregrid 或 /puresingle 启动）")
+
+        await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_gridstatus(self, update, context):
         """/grid —— 查看各币种网格运行状态"""
@@ -4547,6 +4713,7 @@ class QuantBot:
             CommandHandler("params", self.cmd_params),
             # 网格
             CommandHandler("grid", self.cmd_gridstatus),
+            CommandHandler("positions", self.cmd_positions),
             CommandHandler("gridstatus", self.cmd_gridstatus),
             CommandHandler("gridreset", self.cmd_gridreset),
             CommandHandler("stats", self.cmd_stats),

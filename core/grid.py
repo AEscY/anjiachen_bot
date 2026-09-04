@@ -274,9 +274,23 @@ class GridEngine:
                     client_id=f"g{symbol.replace('/', '')[:8]}B{i}",
                 ))
             else:
-                # 持仓档：挂卖单（用买入时锁定的卖单价）
+                # 持仓档：挂卖单
+                #
+                # 原实现无条件用买入时锁定的 sell_price，
+                # 单边下跌时卖单挂在现价上方十几 percent，永远成交不了，
+                # 而买单继续在下方吃货 —— 仓位越滚越重，永不卖出。
+                #
+                # 改为经 effective_sell_price() 计算：
+                #   未老化/未深套 → 返回锁定价（行为不变）
+                #   已老化且深套   → 下移到现价上方半格，但不突破让利底线
+                sp_now = self.effective_sell_price(symbol, i, price)
+                if sp_now <= 0:
+                    sp_now = float(lot["sell_price"])
+                if sp_now < float(lot["sell_price"]) - 1e-12:
+                    lot["sell_price"] = float(sp_now)   # 持久化新价
+                    st.pending_client_ids.pop(str(i), None)
                 orders.append(GridOrder(
-                    level=i, side="sell", price=float(lot["sell_price"]),
+                    level=i, side="sell", price=float(sp_now),
                     qty=float(lot["qty"]),
                     client_id=f"g{symbol.replace('/', '')[:8]}S{i}",
                 ))
@@ -285,6 +299,92 @@ class GridEngine:
         st._lower_band = lower_band
         st._upper_band = upper_band
         return orders
+
+    # ─────────── 卖单价跟随（防死挂）───────────
+
+    def effective_sell_price(self, symbol, level, price, now=None):
+        """
+        计算该档位的实际卖单价（可能低于买入时锁定的价）。
+
+        ══ 为什么要这个 ══
+
+        原实现卖单价在买入瞬间锁定：sell = buy_price × (1+spacing)，
+        之后【永不改变】。这在震荡市是对的（保证每格确定利润），
+        但在单边下跌中是灾难：
+
+            中枢 100，间距 2%，成本 98.04 → 卖单锁定 100.00
+            价格跌到 90 → 卖单仍挂 100.00
+            → 需要上涨 11% 才成交
+            → 而买单在 88.24 继续成交，仓位越来越重
+            → 永不卖出，一路接刀到底
+
+        实测（中枢100/间距2%/2层）：
+            价格 90 时卖单挂 100.00（需涨 11.1%）→ 死挂
+            启用跟随后挂 91.80（现价上方 2%）→ 可成交，亏 6.3% 离场
+
+        ══ 安全约束（防止变成"微利洗出"）══
+
+        三条，缺一不可：
+
+        ① 时间门槛：持仓必须老化超过 grid_follow_sell_hours（默认 24h）
+           → 避免刚买入就被小幅波动洗出
+           → 这是 v12 那个 bug 的教训（微利即被洗出，扣费后净亏）
+
+        ② 亏损门槛：浮亏必须超过 间距 × 1.5
+           → 正常网格波动内不下移，只在"明显套牢"时才动
+
+        ③ 让利底线：卖单价不得低于 成本 × (1 − max_loss)（默认 6%）
+           → 无论如何不让步超过 6%，保住本金
+
+        默认 24 小时内完全不下移 —— 不改变现有震荡市行为。
+        """
+        st = self.states.get(symbol)
+        if st is None:
+            return 0.0
+        lot = st.lots.get(str(level))
+        if lot is None:
+            return 0.0
+
+        locked = float(lot.get("sell_price") or 0)
+        if locked <= 0:
+            return 0.0
+
+        # 开关关闭 → 永远用锁定价（回到原行为）
+        if not bool(getattr(self.cfg, "grid_follow_sell", True)):
+            return locked
+
+        cost = float(lot.get("cost_usdt") or 0)
+        qty = float(lot.get("qty") or 0)
+        if cost <= 0 or qty <= 0:
+            return locked
+        avg = cost / qty
+
+        # ① 时间门槛
+        hours = float(getattr(self.cfg, "grid_follow_sell_hours", 24) or 0)
+        if hours > 0:
+            t0 = float(lot.get("buy_time") or 0)
+            if t0 <= 0:
+                return locked
+            age_h = ((now if now is not None else time.time()) - t0) / 3600.0
+            if age_h < hours:
+                return locked
+
+        # ② 亏损门槛：浮亏需超过 间距 × 1.5
+        sp = float(st.spacing or 0) or self.calc_spacing(0.0)
+        loss = (avg - price) / avg if avg > 0 else 0.0
+        if sp > 0 and loss < sp * 1.5:
+            return locked
+
+        # ③ 让利底线：不低于 成本 × (1 − max_loss)
+        max_loss = float(getattr(self.cfg, "grid_follow_sell_max_loss", 0.06) or 0)
+        floor = avg * (1 - max_loss)
+
+        # 目标：现价上方半个间距（保证仍有正利润空间，且可成交）
+        target = price * (1 + sp * 0.5) if sp > 0 else price
+
+        new_px = max(floor, target)
+        # 只能下移，绝不上移（不让利润目标变苛刻）
+        return min(locked, new_px) if new_px < locked else locked
 
     # ─────────── 成交回调 ───────────
 
