@@ -143,6 +143,18 @@ class QuantBot:
         self.symbols = [settings.SYMBOL, "BTC/USDT", "SOL/USDT"]
         self.timeframe = "5m"
         self.auto_trade_enabled = False
+        # ── 交易模式：唯一的权威来源 ──
+        # 此前 grid_enabled 与 auto_trade_enabled 是两个独立布尔位，
+        # 语义却互相重叠：
+        #     _auto_trade_monitor  条件 auto_trade_enabled
+        #     _grid_monitor        条件 grid_enabled AND auto_trade_enabled
+        # 于是 auto_trade 既是"单次模式开关"又是"总开关"，
+        # 关掉它网格不跑、打开它两个买循环并发抢余额 —— 用户无解。
+        #
+        # 改为单一枚举，两个布尔位变成派生态，由 _sync_mode_flags() 维护。
+        self.trade_mode = "off"       # grid | single | off
+        # 停止前所处模式，供 /autotrade on 恢复（避免静默降级成单次）
+        self._last_active_mode = None
         self.orderbook_filter = True
         self.single_order_usdt = 1.0        # 单次模式单笔额度（U）
         self.max_single_order_pct = 0.10    # 单笔硬上限 10%
@@ -696,6 +708,15 @@ class QuantBot:
             if key in cfg:
                 setattr(self, key, cfg[key])
         self.symbols = cfg.get('symbols') or [settings.SYMBOL, "BTC/USDT", "SOL/USDT"]
+
+        # 模式优先级：新字段优先；旧配置无该字段时，
+        # 从 grid_enabled / auto_trade_enabled 反推，保证平滑升级。
+        saved_mode = str(cfg.get('trade_mode') or '').lower()
+        if saved_mode in self.VALID_MODES:
+            self.trade_mode = saved_mode
+        else:
+            self.trade_mode = self._infer_mode_from_flags()
+        self._sync_mode_flags()
 
         # 启动自检：隔离无效交易对，防止一个坏币种拖垮整个 WebSocket 订阅
         try:
@@ -1289,6 +1310,53 @@ class QuantBot:
                 f"   该任务对应的功能已停止，其余功能不受影响。\n"
                 f"   → 建议重启服务", "critical")
 
+    # ---------- 交易模式：单一权威来源 ----------
+
+    VALID_MODES = ("grid", "single", "off")
+
+    def _sync_mode_flags(self):
+        """
+        由 trade_mode 派生两个布尔位。
+
+        这是模式隔离的核心：所有老代码继续读 grid_enabled /
+        auto_trade_enabled，但它们的取值不再各自独立，
+        而是统一由 trade_mode 推导，从根上消除冲突组合。
+        """
+        m = str(getattr(self, "trade_mode", "off") or "off").lower()
+        if m not in self.VALID_MODES:
+            m = "off"
+            self.trade_mode = m
+        self.grid_enabled = (m == "grid")
+        self.auto_trade_enabled = (m != "off")
+        return m
+
+    def _infer_mode_from_flags(self):
+        """
+        从旧的两个布尔位反推模式 —— 只为兼容已持久化的配置。
+        旧配置里 grid+auto 同时为真，语义上就是"网格"。
+        """
+        grid = bool(getattr(self, "grid_enabled", False))
+        auto = bool(getattr(self, "auto_trade_enabled", False))
+        if grid and auto:
+            return "grid"
+        if auto:
+            return "single"
+        return "off"
+
+    def set_trade_mode(self, mode: str):
+        """切换模式并立即同步布尔位"""
+        m = str(mode or "").lower().strip()
+        if m not in self.VALID_MODES:
+            return False
+        self.trade_mode = m
+        self._sync_mode_flags()
+        return True
+
+    def mode_label(self) -> str:
+        return {"grid": "🕸️ 纯网格", "single": "📈 纯单次",
+                "off": "⏸️ 已停止"}.get(
+                    str(getattr(self, "trade_mode", "off")).lower(), "❓ 未知")
+
     def _check_mode_conflict(self):
         """
         检测交易模式冲突。
@@ -1313,7 +1381,10 @@ class QuantBot:
         except Exception:
             return
 
-        if auto and grid:
+        # 模式隔离后，两个布尔位由 trade_mode 派生，
+        # 不可能再同时为真 —— 冲突在构造上已被消除。
+        # 这里保留检查只为兜底：若有人绕过 set_trade_mode 直接赋值。
+        if auto and grid and str(getattr(self, "trade_mode", "")).lower() != "grid":
             self._pending_mode_warning = (
                 "⚠️ 检测到模式冲突：自动交易与网格【同时开启】\n"
                 "   两个买循环会并发消费同一份余额，且\n"
@@ -1458,6 +1529,7 @@ class QuantBot:
             'symbols': self.symbols,
             'timeframe': self.timeframe,
             'auto_trade_enabled': self.auto_trade_enabled,
+            'trade_mode': self.trade_mode,
             'orderbook_filter': self.orderbook_filter,
             'coin_configs': json.dumps(self.coin_configs),
         })
@@ -1682,7 +1754,11 @@ class QuantBot:
         await asyncio.sleep(10)
         while True:
             try:
-                if not self.is_running or not self.auto_trade_enabled:
+                # 模式隔离：只有【纯单次】模式才运行。
+                # 原实现只看 auto_trade_enabled，而该开关在网格模式下
+                # 同样是 True —— 于是切网格后本循环仍会并发买入，
+                # 与 _grid_monitor 抢同一份余额。
+                if not self.is_running or self.trade_mode != "single":
                     await asyncio.sleep(10)
                     continue
 
@@ -1863,7 +1939,11 @@ class QuantBot:
         await asyncio.sleep(5)
         while True:
             try:
-                if not self.is_running:
+                # 模式隔离：单次模式的卖出逻辑（止盈/止损/移动止损）
+                # 只在【纯单次】下运行。原实现仅凭 is_running 就跑，
+                # 网格模式下虽靠 _grid_has_state 跳过持仓，
+                # 但仍每 5 秒空转一遍，且该保护依赖持仓状态正确。
+                if not self.is_running or self.trade_mode != "single":
                     await asyncio.sleep(5)
                     continue
 
@@ -2055,13 +2135,13 @@ class QuantBot:
         await asyncio.sleep(8)
         while True:
             try:
-                if not self.is_running or not self.grid_enabled:
+                # 模式隔离：只有【纯网格】模式才运行。
+                # 原实现要 grid_enabled 与 auto_trade_enabled 同时为真，
+                # 导致用户 /autotrade off 后网格静默停摆、且无从得知。
+                if not self.is_running or self.trade_mode != "grid":
                     await asyncio.sleep(10)
                     continue
                 self.watchdog.beat("网格交易")
-                if not self.auto_trade_enabled:
-                    await asyncio.sleep(10)
-                    continue
 
                 await self._refresh_balance_cache()
                 equity = self._effective_equity_usdt()
@@ -2407,19 +2487,155 @@ class QuantBot:
         await update.effective_message.reply_text("\n".join(lines))
 
     async def cmd_autotrade(self, update, context):
+        """
+        /autotrade on|off —— 兼容旧命令。
+
+        ⚠️ on 的含义已从"打开单次自动交易"改为"恢复上次模式"。
+        因为纯开关在新模型下无法表达"恢复成网格还是单次"，
+        直接置 True 会把模式退回 single，这是危险的静默降级。
+        """
         if not self._auth(update): return
         try:
             mode = context.args[0].lower()
             if mode == "on":
-                self.auto_trade_enabled = True
+                # 恢复到停止前的模式；若从未设过则默认单次
+                target = self._last_active_mode or "single"
+                self.set_trade_mode(target)
             elif mode == "off":
-                self.auto_trade_enabled = False
+                if self.trade_mode != "off":
+                    self._last_active_mode = self.trade_mode
+                self.set_trade_mode("off")
             else:
                 raise ValueError
             await self._save_config()
-            await update.effective_message.reply_text(f"🤖 自动交易已{'开启' if self.auto_trade_enabled else '关闭'}")
-        except:
+            await update.effective_message.reply_text(
+                f"🤖 {self.mode_label()}\n"
+                f"   切换模式请用 /puregrid 或 /puresingle")
+        except Exception:
             await update.effective_message.reply_text("用法: /autotrade on|off")
+
+    # ---------- 模式切换 ----------
+
+    async def cmd_mode(self, update, context):
+        """/mode —— 查看当前模式"""
+        if not self._auth(update): return
+        return await update.effective_message.reply_text(
+            self._mode_report(), parse_mode=None)
+
+    async def cmd_puregrid(self, update, context):
+        """/puregrid —— 一键切到纯网格"""
+        if not self._auth(update): return
+        self._last_active_mode = "grid"
+        self.set_trade_mode("grid")
+        await self._save_config()
+        return await update.effective_message.reply_text(
+            self._mode_report(switched="纯网格"))
+
+    async def cmd_puresingle(self, update, context):
+        """/puresingle —— 一键切到纯单次"""
+        if not self._auth(update): return
+        self._last_active_mode = "single"
+        self.set_trade_mode("single")
+        await self._save_config()
+        return await update.effective_message.reply_text(
+            self._mode_report(switched="纯单次"))
+
+    def _mode_report(self, switched=None):
+        """
+        模式自检报告。
+
+        设计重点不是"显示模式"，而是【暴露设了却不生效的配置】。
+        间距被 ATR 模式劫持那一类问题，根源就是命令回"✅ 已生效"
+        而实际值由别处决定 —— 报告必须逐项校验真实生效值。
+        """
+        m = str(getattr(self, "trade_mode", "off")).lower()
+        lines = []
+        if switched:
+            lines.append(f"✅ 已切换到 {switched}\n")
+        else:
+            lines.append("🎛️ 交易模式\n")
+        lines.append(f"  当前模式: {self.mode_label()}")
+
+        running = {
+            "grid": "🕸️ 网格布网/撤网",
+            "single": "📈 单次买入 + 移动止盈止损",
+            "off": "无（全部停止）",
+        }[m]
+        lines.append(f"  运行中:   {running}")
+
+        # ── 网格模式：校验真正生效的间距 ──
+        if m == "grid":
+            lines.append("")
+            lines.append("── 网格关键项 ──")
+            sp_mode = str(getattr(self, "grid_spacing_mode", "fixed")).lower()
+            sp_set = float(getattr(self, "grid_spacing_pct", 0.02))
+            try:
+                sp_eff = float(self._cur_spacing())
+            except Exception:
+                sp_eff = sp_set
+            if sp_mode == "fixed":
+                lines.append(f"  ✅ 间距模式 fixed，设定值 {sp_set*100:.2f}% 已生效")
+            else:
+                flag = "⚠️" if abs(sp_eff - sp_set) > 1e-9 else "✅"
+                lines.append(
+                    f"  {flag} 间距模式 atr —— 你设的 {sp_set*100:.2f}% "
+                    f"【不参与计算】")
+                lines.append(
+                    f"     实际生效 {sp_eff*100:.2f}%（由 ATR×倍数 决定）")
+                lines.append("     要固定请用 /set grid_spacing_mode fixed")
+            # 手续费视角的间距健康度
+            fee_rt = 0.0016
+            ratio = fee_rt / sp_eff if sp_eff > 0 else 9.99
+            if ratio > 0.25:
+                lines.append(f"  ❌ 手续费吃掉 {ratio*100:.0f}%，间距过小！"
+                             f" 建议 /setspacing 2")
+            elif ratio > 0.12:
+                lines.append(f"  ⚠️ 手续费吃掉 {ratio*100:.0f}%，偏小")
+            else:
+                lines.append(f"  ✅ 手续费占比 {ratio*100:.0f}%")
+
+            lv = int(getattr(self, "grid_levels", 2))
+            try:
+                eq = float(self._effective_equity_usdt())
+            except Exception:
+                eq = 0.0
+            cap = float(getattr(self, "equity_cap_usdt", 0) or 0)
+            base = min(eq, cap) if cap > 0 else eq
+            per = base * float(getattr(self, "grid_capital_pct", 0.8)) / max(1, lv)
+            lines.append(f"  每格金额: {per:.2f} U（本金 {base:.2f} ÷ {lv} 层）")
+            mn = float(getattr(self, "grid_min_order_usdt", 5))
+            if per < mn:
+                lines.append(f"  ❌ 每格 {per:.2f}U < 最小下单额 {mn:.2f}U，"
+                             f"全部档位会被跳过！")
+                lines.append(f"     → /setminorder 1 或 /setlevels 1")
+            else:
+                lines.append(f"  ✅ 每格高于最小下单额 {mn:.2f} U")
+
+        # ── 通用阻塞项 ──
+        blocks = []
+        try:
+            blocked = getattr(self, "reconcile_blocked", None) or {}
+            for sym in (blocked or []):
+                blocks.append(f"  ❌ {sym} 对账阻塞 → /import 解锁")
+        except Exception:
+            pass
+        try:
+            free = float(getattr(self, "_cached_usdt_free", 0) or 0)
+            rb = float(getattr(self, "reserve_bottom", 10))
+            if free < rb:
+                blocks.append(
+                    f"  ❌ 可用 {free:.2f}U < 保留底线 {rb:.2f}U，不会交易"
+                    f" → /setreserve 1")
+        except Exception:
+            pass
+        if blocks:
+            lines.append("")
+            lines.append("── 需要处理 ──")
+            lines.extend(blocks)
+
+        lines.append("")
+        lines.append("切换: /puregrid  /puresingle  /autotrade off")
+        return "\n".join(lines)
 
     # ---------- 通用参数命令（由 params 注册表驱动）----------
     # 此前每个参数各写一个命令函数，导致 11 个函数结构雷同、校验规则不一致，
@@ -4036,6 +4252,9 @@ class QuantBot:
             CommandHandler("holdings", self.cmd_holdings),
             CommandHandler("panic", self.cmd_panic),
             CommandHandler("autotrade", self.cmd_autotrade),
+            CommandHandler("mode", self.cmd_mode),
+            CommandHandler("puregrid", self.cmd_puregrid),
+            CommandHandler("puresingle", self.cmd_puresingle),
             CommandHandler("settf", self.cmd_set_tf),
             CommandHandler("addsymbol", self.cmd_add_symbol),
             CommandHandler("delsymbol", self.cmd_del_symbol),
