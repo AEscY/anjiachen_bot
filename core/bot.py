@@ -479,6 +479,28 @@ class QuantBot:
         net_pnl = float(exit_revenue) - realized_cost - realized_fee_buy - float(sell_fee or 0)
         return net_pnl, realized_cost, realized_fee_buy
 
+    async def _safe_fetch_balance(self):
+        """
+        安全取余额。交易所未连接 / 断连时返回空字典而非抛异常。
+
+        为什么需要这一层：
+          cmd_status / cmd_holdings 直接调 self.exchange.fetch_balance()，
+          而 exchange 未连接时其 .exchange 为 None，
+          抛 AttributeError: 'NoneType' object has no attribute ...
+          命令处理器没有 try 包裹，异常直接冒泡到 Telegram ——
+          用户点「📊 状态」只看到"转圈"，没有任何错误提示，
+          而真正的意思只是"交易所暂时连不上"。
+
+        实测：/status 与 /holdings 在 exchange 为 None 时均崩溃。
+        """
+        if not getattr(self, "exchange", None):
+            return {}
+        try:
+            return await self.exchange.fetch_balance() or {}
+        except Exception as e:
+            logger.debug(f"取余额失败: {e}")
+            return {}
+
     async def _refresh_balance_cache(self, force=False):
         now = time.time()
         if force or (now - self._balance_cache_time > self._balance_cache_ttl):
@@ -756,6 +778,12 @@ class QuantBot:
                     'single_order_usdt'):
             if key in cfg:
                 setattr(self, key, cfg[key])
+        # 关机状态必须持久化恢复，否则重启会自己开机
+        if 'is_running' in cfg:
+            self.is_running = bool(cfg['is_running'])
+            if not self.is_running:
+                logger.warning("⏸️ 上次为【关机】状态，本次启动保持停止。"
+                               "如需运行请点面板「⚡ 开启」或发 /start")
         self.symbols = cfg.get('symbols') or [settings.SYMBOL, "BTC/USDT", "SOL/USDT"]
 
         # 模式优先级：新字段优先；旧配置无该字段时，
@@ -1118,7 +1146,7 @@ class QuantBot:
             f"⏳ 正在从交易所导入 {len(syms)} 个币种的持仓…")
 
         try:
-            bal = await self.exchange.fetch_balance()
+            bal = await self._safe_fetch_balance()
         except Exception as e:
             await update.effective_message.reply_text(
                 f"❌ 读取交易所余额失败: {e}")
@@ -1579,6 +1607,13 @@ class QuantBot:
             'timeframe': self.timeframe,
             'auto_trade_enabled': self.auto_trade_enabled,
             'trade_mode': self.trade_mode,
+            # ⚠️ is_running 此前既不在 PARAMS 注册表、也不在白名单里，
+            # 从未被持久化。后果链：
+            #   用户点「🔴 关机」→ is_running=False（仅内存）
+            #   → Render 休眠/重启 → __init__ 复位为 True
+            #   → 【机器人自己开机了】
+            # 这是安全问题：用户以为已停止，实际仍在交易。
+            'is_running': bool(self.is_running),
             'orderbook_filter': self.orderbook_filter,
             'coin_configs': json.dumps(self.coin_configs),
         })
@@ -2211,27 +2246,64 @@ class QuantBot:
                 # 统一为真实总资产：cap 只影响仓位，不应影响风控口径。
                 self.risk.update_equity(self._total_equity_usdt())
 
-                # ⚠️ 多币种资金预算：原来给每个币种都传【全额 equity】，
-                # 导致 N 个币种的总挂单需求 = N × equity × 80%。
-                # 实测（2层/80%仓位）：
-                #     1 币  需求 0.8x 可动用  ✅
-                #     2 币  需求 1.6x         ❌ 超额
-                #     3 币  需求 2.4x         ❌ 超额
-                # 交易所只认真实余额，先挂的拿到钱，
-                # 后面的币种余额不足 → 静默挂单失败。
+                # ⚠️ 多币种资金预算 —— 这里修过两次，务必看清口径：
                 #
-                # 改为按币种数平分预算：
-                #     每个币种的网格预算 = (权益-底线) / 币种数
-                # 这样 N 个币种的总需求 = 权益 - 底线，不会超额。
+                # 【第一版】给每个币种都传【全额 equity】
+                #   → N 个币种总需求 = N × equity × 80%
+                #   → 2 币 1.6x、3 币 2.4x，严重超额
+                #   → 先挂的拿到钱，后面的余额不足静默失败
+                #
+                # 【第二版】改成 share = equity / n_sym，但仍用【总权益】。
+                #   总权益 = 可用现金 + 持仓市值，而买单只能花【现金】。
+                #
+                #   实测用户账户：
+                #     现金 4,998.84 U，持仓市值 85,531.06 U
+                #     总权益 90,529.90 U → share = 30,176 U
+                #     每格 = (30176 − 1) × 0.8 / 2 = 12,070 U
+                #     3 币 × 2 层 = 72,421 U，而现金只有 4,998 U
+                #     → 超额 14.5 倍！SOL 抢先挂出 12,070 U 的巨额单，
+                #       其余币种余额不足静默失败。
+                #     这正是用户看到"切换网格后秒下单 SOL、金额离谱"的根源。
+                #
+                # 【第三版（当前）】预算一律以【可用 USDT 现金】为准：
+                #     budget_total = 可用现金 − 保留底线        （只扣一次）
+                #     share        = budget_total / 币种数
+                #   保留底线只在此处扣一次，desired_orders 不再重复扣
+                #   （通过 budget_is_net=True 告知）。
                 symbols_now = list(self.symbols or [])
                 n_sym = max(1, len(symbols_now))
-                share = max(0.0, equity) / n_sym
+
+                # 买单只能用现金，不能用持仓市值
+                cash_free = float(self._cached_usdt_free or 0.0)
+                if cash_free <= 0.0:
+                    try:
+                        cash_free = float(await self._refresh_balance_cache())
+                    except Exception:
+                        cash_free = 0.0
+                rb_total = float(getattr(self, "reserve_bottom", 0) or 0)
+                budget_total = max(0.0, cash_free - rb_total)
+
+                if budget_total <= 0.0:
+                    if not getattr(self, "_grid_nocash_alerted", False):
+                        self._grid_nocash_alerted = True
+                        await self._alert(
+                            f"💵 可用现金 {cash_free:.2f} U 低于保留底线 "
+                            f"{rb_total:.2f} U，网格无资金可分配，本轮不挂单。\n"
+                            f"   → /setreserve 调低底线，或充值")
+                        logger.warning(
+                            f"⚠️ 网格预算为 0（现金 {cash_free:.2f} − 底线 {rb_total:.2f}）")
+                    await asyncio.sleep(20)
+                    continue
+                self._grid_nocash_alerted = False
+
+                share = budget_total / n_sym
+                self._grid_last_share = share
 
                 for sym in symbols_now:
                     try:
                         if self.reconciler.is_blocked(sym):
                             continue
-                        await self._grid_step(sym, share)
+                        await self._grid_step(sym, share, budget_is_net=True)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -2246,7 +2318,7 @@ class QuantBot:
                 logger.error(f"网格主循环异常: {e}")
                 await asyncio.sleep(20)
 
-    async def _grid_step(self, sym, equity):
+    async def _grid_step(self, sym, equity, budget_is_net=False):
         """单个币种的网格推进"""
         ticker = self.ws.get_ticker(sym)
         if not ticker:
@@ -2283,15 +2355,31 @@ class QuantBot:
             return
 
         # 4) 风控闸门
+        #
+        # ⚠️ 原实现传 extra_usdt=0.0，而 risk.can_open 里
+        # 总仓位校验写的是 `if equity > 0 and extra_usdt > 0` ——
+        # 传 0 直接跳过校验，【总仓位上限形同虚设】。
+        # 网格每格金额必须纳入风控，否则多币种同时布网会超额。
         used = await self._allocation_used_usdt()
+        # 估算本轮该币种将要占用的买入金额
+        lv_now = max(1, int(getattr(self, "grid_levels", 2) or 2))
+        cpc_now = float(getattr(self, "grid_capital_pct", 0.8) or 0.8)
+        if budget_is_net:
+            per_now = max(0.0, float(equity or 0.0)) * cpc_now / lv_now
+        else:
+            rb_now = float(getattr(self, "reserve_bottom", 0) or 0)
+            per_now = (max(0.0, float(equity or 0.0) - rb_now)
+                       * cpc_now / lv_now)
         ok, reason = await self.risk.can_open(
-            sym, extra_usdt=0.0, used_usdt=used, equity=equity)
+            sym, extra_usdt=per_now, used_usdt=used,
+            equity=self._total_equity_usdt())
         if not ok and st is None:
             logger.debug(f"{sym} 风控拦截: {reason}")
             return
 
         # 5) 同步订单到交易所（含对账与成交检测）
-        res = await self.executor.sync_symbol(sym, p, atr_pct, equity)
+        res = await self.executor.sync_symbol(sym, p, atr_pct, equity,
+                                              budget_is_net=budget_is_net)
         if res.get("filled"):
             await self._save_runtime_state()
         if res.get("placed") or res.get("cancelled"):
@@ -2410,7 +2498,7 @@ class QuantBot:
 
     async def cmd_status(self, update, context):
         if not self._auth(update): return
-        bal = await self.exchange.fetch_balance()
+        bal = await self._safe_fetch_balance()
         usdt = float(bal.get('USDT', {}).get('free', 0))
         total = usdt
         pos_lines = []
@@ -2496,7 +2584,7 @@ class QuantBot:
 
     async def cmd_holdings(self, update, context):
         if not self._auth(update): return
-        bal = await self.exchange.fetch_balance()
+        bal = await self._safe_fetch_balance()
         lines = ["📋 持币"]
         for sym in self.symbols:
             coin = sym.split('/')[0]
@@ -2659,28 +2747,82 @@ class QuantBot:
             else:
                 lines.append(f"  ✅ 手续费占比 {ratio*100:.0f}%")
 
-            lv = int(getattr(self, "grid_levels", 2))
-            try:
-                eq = float(self._effective_equity_usdt())
-            except Exception:
-                eq = 0.0
-            cap = float(getattr(self, "equity_cap_usdt", 0) or 0)
-            base = min(eq, cap) if cap > 0 else eq
-            per = base * float(getattr(self, "grid_capital_pct", 0.8)) / max(1, lv)
-            lines.append(f"  每格金额: {per:.2f} U（本金 {base:.2f} ÷ {lv} 层）")
+            lv = max(1, int(getattr(self, "grid_levels", 2)))
             mn = float(getattr(self, "grid_min_order_usdt", 5))
+            rb = float(getattr(self, "reserve_bottom", 0) or 0)
+            n_sym = max(1, len(self.symbols or []))
+            cpc = float(getattr(self, "grid_capital_pct", 0.8))
+            # ⚠️ 与 _grid_monitor 保持一致：买单只能花【可用现金】，
+            # 绝不能用总权益（含持仓市值）。
+            # 曾实测：现金 4,998 U / 总权益 90,530 U
+            #         → 报告说每格 3.60 U 一切正常
+            #         → 实际按总权益算每格 12,070 U，超额 14.5 倍
+            eq = float(getattr(self, "_cached_usdt_free", 0) or 0)
+
+            # ⚠️ 必须与 _grid_monitor + desired_orders 的算法完全一致：
+            #     share   = equity / 币种数
+            #     budget  = share − reserve_bottom
+            #     per     = budget × capital_pct / levels
+            #
+            # 原实现直接用【全额权益 ÷ 层数】，漏掉两件事：
+            #   1) 币种数平分（_grid_monitor 里 share = equity / n_sym）
+            #   2) 保留底线扣除（desired_orders 里 budget = share − reserve）
+            #
+            # 实测（9U / 3币 / 2层 / reserve 1U）：
+            #     报告显示 3.60 U → "✅ 高于最小额，会挂单"
+            #     实际计算 0.80 U → 低于最小额，一单不挂
+            #   **差 4.5 倍，报告撒谎。**
+            budget_total = max(0.0, eq - rb)     # 底线只扣一次
+            per_sym = budget_total / n_sym
+            per = per_sym * cpc / lv
+
+            cap_o = float(getattr(self, "grid_max_order_usdt", 0) or 0)
+            if cap_o > 0 and per > cap_o:
+                per = cap_o
+
+            lines.append(
+                f"  每格金额: {per:.2f} U"
+                f"（可用现金 {eq:.2f} − 底线 {rb:.2f} = {budget_total:.2f}"
+                f" ÷ {n_sym}币 = {per_sym:.2f} × {cpc*100:.0f}% ÷ {lv}层）")
+            if cap_o > 0:
+                lines.append(f"  单格上限: {cap_o:.2f} U（grid_max_order_usdt）")
+
+            # 挂满总需求 vs 可用现金：让用户一眼看出会不会超额
+            total_need = per * lv * n_sym
+            if total_need > eq + 1e-9:
+                lines.append(
+                    f"  ❌ 挂满需 {total_need:.2f} U > 可用现金 {eq:.2f} U，"
+                    f"后面的币种会余额不足")
+            else:
+                lines.append(
+                    f"  ✅ 挂满共需 {total_need:.2f} U，可用现金 {eq:.2f} U，"
+                    f"预留 {eq - total_need:.2f} U")
             if per < mn:
                 lines.append(f"  ❌ 每格 {per:.2f}U < 最小下单额 {mn:.2f}U，"
-                             f"全部档位会被跳过！")
-                lines.append(f"     → /setminorder 1 或 /setlevels 1")
+                             f"该币种不会挂单！")
+                # 给出能达到的最小配置
+                # budget 已改名 budget_total，此处同步
+                need_lv = (max(1, int(budget_total * cpc / mn))
+                           if mn > 0 else 1)
+                lines.append(
+                    f"     → 改层数 /setlevels {need_lv}（最多），"
+                    f"或 /setminorder 1，或 /setreserve 1，或减少币种")
             else:
                 lines.append(f"  ✅ 每格高于最小下单额 {mn:.2f} U")
 
         # ── 通用阻塞项 ──
         blocks = []
         try:
-            blocked = getattr(self, "reconcile_blocked", None) or {}
-            for sym in (blocked or []):
+            # ⚠️ 原写 getattr(self, "reconcile_blocked", None)
+            # 而 QuantBot 根本没有这个属性（正确的是 self.reconciler.blocked）。
+            # getattr 有默认值兜底 → 永远返回 {} → 阻塞【永远检测不到】。
+            # 用户实测确有 BTC/ETH 阻塞，但自检报告里一个字都没提。
+            #
+            # 这类"用 getattr 兜底却写错名字"的错误不会抛异常、
+            # 不会进日志，只会导致功能静默失效 —— 最难发现的一类。
+            rec = getattr(self, "reconciler", None)
+            blocked = (getattr(rec, "blocked", None) or set())
+            for sym in sorted(blocked):
                 blocks.append(f"  ❌ {sym} 对账阻塞 → /import 解锁")
         except Exception:
             pass
@@ -2699,6 +2841,26 @@ class QuantBot:
             lines.extend(blocks)
 
         lines.append("")
+        # 布网预期：解释"为什么一切换就下单"，避免用户误以为异常
+        if self.trade_mode == "grid":
+            lines.append("")
+            lines.append("  💡 切换后下一轮循环（≤20 秒）即开始布网。")
+            lines.append("     买单挂在现价下方，为【限价单】，不会立刻成交")
+            lines.append("     —— 只有价格跌到买档价才会成交。")
+            # 已有持仓不会被网格接管，必须显式告知
+            try:
+                held = [c for c, v in (self._cached_balances or {}).items()
+                        if c != "USDT" and isinstance(v, dict)
+                        and float(v.get("free") or 0) > 0]
+            except Exception:
+                held = []
+            if held:
+                lines.append(
+                    f"  ⚠️ 检测到已有持仓 {'/'.join(held[:6])}"
+                    f"{' 等' if len(held) > 6 else ''} ——")
+                lines.append("     这些是切换前留下的，网格【不会】接管它们。")
+                lines.append("     如需清掉：/panic（会按市价全部卖出）")
+
         lines.append("切换: /puregrid  /puresingle  /autotrade off")
         return "\n".join(lines)
 
@@ -2984,6 +3146,25 @@ class QuantBot:
             if isinstance(d, dict) and sym in d:
                 d.pop(sym, None)
                 removed.append(attr)
+
+        # ⚠️ 网格状态此前【从未被清理】。
+        # 上面的文档字符串里写着"原实现只清了 grid"，
+        # 那是历史说明文字 —— 实际代码里 grid 根本不在清理列表中。
+        #
+        # 实测：删除 DOGE/USDT 后 grid.states 仍含该币，
+        # 连同持仓（100 DOGE / 15 U）一起残留：
+        #   · 币种已移出监控 → 这份持仓永远不会被卖出
+        #   · 随 _save_runtime_state 持久化 → 数据库堆积垃圾
+        #   · 重新添加同名币种 → 读到上一次的旧成本
+        try:
+            gs = getattr(self.grid, "states", None)
+            if isinstance(gs, dict) and sym in gs:
+                lot_n = len((gs[sym].lots or {}))
+                gs.pop(sym, None)
+                removed.append(f"grid.states({lot_n}档持仓)")
+        except Exception as e:
+            logger.debug(f"清理网格状态失败 {sym}: {e}")
+
         if removed:
             logger.info(f"🧹 已清理 {sym} 的运行时状态: {', '.join(removed)}")
         return removed
@@ -3196,7 +3377,7 @@ class QuantBot:
 
         # 3) 余额 vs 保留底线
         try:
-            bal = await self.exchange.fetch_balance()
+            bal = await self._safe_fetch_balance()
             usdt = float(bal.get('USDT', {}).get('free', 0))
         except Exception:
             usdt = -1
@@ -3726,10 +3907,14 @@ class QuantBot:
             await self._refresh_panel(query)
         elif data == "bot_start":
             self.is_running = True
+            await self._save_config()   # 不存的话重启又变回关机
             await query.answer("已开启")
+            await self._refresh_panel(query)
         elif data == "bot_stop":
             self.is_running = False
-            await query.answer("已关机")
+            await self._save_config()   # 不存的话重启会自动开机
+            await query.answer("已关机（重启后保持停止）", show_alert=True)
+            await self._refresh_panel(query)
         elif data == "refresh":
             await self._refresh_panel(query)
             answered = True
@@ -3740,7 +3925,7 @@ class QuantBot:
         elif data == "check":
             await self.cmd_check(update, context)
         elif data == "balance":
-            bal = await self.exchange.fetch_balance()
+            bal = await self._safe_fetch_balance()
             await query.message.reply_text(f"USDT: {float(bal.get('USDT',{}).get('free',0)):.2f}")
         elif data == "stats":
             await self.cmd_stats(update, context)

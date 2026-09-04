@@ -35,7 +35,7 @@ class OrderExecutor:
     # ─────────── 主入口 ───────────
 
     async def sync_symbol(self, symbol, price, atr_pct, equity_usdt,
-                          force=False) -> dict:
+                          force=False, budget_is_net=False) -> dict:
         """
         同步单个币种的网格订单。
         返回 {'placed': n, 'cancelled': n, 'filled': [...]}
@@ -53,7 +53,9 @@ class OrderExecutor:
         result["filled"] = filled
 
         # 2) 计算目标订单
-        desired = self.grid.desired_orders(symbol, price, atr_pct, equity_usdt)
+        desired = self.grid.desired_orders(symbol, price, atr_pct,
+                                           equity_usdt,
+                                           budget_is_net=budget_is_net)
 
         # 3) 拉取交易所当前未成交单
         try:
@@ -275,6 +277,39 @@ class OrderExecutor:
             q = min(float(lot["qty"]), filled)
             if q <= 0:
                 break
-            self.grid.on_sell_filled(symbol, int(lvl), q, avg, fee * (q / max(total_qty, 1e-12)), fee_cur)
+            self.grid.on_sell_filled(symbol, int(lvl), q, avg,
+                                     fee * (q / max(total_qty, 1e-12)), fee_cur)
             filled -= q
+
+        # ⚠️ 清仓残留必须核销，不能留在账本里。
+        #
+        # 成因：round_amount 按交易所精度取整后，实际卖出量可能
+        # 略小于持仓总量（例如 0.50000 → 0.49999）。
+        # 逐档核销时最后一档只能分到 0.09999，留下 0.00001 的"灰尘"。
+        #
+        # 实测：5 档持仓市价清仓后，账本残留 1 档微小数量，
+        # 导致"清仓后无持仓"断言失败。
+        #
+        # 后果：
+        #   · 账本与交易所永久差一笔灰尘 → 对账不一致
+        #   · 网格状态不干净 → 下次建网读到幽灵持仓
+        #   · 残留档位继续挂卖单，但数量低于交易所最小额 → 反复失败
+        #
+        # 处理：清仓语义就是"全部卖出"，残留部分按成交价核销，
+        # 对应成本计入已实现亏损，然后清空档位。
+        st_now = self.grid.get_state(symbol)
+        if st_now and st_now.lots:
+            residual_qty = sum(float(l.get("qty") or 0)
+                               for l in st_now.lots.values())
+            residual_cost = sum(float(l.get("cost_usdt") or 0)
+                                for l in st_now.lots.values())
+            if residual_qty > 0:
+                dust_pnl = residual_qty * avg - residual_cost
+                st_now.realized_pnl += dust_pnl
+                logger.warning(
+                    f"🧹 {symbol} 清仓残留 {residual_qty:.8f} "
+                    f"（精度截断灰尘，成本 {residual_cost:.4f} U）已核销，"
+                    f"计入盈亏 {dust_pnl:+.4f} U")
+            st_now.lots.clear()
+            st_now.pending_client_ids.clear()
         return True

@@ -74,12 +74,16 @@ _reg(
               scale=0.01, aliases=("setgridcapital",), unit="%", group="网格·资金"),
     ParamSpec("grid_min_order_usdt", 5.0, "单档最小下单金额（低于此值该档不挂）", float, 0.0, 10000,
               aliases=("setminorder",), unit="U", group="网格·资金"),
+    ParamSpec("grid_max_order_usdt", 0.0, "单档最大下单金额上限（0=不限，防配置错误挂出巨额单）", float, 0.0, 1000000),
+
 )
 
 # ---------- 网格：风控 ----------
 _reg(
     ParamSpec("grid_stop_loss_pct", 0.15, "击穿区间下限后的止损线", float, 0.02, 0.50,
               scale=0.01, aliases=("setgridstop",), unit="%", group="网格·风控"),
+    ParamSpec("grid_hard_stop_loss_pct", 0.0, "网格硬止损：浮亏达此值无条件清仓，无视区间下界（0=关闭）", float, 0.0, 0.9),
+
     ParamSpec("grid_lower_buffer_pct", 0.06, "区间下限缓冲（最低档之下再加此缓冲）", float, 0.0, 0.30,
               scale=0.01, aliases=("setlowerbuf",), unit="%", group="网格·风控"),
     ParamSpec("grid_upper_buffer_pct", 0.06, "区间上限缓冲（最高档之上）", float, 0.0, 0.30,

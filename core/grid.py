@@ -191,7 +191,7 @@ class GridEngine:
     # ─────────── 目标订单（核心）───────────
 
     def desired_orders(self, symbol, price: float, atr_pct: float,
-                       equity_usdt: float) -> list:
+                       equity_usdt: float, budget_is_net: bool = False) -> list:
         """
         计算此刻应该挂在交易所的订单。
 
@@ -215,17 +215,34 @@ class GridEngine:
         upper_band = buys[0] * (1 + float(self.cfg.grid_upper_buffer_pct))
 
         # 每档金额
-        # ⚠️ 边界：原实现用【全额 equity】，不动用保留底线之外的判断；
-        # 但回测引擎用的是 (cash - reserve_bottom)，两者不一致，
-        # 导致回测显示"一单不挂"而实盘却挂了（或反之）。
         #
-        # 统一为与回测一致的保守口径：先扣除保留底线再算每格。
-        # reserve_bottom 的意义本就是"这钱不能动"，
-        # 网格不应该把它算进可分配资金。
-        budget = float(equity_usdt or 0.0) - float(
-            getattr(self.cfg, "reserve_bottom", 0.0) or 0.0)
-        budget = max(0.0, budget)
+        # budget_is_net=True 表示调用方传入的 equity_usdt【已是该币种的
+        # 可支配预算】（已扣除保留底线、已按币种数平分），此时不得再扣一次。
+        #
+        # 为什么需要这个开关（真实事故）：
+        #   _grid_monitor 传的是 share = equity / 币种数，
+        #   而这里又扣了一次 reserve_bottom —— 每个币种各扣一遍，
+        #   3 个币种就等于扣了 3 倍底线。更严重的是 equity 用的是
+        #   【总权益】（含持仓市值），不是【可用 USDT 现金】。
+        #
+        # 实测用户账户：现金 4,998 U，持仓市值 85,531 U，
+        #   总权益 90,529 U → 每格算出 12,070 U
+        #   3 币 × 2 层需要 72,421 U，而实际只有 4,998 U
+        #   → 超额 14.5 倍，SOL 抢先挂出巨额单，其余币种余额不足静默失败。
+        if budget_is_net:
+            budget = max(0.0, float(equity_usdt or 0.0))
+        else:
+            budget = float(equity_usdt or 0.0) - float(
+                getattr(self.cfg, "reserve_bottom", 0.0) or 0.0)
+            budget = max(0.0, budget)
         per_usdt = budget * float(self.cfg.grid_capital_pct) / max(1, levels)
+
+        # 单格金额上限：防止配置错误（或权益口径异常）挂出巨额单。
+        # 0 = 不限制。
+        cap_order = float(getattr(self.cfg, "grid_max_order_usdt", 0) or 0)
+        if cap_order > 0 and per_usdt > cap_order:
+            per_usdt = cap_order
+
         min_order = float(self.cfg.grid_min_order_usdt)
 
         # 静默失败可视化：原来每格不达标时直接 continue，
@@ -290,7 +307,47 @@ class GridEngine:
                          f"(成交{qty:.6f} 手续费{fee:.6f}{fee_currency})，放弃建仓")
             return None
 
-        st.lots[str(level)] = {
+        key = str(level)
+        old_lot = st.lots.get(key)
+
+        # ⚠️ 同档位已有持仓时必须【合并】，绝不能覆盖。
+        #
+        # 原实现直接 st.lots[key] = {...} 覆盖，后果（实测）：
+        #     第1次买入 10 SOL @ 98  → 成本 980 U
+        #     中枢漂移后第2次买入 10 SOL @ 88 → 成本 880 U
+        #     账本只剩 10 SOL / 880 U
+        #     → 第1次的 10 SOL（980 U）【凭空消失】
+        #     → 账本与交易所差 980 U → 对账阻塞
+        #
+        # 触发场景：买单成交 → 卖单未成交 → 中枢漂移重挂
+        #          → 同档位新买单价更低 → 再次成交
+        if old_lot is not None:
+            oq = float(old_lot.get("qty") or 0)
+            oc = float(old_lot.get("cost_usdt") or 0)
+            nq = oq + float(net_qty)
+            nc = oc + float(cost)
+            if nq <= 0:
+                logger.error(f"❌ {symbol} 第{level}档合并后数量异常，放弃")
+                return None
+            new_avg = nc / nq
+            old_lot["qty"] = float(nq)
+            old_lot["cost_usdt"] = float(nc)
+            old_lot["buy_price"] = float(new_avg)
+            # 卖单价按【加权成本】重算，保证整批仍有确定利润空间；
+            # 若沿用旧的更高价，价格长期低于它时卖单永不成交。
+            old_lot["sell_price"] = float(new_avg) * (1 + spacing)
+            old_lot["buy_time"] = time.time()
+            old_lot["order_id"] = order_id
+            # 强制重新挂单：原卖单价已变，需撤旧单重挂
+            st.pending_client_ids.pop(key, None)
+            st.fees += float(fee or 0)
+            logger.warning(
+                f"🔀 {symbol} 第{level}档【合并】买入 {net_qty:.6f} @ {price:.4f}"
+                f"（原 {oq:.6f} @ 均{oc/max(oq,1e-12):.4f}）"
+                f"→ 现 {nq:.6f} 均价 {new_avg:.4f} → 挂卖 {old_lot['sell_price']:.4f}")
+            return 0.0
+
+        st.lots[key] = {
             "level": level, "qty": float(net_qty), "cost_usdt": float(cost),
             "buy_price": float(price),
             "sell_price": float(price) * (1 + spacing),   # 锁定
@@ -306,18 +363,56 @@ class GridEngine:
         st = self.states.get(symbol)
         if st is None:
             return None
-        lot = st.lots.pop(str(level), None)
+        key = str(level)
+        lot = st.lots.get(key)
         if lot is None:
             return None
 
-        cost = float(lot["cost_usdt"])
-        revenue = qty * price - (fee if fee_currency in ("", "USDT") else 0)
+        lot_qty = float(lot.get("qty") or 0)
+        lot_cost = float(lot.get("cost_usdt") or 0)
+        if lot_qty <= 0:
+            st.lots.pop(key, None)
+            return None
+
+        sell_qty = float(qty or 0)
+        if sell_qty <= 0:
+            return None
+
+        # ⚠️ 部分成交必须按比例分摊成本。
+        #
+        # 原实现 cost = 整档总成本，而 revenue 只算卖出的那部分：
+        #     买入 10 SOL @ 100（成本 1000 U），卖出 3 SOL @ 102
+        #     原算法：306 − 1000 = −694 U   ❌ 明明赚了却记巨亏
+        #     正确  ：306 − 300  = +6 U
+        #
+        # 更严重：原实现无条件 lots.pop()，剩余 7 SOL 的持仓
+        # 【凭空消失】→ 账本与交易所不一致 → 对账阻塞。
+        #
+        # 限价单部分成交在实盘很常见（流动性不足/大单），必然踩中。
+        if sell_qty >= lot_qty - 1e-9:
+            cost = lot_cost
+            st.lots.pop(key, None)
+            remaining = 0.0
+        else:
+            ratio = sell_qty / lot_qty
+            cost = lot_cost * ratio
+            lot["qty"] = lot_qty - sell_qty
+            lot["cost_usdt"] = lot_cost - cost
+            remaining = lot["qty"]
+
+        revenue = sell_qty * price - (fee if fee_currency in ("", "USDT") else 0)
         pnl = revenue - cost
         st.realized_pnl += pnl
         st.fees += float(fee or 0)
         st.cycles += 1
-        logger.info(f"🕸️  {symbol} 第{level}档卖出 @ {price:.4f} 净利 {pnl:+.4f}U "
-                    f"(累计 {st.realized_pnl:+.4f}U)")
+        if remaining > 0:
+            logger.info(
+                f"🕸️  {symbol} 第{level}档【部分】卖出 {sell_qty:.6f}/{lot_qty:.6f} "
+                f"@ {price:.4f} 净利 {pnl:+.4f}U，剩余 {remaining:.6f}"
+                f"（累计 {st.realized_pnl:+.4f}U）")
+        else:
+            logger.info(f"🕸️  {symbol} 第{level}档卖出 @ {price:.4f} 净利 {pnl:+.4f}U "
+                        f"(累计 {st.realized_pnl:+.4f}U)")
         return pnl
 
     # ─────────── 查询 ───────────
@@ -351,18 +446,97 @@ class GridEngine:
             "upper_band": getattr(st, "_upper_band", 0),
         }
 
+    def stop_loss_band(self, st: GridState, spacing: float = 0.0):
+        """
+        基于【锚点 anchor】的固定止损下界。
+
+        为什么必须用 anchor 而不是 center：
+
+        center 会随价格漂移（need_rebalance → update_center），
+        而 _lower_band 正是由 center 算出的 —— 于是价格每跌一段，
+        中枢跟着下移，下界也跟着下移，价格【永远跌不破】下界。
+
+        实测（中枢100/间距2%/2层/止损5%）：
+            现价  96   center  96   下界 90.35  浮亏 1.09%   不止损
+            现价  92   center  92   下界 86.59  浮亏 5.21%   不止损
+            现价  85   center  85   下界 80.00  浮亏 12.43%  不止损
+        → 浮亏 12.43% 远超 5% 阈值，却因"没跌破下界"永不触发，
+          网格在低位继续买入，一路接刀到底。
+
+        anchor 在建网时确定后【不再变化】，用它算出的下界是固定的，
+        价格单边下跌时必然跌破 → 止损正常生效。
+        """
+        sp = spacing or float(st.spacing or 0) or self.calc_spacing(0.0)
+        if sp <= 0:
+            return 0.0
+        base = float(st.anchor or 0) or float(st.center or 0)
+        if base <= 0:
+            return 0.0
+        levels = max(1, int(getattr(self.cfg, "grid_levels", 2) or 2))
+        lowest_buy = base * (1 - sp) ** levels
+        return lowest_buy * (1 - float(self.cfg.grid_lower_buffer_pct))
+
     def should_stop_loss(self, symbol, price: float) -> bool:
-        """击穿区间下限 且 整体浮亏超阈值"""
+        """
+        击穿区间下限 且 整体浮亏超阈值 → 止损。
+
+        两处修复（都是致命的）：
+
+        ① 原依赖 st._lower_band —— 它是 desired_orders 的【副产品】：
+           · 不在 dataclass 字段里，to_dict/from_dict 不持久化
+           · 风控拦截 / 行情陈旧 / 对账阻塞时 desired_orders 不执行
+             → 值为 0 → `if lower <= 0: return False` 直接放行
+           → 重启后第一轮、或任何跳过挂单的轮次，止损彻底失效。
+
+        ② 即使有值，它也随 center 漂移（见 stop_loss_band 的说明），
+           导致单边下跌时永不止损。
+
+        现在改为基于【anchor 的固定下界】独立计算，不再依赖任何副产品。
+        """
         st = self.states.get(symbol)
         if st is None or not st.lots:
             return False
-        lower = getattr(st, "_lower_band", 0)
+
+        total_qty = sum(float(l["qty"]) for l in st.lots.values())
+        total_cost = sum(float(l["cost_usdt"]) for l in st.lots.values())
+        if total_qty <= 0 or total_cost <= 0:
+            return False
+
+        avg = total_cost / total_qty
+        loss_pct = (avg - price) / avg
+        threshold = float(self.cfg.grid_stop_loss_pct)
+
+        # 绝对兜底：浮亏超过硬止损线（0=关闭），无论如何都止损。
+        # 防止 anchor 被异常重置、或参数配置失当时保护完全失效。
+        hard = float(getattr(self.cfg, "grid_hard_stop_loss_pct", 0) or 0)
+        if hard > 0 and loss_pct >= hard:
+            logger.warning(
+                f"🛑 {symbol} 触发硬止损：浮亏 {loss_pct*100:.2f}% "
+                f"≥ {hard*100:.2f}%（无视区间下界）")
+            return True
+
+        # 区间止损：基于 anchor 的固定下界
+        lower = self.stop_loss_band(st)
         if lower <= 0 or price >= lower:
             return False
+        return loss_pct >= threshold
+
+    def loss_info(self, symbol, price: float) -> dict:
+        """供 /grid 显示的止损诊断信息"""
+        st = self.states.get(symbol)
+        if st is None or not st.lots:
+            return {}
         total_qty = sum(float(l["qty"]) for l in st.lots.values())
         total_cost = sum(float(l["cost_usdt"]) for l in st.lots.values())
         if total_qty <= 0:
-            return False
+            return {}
         avg = total_cost / total_qty
-        loss_pct = (avg - price) / avg
-        return loss_pct >= float(self.cfg.grid_stop_loss_pct)
+        return {
+            "avg_cost": avg,
+            "loss_pct": (avg - price) / avg,
+            "band": self.stop_loss_band(st),
+            "anchor": st.anchor,
+            "center": st.center,
+            "threshold": float(self.cfg.grid_stop_loss_pct),
+            "hard": float(getattr(self.cfg, "grid_hard_stop_loss_pct", 0) or 0),
+        }
