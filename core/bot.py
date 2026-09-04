@@ -2382,11 +2382,19 @@ class QuantBot:
         await update.effective_message.reply_text(f"⚙️ 控制台 {self.env_tag}", reply_markup=self._build_main_keyboard())
 
     def _build_main_keyboard(self):
-        auto = "🟢" if self.auto_trade_enabled else "🔴"
+        # 模式指示：用 ✓ 标出当前模式，让状态一眼可见
+        m = str(getattr(self, "trade_mode", "off")).lower()
+        mk = (lambda k, on, off: f"{on if m == k else off}")
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🚨 紧急全平", callback_data="panic_confirm")],
+            # ── 模式切换：三个按钮互斥，当前模式带 ✓ ──
+            # v28 引入 trade_mode 后，面板此处仍只显示旧的"自动交易"
+            # 布尔开关 —— 用户看不到模式，也无法用按钮切换，
+            # 只能手打 /puregrid。这是 v28 的遗漏。
+            [InlineKeyboardButton(mk("grid", "✓🕸️ 网格", "🕸️ 网格"), callback_data="mode_grid"),
+             InlineKeyboardButton(mk("single", "✓📈 单次", "📈 单次"), callback_data="mode_single"),
+             InlineKeyboardButton(mk("off", "✓⏸️ 停止", "⏸️ 停止"), callback_data="mode_off")],
             [InlineKeyboardButton("⚡ 开启", callback_data="bot_start"), InlineKeyboardButton("🔴 关机", callback_data="bot_stop")],
-            [InlineKeyboardButton(f"🤖 自动交易 {auto}", callback_data="toggle_auto")],
             [InlineKeyboardButton("📊 状态", callback_data="status"), InlineKeyboardButton("💳 余额", callback_data="balance")],
             [InlineKeyboardButton("📋 持币", callback_data="holdings"), InlineKeyboardButton("📊 信号", callback_data="check")],
             [InlineKeyboardButton("🎯 止盈", callback_data="menu_set_tp"), InlineKeyboardButton("🛡️ 止损", callback_data="menu_set_sl")],
@@ -3678,10 +3686,43 @@ class QuantBot:
                 await query.answer("🚨 执行中…", show_alert=True)
                 await self.cmd_panic(update, context)
             answered = True
+        elif data.startswith("mode_"):
+            # ── 模式切换（面板按钮）──
+            # 必须走 set_trade_mode，绝不能直接改 auto_trade_enabled。
+            # v28 把 auto_trade_enabled 变成 trade_mode 的派生态后，
+            # 旧的 toggle_auto 仍在直接翻转它 —— 绕过模型、
+            # 与 _sync_mode_flags() 打架，重启后即被覆盖失效。
+            target = data[len("mode_"):]
+            if target not in self.VALID_MODES:
+                await query.answer("❌ 未知模式", show_alert=True)
+                answered = True
+            else:
+                prev = self.trade_mode
+                if prev != "off":
+                    self._last_active_mode = prev
+                self.set_trade_mode(target)
+                await self._save_config()
+                await query.answer(f"✅ 已切换为 {self.mode_label()}",
+                                   show_alert=True)
+                await self._refresh_panel(query)
+                # 网格模式下顺带做一次自检，暴露"设了却不生效"的配置
+                if target == "grid":
+                    try:
+                        await query.message.reply_text(self._mode_report())
+                    except Exception:
+                        pass
+                answered = True
         elif data == "toggle_auto":
-            self.auto_trade_enabled = not self.auto_trade_enabled
+            # 兼容旧回调：语义改为"在上次模式与停止之间切换"，
+            # 不再直接翻转派生态布尔位。
+            if self.trade_mode == "off":
+                target = self._last_active_mode or "single"
+            else:
+                self._last_active_mode = self.trade_mode
+                target = "off"
+            self.set_trade_mode(target)
             await self._save_config()
-            await query.answer(f"自动交易已{'开启' if self.auto_trade_enabled else '关闭'}")
+            await query.answer(f"🤖 {self.mode_label()}")
             await self._refresh_panel(query)
         elif data == "bot_start":
             self.is_running = True
