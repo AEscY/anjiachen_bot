@@ -554,7 +554,51 @@ class QuantBot:
         max_alloc = balance * self.max_total_allocated_pct
         return used + additional_usdt <= max_alloc + 1e-9
 
+    async def _expire_cooldown_if_due(self):
+        """
+        连亏冷静期到期则复位。
+
+        独立成方法的原因：它必须在【全局暂停检查之前】执行。
+        冷静期的实现方式就是 is_paused=True，若先判暂停就 return，
+        到期复位永远跑不到 —— 冷静期会变成永久停摆。
+        """
+        cd = float(getattr(self, "consecutive_loss_cooldown", 0) or 0)
+        start = float(getattr(self, "_last_pause_time", 0) or 0)
+        if cd <= 0 or start <= 0:
+            return False
+        if self._consecutive_losses < int(
+                getattr(self, "max_consecutive_losses", 4) or 4):
+            return False
+        elapsed = max(0.0, time.time() - start)
+        if elapsed < cd:
+            return False
+        self._consecutive_losses = 0
+        self._last_pause_time = 0
+        self._is_paused = False
+        await self._alert("✅ 连续亏损冷静期结束，恢复交易", "info")
+        return True
+
     async def _check_risk_limits(self):
+        # ---- 0) 全局暂停 ----
+        # ⚠️ 原实现完全没有这一道。
+        # risk.can_open() 第 1 道就是 is_paused 检查，
+        # 而本函数（单次模式入口）直接从回撤开始判 ——
+        # 于是 is_paused=True 但回撤/连亏/日亏都未触发时，
+        # 单次模式会【无视暂停继续开仓】。
+        # 用户截图里"暂停 是"的状态，在单次模式下形同虚设。
+        #
+        # 注意：本函数只用于开仓判定，平仓逻辑不走这里，
+        # 所以暂停时仍能正常卖出。
+        #
+        # ⚠️ 但到期判定必须排在它前面。连亏冷静期本身就是靠
+        # is_paused=True 实现的，若先判暂停就直接 return，
+        # 永远走不到下面的"到期复位"分支 —— 冷静期变成永久停摆。
+        # （这是我在补全局暂停检查时引入的回归，由 test_smoke 抓出。）
+        await self._expire_cooldown_if_due()
+
+        if self._is_paused:
+            return False
+
         today = datetime.now(CST).date().isoformat()
         if today != self.last_reset_day:
             self._today_loss_pct = 0.0
@@ -585,7 +629,10 @@ class QuantBot:
                     "critical",
                 )
                 return False
-            elapsed = time.time() - self._last_pause_time
+            # 钳制：last_pause_time 若被恢复成未来时间戳（跨重启时间基准
+            # 不一致），elapsed 为负 → 剩余时间会比总时长还长。
+            # 实测曾显示"剩余 40 / 总共 30 分钟"。
+            elapsed = max(0.0, time.time() - self._last_pause_time)
             if elapsed >= self.consecutive_loss_cooldown:
                 # 冷静期结束：复位
                 self._consecutive_losses = 0
@@ -593,9 +640,11 @@ class QuantBot:
                 self._is_paused = False
                 await self._alert("✅ 连续亏损冷静期结束，恢复交易", "info")
             else:
-                remain = int(self.consecutive_loss_cooldown - elapsed)
+                cd = float(self.consecutive_loss_cooldown)
+                remain = int(max(0.0, min(cd, cd - elapsed)))
                 if remain % 600 < 10:   # 避免每 10s 刷屏
-                    await self._alert(f"⏳ 冷静期剩余 {remain//60} 分钟", "warning")
+                    await self._alert(
+                        f"⏳ 冷静期剩余 {remain//60}/{int(cd)//60} 分钟", "warning")
                 return False
 
         # ---- 3) 日内亏损熔断 ----
@@ -2149,8 +2198,18 @@ class QuantBot:
                     await asyncio.sleep(15)
                     continue
 
-                # 风险监控更新峰值与回撤
-                self.risk.update_equity(equity)
+                # ⚠️ 回撤峰值必须用【真实总资产】，绝不能用 _effective_equity_usdt()
+                # （后者是 min(实际, equity_cap)，只用于仓位计算）。
+                #
+                # 原实现两处用不同口径更新同一个 risk.peak_equity：
+                #   本处(网格循环) 传 min(实际, cap)   ← 设了 /setcap 9 就变成 9
+                #   _risk_monitor_task 传 真实总资产   ← 88731
+                # 峰值被拉到 88731 后，下一轮用 9 去算回撤：
+                #   (88731 - 9) / 88731 = 99.99%
+                # → 回撤瞬间爆表 → 永久熔断，且没有任何日志说明原因。
+                #
+                # 统一为真实总资产：cap 只影响仓位，不应影响风控口径。
+                self.risk.update_equity(self._total_equity_usdt())
 
                 # ⚠️ 多币种资金预算：原来给每个币种都传【全额 equity】，
                 # 导致 N 个币种的总挂单需求 = N × equity × 80%。
@@ -2245,13 +2304,11 @@ class QuantBot:
             try:
                 await self._refresh_balance_cache(force=True)
                 self.watchdog.beat("风控监控")
-                equity = self._cached_usdt_free
-                for sym in self.symbols:
-                    ticker = self.ws.get_ticker(sym)
-                    if ticker:
-                        coin = sym.split('/')[0]
-                        free = self._cached_balances.get(coin, {}).get('free', 0)
-                        equity += free * ticker.get('last', 0)
+                # 与网格循环保持同一口径：统一走 _total_equity_usdt()。
+                # 原实现在此处内联重算一遍总资产，逻辑与 _total_equity_usdt()
+                # 重复且不同（前者只遍历 self.symbols，后者遍历全部持仓币），
+                # 两者都去更新同一个 peak_equity —— 口径打架的根源。
+                equity = self._total_equity_usdt()
                 if equity > 0:
                     if self._daily_start_equity <= 0:
                         self._daily_start_equity = equity

@@ -118,14 +118,20 @@ class RiskManager:
                     f"⛔ 连续亏损 {self.consecutive_losses} 笔，进入 "
                     f"{int(cooldown)//60} 分钟冷静期", "critical")
                 return False, "连亏冷静期(新)"
-            elapsed = time.time() - self.last_pause_time
+            elapsed = max(0.0, time.time() - self.last_pause_time)
             if elapsed >= cooldown:
                 self.consecutive_losses = 0
                 self.last_pause_time = 0.0
                 self.is_paused = False
                 await self._fire_alert("✅ 连续亏损冷静期结束，恢复交易", "info")
             else:
-                return False, f"连亏冷静期(剩{int(cooldown-elapsed)//60}分)"
+                # ⚠️ remain 必须钳制在 [0, cooldown]。
+                # 曾实测出现"剩余 40 分钟 / 总共 30 分钟"的自相矛盾显示：
+                # last_pause_time 若被恢复成一个未来时间戳（跨重启的
+                # 时间基准不一致），elapsed 为负 → remain > cooldown。
+                # 不钳制则用户看到的剩余时间比总时长还长，无法判断何时恢复。
+                remain = max(0.0, min(cooldown, cooldown - elapsed))
+                return False, (f"连亏冷静期(剩{int(remain)//60}/共{int(cooldown)//60}分)")
 
         # 4) 日内亏损
         if self.today_loss_pct >= float(self.cfg.max_daily_loss_pct):

@@ -144,6 +144,7 @@ class BTResult:
     def __init__(self):
         self.n_trades = 0
         self.n_buy = 0
+        self._open_buys = 0      # 回测结束时仍未平仓的买入笔数
         self.n_sell = 0
         self.n_closed = 0            # 完整买卖配对数
         # ⚠️ n_trades 曾是一个"陷阱字段"：定义了却从未被赋值，
@@ -243,14 +244,43 @@ class BTResult:
                     mdd = dd
         return mdd
 
+    @property
+    def open_lots(self):
+        """回测结束时仍未平仓的买入笔数"""
+        return int(getattr(self, "_open_buys", 0) or 0)
+
+    @property
+    def true_win_rate(self):
+        """
+        含未平仓的胜率。
+
+        ⚠️ win_rate = wins / n_closed 只统计【买卖配对完成】的交易。
+        买入后一直没卖出的那笔，既不计入亏损、浮亏也不进净利，
+        就这么凭空消失 —— 典型的幸存者偏差。
+
+        实测 SOL 回测：14 笔"全赢"、胜率 100%，
+        而所有套牢未卖的都没被统计，严重高估策略。
+
+        这里把未平仓统一视为未获胜，给出保守下界。
+        """
+        total = self.n_closed + self.open_lots
+        return (self.wins / total) if total else 0.0
+
     def summary(self):
-        return (
+        base = (
             f"交易 {self.n_closed} 笔 | 胜率 {self.win_rate*100:.1f}% | "
             f"净利 {self.net_pnl:+.4f} U | ROI {self.roi*100:+.2f}% | "
             f"回撤 {self.max_drawdown_pct()*100:.2f}% | "
             f"手续费占比 {self.fee_ratio*100:.1f}% | "
             f"夏普 {self.sharpe():.2f}"
         )
+        # 有未平仓时，胜率必须给出修正口径，否则会误导
+        if self.open_lots > 0:
+            base += (
+                f"\n⚠️ 另有 {self.open_lots} 笔未平仓未计入胜率；"
+                f"计入后胜率 {self.true_win_rate*100:.1f}%"
+            )
+        return base
 
 
 # ════════════════════════════════════════════════════════════
@@ -516,6 +546,9 @@ class Backtester:
         r.final_equity = r.equity_curve[-1]
         r.net_pnl = r.final_equity - c.initial_cash
         r.max_drawdown = r.max_drawdown_pct()
+        # 未平仓笔数 = 买入笔数 − 已配对卖出笔数。
+        # 用于修正 win_rate 的幸存者偏差（见 true_win_rate）。
+        r._open_buys = max(0, int(getattr(r, "n_buy", 0)) - self.result.n_closed)
         return r
 
     def _fill_orders(self, bar, i):
