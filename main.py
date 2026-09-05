@@ -3,17 +3,27 @@
 
 三件事：日志脱敏、健康检查端口、启动机器人。
 
+关键顺序（旧版真实踩过的坑）：
+    健康检查端口必须在【最开始】绑定。
+    旧写法先创建 TradingBot（内部会连交易所、校验 token），
+    任一步失败 → 进程在绑端口前就退出 →
+    Render 报 "No open ports detected" → 部署失败。
+    现在反过来：先绑端口保住部署，再初始化，
+    初始化失败时端口仍在，日志里有明确原因。
+
 日志脱敏必须挂【handler】而不是 logger ——
 挂在 logger 上时，httpx / telegram 等子 logger 的记录是
 "传播"到 root handler 的，根本不经过 root logger 的 filter，
-等于写了没用。这是旧版真实踩过的坑。
+等于写了没用。
 """
 import logging
 import os
 import sys
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# config 在 import 时校验必填变量，缺失即退出 —— 这是刻意的
 import config as C
 
 
@@ -45,11 +55,10 @@ def setup_logging() -> None:
     h.addFilter(RedactFilter(C.TG_TOKEN))
 
     root = logging.getLogger()
-    root.handlers.clear()      # 清掉他人可能已挂的 handler，否则漏过滤
+    root.handlers.clear()
     root.addHandler(h)
     root.setLevel(getattr(logging, C.LOG_LEVEL, logging.INFO))
 
-    # 第三方库的 token 也走同一个 handler，同样被脱敏
     for name in ("httpx", "telegram", "telegram.ext", "ccxt", "urllib3"):
         lg = logging.getLogger(name)
         lg.handlers.clear()
@@ -57,11 +66,24 @@ def setup_logging() -> None:
         lg.setLevel(logging.WARNING)
 
 
-def start_health(get_status) -> None:
+class _Status:
+    """健康检查返回值。初始化失败时也能说明原因。"""
+
+    def __init__(self):
+        self.text = "BOOTING\n"
+
+    def set(self, t: str):
+        self.text = t
+
+    def get(self) -> str:
+        return self.text
+
+
+def start_health(status: _Status) -> None:
     """Render 要求绑定端口，否则认为服务未启动。"""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = get_status().encode("utf-8")
+            body = status.get().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -77,30 +99,72 @@ def start_health(get_status) -> None:
     logging.getLogger(__name__).info(f"健康检查端口 {port}")
 
 
-def main() -> None:
+def main() -> int:
     setup_logging()
     log = logging.getLogger("main")
+    status = _Status()
 
-    from bot import TradingBot
-    from commands import build_app
+    # ① 先绑端口 —— 保住部署，后续任何失败都能在日志里看到
+    try:
+        start_health(status)
+    except Exception as e:
+        log.error(f"健康检查端口绑定失败: {type(e).__name__}: {e}")
+        return 1
 
-    bot = TradingBot()
+    # ② 再初始化机器人
+    try:
+        from bot import TradingBot
+        from commands import build_app
 
-    def status():
-        if not bot.running:
-            return "STOPPED\n"
-        if bot.risk.reason:
-            return f"PAUSED {bot.risk.reason}\n"
-        return "OK\n"
+        log.info("正在连接交易所…")
+        bot = TradingBot()
+        log.info("交易所连接成功")
 
-    start_health(status)
+        def _st():
+            if not bot.running:
+                return "STOPPED\n"
+            if bot.risk.reason:
+                return f"PAUSED {bot.risk.reason}\n"
+            return "OK\n"
 
-    log.info(f"启动 | {'模拟盘' if C.SANDBOX else '实盘'} "
-             f"| 币种 {', '.join(bot.state['coins']) or '无'}")
+        # 用闭包替换默认状态
+        status._bot = bot  # noqa
 
-    app = build_app(bot)
-    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+        def poll():
+            while True:
+                try:
+                    status.set(_st())
+                except Exception:
+                    pass
+                threading.Event().wait(5)
+
+        threading.Thread(target=poll, daemon=True).start()
+
+        log.info(f"启动 | {'模拟盘' if C.SANDBOX else '实盘'} "
+                 f"| 币种 {', '.join(bot.state['coins']) or '无'}")
+
+        # ③ 启动 Telegram —— 失败会抛，下面统一捕获
+        app = build_app(bot)
+        status.set("OK\n")
+        app.run_polling(allowed_updates=["message"],
+                        drop_pending_updates=True)
+        return 0
+
+    except Exception as e:
+        status.set(f"FAILED {type(e).__name__}\n")
+        log.error("=" * 50)
+        log.error(f"启动失败: {type(e).__name__}: {e}")
+        log.error("=" * 50)
+        log.error("完整堆栈:")
+        for line in traceback.format_exc().splitlines():
+            log.error(line)
+        log.error("=" * 50)
+        log.error("端口保持存活，可在 Logs 页面查看上述原因。")
+        log.error("修正后重新部署即可。")
+        # 保持存活，让 Render 有机会把日志刷出来
+        threading.Event().wait(300)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
