@@ -24,6 +24,5 @@ PASSPHRASE = _need("OKX_PASSPHRASE")
 SANDBOX = os.getenv("OKX_SANDBOX", "true").strip().lower() == "true"
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-DB_FILE = os.getenv("DB_FILE", "bot.db")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
