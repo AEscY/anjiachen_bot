@@ -156,10 +156,34 @@ class Exchange:
 
     # ─────────── 账户 ───────────
 
-    def balances(self) -> tuple[float, dict]:
-        """返回 (可用 USDT, {币: 可用数量})"""
+    def balances(self) -> tuple[float, float, dict]:
+        """
+        返回 (可用 USDT, 冻结 USDT, {币: 可用数量})
+
+        为什么必须返回冻结部分：
+
+            ccxt 的 free 只含【未冻结】资金。挂出限价买单后，
+            USDT 从 free 移到 used —— 钱还在你账户里，
+            只是暂时锁定在订单里。
+
+            如果权益只算 free + 持仓，网格一挂单，
+            权益就"蒸发"掉全部冻结金额。真实部署日志：
+
+                日基准 7256.38U（可用 4805.53 + 1 ETH 2450.85）
+                挂 4 档买单，每档 960.91U，冻结 3843.64U
+                权益 → (4805.53-3843.64) + 2450.85 = 3412.74U
+                日亏损 = (7256.38-3412.74)/7256.38 = 52.97%
+                → 触发日亏损熔断，暂停 1 小时
+                → 订单还挂着，1 小时后重算，仍是 52.97%
+                → 再次暂停 → 永久停摆
+
+            即：网格越正常工作，越容易把自己熔断。
+
+        所以权益必须是 free + used + 持仓市值。
+        而【可动用】金额仍然是 free —— 冻结的钱不能重复挂单。
+        """
         if self.fatal:
-            return 0.0, {}
+            return 0.0, 0.0, {}
         try:
             b = self.ex.fetch_balance()
         except Exception as e:
@@ -167,15 +191,24 @@ class Exchange:
                 self._raise_fatal("读取账户余额", e)
             else:
                 logger.warning(f"取余额失败: {e}")
-            return 0.0, {}
-        free_usdt = float((b.get("USDT") or {}).get("free") or 0.0)
+            return 0.0, 0.0, {}
+
+        u = b.get("USDT") or {}
+        free_usdt = float(u.get("free") or 0.0)
+        used_usdt = float(u.get("used") or 0.0)
+        total_usdt = float(u.get("total") or 0.0)
+
+        # 部分交易所不返回 used，用 total - free 兜底
+        if used_usdt <= 0 and total_usdt > free_usdt:
+            used_usdt = total_usdt - free_usdt
+
         coins = {}
         for k, v in (b.get("free") or {}).items():
             if k == "USDT" or not isinstance(v, (int, float)):
                 continue
             if float(v) > 0:
                 coins[k] = float(v)
-        return free_usdt, coins
+        return free_usdt, used_usdt, coins
 
     # ─────────── 订单 ───────────
 

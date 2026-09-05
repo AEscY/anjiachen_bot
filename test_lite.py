@@ -8,6 +8,8 @@
 
 每个测试都对应旧版的一个真实 bug，注释里写明来源。
 """
+import ast
+import io
 import os
 import sys
 import time
@@ -406,7 +408,7 @@ def _boom(*a, **k):
 
 _e.ex.fetch_balance = _boom
 for _ in range(5):
-    _free, _coins = _e.balances()
+    _free, _used, _coins = _e.balances()
 
 check("fatal 后只请求交易所 1 次（不刷屏）", _calls["n"] == 1,
       f"实际请求 {_calls['n']} 次")
@@ -436,10 +438,123 @@ _pushed2 = []
 _e = _blank_exchange()
 _e._on_fatal = lambda t: _pushed2.append(t)
 _e.ex.fetch_balance = lambda *a, **k: _raise(ccxt.NetworkError("timeout"))
-_free2, _ = _e.balances()
+_free2, _used2, _ = _e.balances()
 check("网络错误不触发 fatal 告警", not _pushed2)
 check("网络错误不置 fatal 状态", _e.fatal is None)
 check("网络错误仍安全返回空", _free2 == 0.0)
+
+
+# ═══════════════════════════════════════════════════════════
+# 权益口径：挂单冻结资金必须计入权益
+#
+# 真实部署日志：
+#     日基准 7256.38U（可用 4805.53 + 1 ETH 2450.85）
+#     挂 4 档买单，每档 960.91U，冻结 3843.64U
+#     日亏损 52.97% 达上限 5%，暂停 1 小时
+#     冷却中（剩 59/60 分钟）… 每小时重复，永久停摆
+#
+# 根因：ccxt 的 free 不含挂单冻结的 USDT（钱在 used 里）。
+# 权益只算 free + 持仓 → 一挂单就"亏损"掉全部冻结额。
+# 而订单还挂着，1 小时后重算仍触发 → 死循环。
+# ═══════════════════════════════════════════════════════════
+
+print("\n    权益口径：冻结资金")
+
+
+class _FakeBal:
+    """返回指定余额的假 Exchange，只测权益口径。"""
+
+    def __init__(self, usdt):
+        self._info = {"USDT": usdt}
+
+    def balances(self):
+        u = self._info["USDT"]
+        return u["free"], u["used"], {}
+
+
+# 真实日志的数字
+_free_after = 4805.53 - 3843.64      # 挂单后可用
+_base = 7256.38                      # 日基准（挂单前）
+_frozen = 3843.64
+
+# 修复前：equity = free + 持仓（漏掉冻结）
+_old_equity = _free_after + 2450.85
+_old_loss = (_base - _old_equity) / _base
+check("复现原缺陷：漏算冻结 → 日亏损 52.97%",
+      abs(_old_loss * 100 - 52.97) < 0.01, f"{_old_loss*100:.2f}%")
+
+# 修复后：equity = free + used + 持仓
+_new_equity = _free_after + _frozen + 2450.85
+_new_loss = (_base - _new_equity) / _base
+check("修复后：计入冻结 → 日亏损 0%",
+      abs(_new_loss) < 1e-9, f"{_new_loss*100:.6f}%")
+check("修复后权益回到基准 7256.38U",
+      abs(_new_equity - _base) < 0.01, f"{_new_equity:.2f}U")
+
+# balances() 必须返回三元组，且 used 有兜底
+_e = _blank_exchange()
+
+
+def _mkbal(free, used, total):
+    e2 = _blank_exchange()
+    e2.ex.fetch_balance = lambda *a, **k: {
+        "USDT": {"free": free, "used": used, "total": total},
+        "free": {}}
+    return e2
+
+
+_f, _u, _c = _mkbal(100.0, 50.0, 150.0).balances()
+check("balances 返回 (可用, 冻结, 持仓)", (_f, _u) == (100.0, 50.0),
+      f"free={_f} used={_u}")
+
+# 交易所不给 used 时，用 total - free 兜底
+_f2, _u2, _ = _mkbal(100.0, 0.0, 150.0).balances()
+check("交易所不返回 used 时用 total-free 兜底",
+      abs(_u2 - 50.0) < 1e-9, f"used={_u2}")
+
+# fatal 状态返回三元组
+_ef = _blank_exchange()
+_ef.fatal = "x"
+check("fatal 时 balances 返回三元组", len(_ef.balances()) == 3)
+
+
+# ═══════════════════════════════════════════════════════════
+# 通知：同步函数里不得直接调 async 的 _tell
+#
+# 真实缺陷：_on_fill / _liquidate 是同步函数，里面写
+#     self._tell("🟢 买入 ...")
+# 只是创建了协程对象却没人 await —— 通知【静默丢失】，
+# 只在日志留一行 RuntimeWarning: coroutine was never awaited。
+#
+# 后果：买入、卖出、区间止损三类最关键的通知一条都收不到。
+# ═══════════════════════════════════════════════════════════
+
+print("\n    通知链路")
+
+_src = io.open("bot.py", encoding="utf-8").read()
+_tree = ast.parse(_src)
+
+_sync_methods = ("_on_fill", "_liquidate")
+_bad = []
+for _node in ast.walk(_tree):
+    if not isinstance(_node, ast.FunctionDef):
+        continue
+    if _node.name not in _sync_methods:
+        continue
+    for _sub in ast.walk(_node):
+        if isinstance(_sub, ast.Call):
+            _fn = _sub.func
+            if (isinstance(_fn, ast.Attribute)
+                    and _fn.attr == "_tell"
+                    and isinstance(_fn.value, ast.Name)
+                    and _fn.value.id == "self"):
+                _bad.append(f"{_node.name}:{_sub.lineno}")
+
+check("同步函数未直接调用 async _tell", not _bad,
+      "违规位置: " + ", ".join(_bad) if _bad else "已全部用 _tell_nowait")
+
+check("同步函数使用 _tell_nowait",
+      "_tell_nowait" in _src)
 
 
 print("\n" + "=" * 70)

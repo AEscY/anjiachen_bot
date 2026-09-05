@@ -49,9 +49,11 @@ async def cmd_status(update, ctx):
     if not _auth(update):
         return
     b = BOT
-    free, coins = b.ex.balances()
+    free, used, coins = b.ex.balances()
     prices = {s: b.ex.price(s) for s in b.state["coins"]}
-    equity = free + sum(q * prices.get(f"{c}/USDT", 0.0) for c, q in coins.items())
+    # 权益必须含冻结，否则挂单后看起来像巨亏
+    holding = sum(q * prices.get(f"{c}/USDT", 0.0) for c, q in coins.items())
+    equity = free + used + holding
 
     lines = [f"📊 状态 {'(模拟盘)' if C.SANDBOX else '(实盘)'}",
              f"运行  {'是' if b.running else '否'}",
@@ -59,7 +61,12 @@ async def cmd_status(update, ctx):
              ""]
     lines.append(b.risk.summary(equity))
     lines.append("")
-    lines.append(f"可用现金  {free:.2f}U")
+    lines.append(f"权益      {equity:.2f}U")
+    lines.append(f"  可用    {free:.2f}U")
+    if used > 0.01:
+        lines.append(f"  冻结    {used:.2f}U（挂在订单里，不是亏损）")
+    if holding > 0.01:
+        lines.append(f"  持仓    {holding:.2f}U")
     lines.append(f"每档金额  {b.per_grid(free):.2f}U")
     lines.append(f"币种      {', '.join(b.state['coins']) or '无'}")
     await update.message.reply_text("\n".join(lines))
@@ -232,12 +239,17 @@ async def cmd_resume(update, ctx):
     if not _auth(update):
         return
     b = BOT
-    free, coins = b.ex.balances()
+    free, used, coins = b.ex.balances()
     prices = {s: b.ex.price(s) for s in b.state["coins"]}
-    equity = free + sum(q * prices.get(f"{c}/USDT", 0.0) for c, q in coins.items())
+    equity = (free + used + sum(
+        q * prices.get(f"{c}/USDT", 0.0) for c, q in coins.items()))
     b.risk.resume(equity)
     b.save()
-    await update.message.reply_text("✅ 冷却已解除")
+    extra = ""
+    if used > 0.01:
+        extra = (f"\n（其中 {used:.2f}U 冻结在挂单里，"
+                 f"已计入权益，不会算作亏损）")
+    await update.message.reply_text(f"✅ 冷却已解除{extra}")
 
 
 async def cmd_panic(update, ctx):
@@ -296,8 +308,24 @@ def build_app(bot: TradingBot) -> Application:
         app.add_handler(CommandHandler(name, fn))
     app.add_error_handler(on_error)
 
+    _task = None
+
     async def _post_init(a):
-        asyncio.create_task(bot.loop())
+        nonlocal _task
+        _task = asyncio.create_task(bot.loop())
+        bot._loop_task = _task
+
+    async def _post_stop(a):
+        # 让主循环自己退出并保存状态，而不是被事件循环销毁
+        bot.stop()
+        if _task is not None:
+            try:
+                await asyncio.wait_for(_task, timeout=15)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                _task.cancel()
+        bot.save()
+
+    app.post_stop = _post_stop
 
     app.post_init = _post_init
     return app

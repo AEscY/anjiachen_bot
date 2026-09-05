@@ -54,6 +54,7 @@ class TradingBot:
         self.running = bool(self.state.get("running", True))
         self._last_save = 0.0
         self._syms: list[str] = []
+        self._stop = asyncio.Event()
 
         syms = self.state.get("coins")
         if syms:
@@ -120,7 +121,7 @@ class TradingBot:
                 "sell_price": sell_price(price, spacing),
                 "buy_time": time.time(),
             }
-            self._tell(f"🟢 买入 {sym}\n"
+            self._tell_nowait(f"🟢 买入 {sym}\n"
                        f"   {qty} @ {price}\n"
                        f"   卖单挂 {sell_price(price, spacing):.4f}")
         else:
@@ -130,7 +131,7 @@ class TradingBot:
                 return
             pnl = qty * price - float(lot["cost_usdt"])
             self.risk.add_realized(pnl)
-            self._tell(f"🔴 卖出 {sym}\n"
+            self._tell_nowait(f"🔴 卖出 {sym}\n"
                        f"   {qty} @ {price}\n"
                        f"   净利 {pnl:+.4f}U")
 
@@ -222,7 +223,7 @@ class TradingBot:
 
         if sold > 0:
             self.risk.add_realized(pnl)
-            self._tell(f"🚨 {sym} 跌破区间止损，已清仓\n"
+            self._tell_nowait(f"🚨 {sym} 跌破区间止损，已清仓\n"
                        f"   卖出 {sold} @ 约 {price}\n"
                        f"   净利 {pnl:+.4f}U")
 
@@ -232,14 +233,19 @@ class TradingBot:
     # ─────────── 主循环 ───────────
 
     async def step(self) -> None:
-        free_usdt, coins = self.ex.balances()
-        if free_usdt <= 0 and not coins:
+        free_usdt, used_usdt, coins = self.ex.balances()
+        if free_usdt <= 0 and used_usdt <= 0 and not coins:
             logger.warning("取不到余额，跳过本轮")
             return
 
         prices = {s: self.ex.price(s) for s in self.state["coins"]}
-        equity = free_usdt + sum(
-            q * prices.get(f"{c}/USDT", 0.0) for c, q in coins.items())
+        # 权益 = 可用 + 冻结 + 持仓市值
+        #
+        # 冻结部分绝不能漏：挂单冻结的 USDT 仍在账户里。
+        # 漏算会导致网格一挂单就"亏损"掉全部冻结额，
+        # 触发日亏损熔断并每小时重复触发，永久停摆。
+        equity = (free_usdt + used_usdt + sum(
+            q * prices.get(f"{c}/USDT", 0.0) for c, q in coins.items()))
         self.risk.update(equity)
 
         # 风控只管【开新仓】，不管【记账】和【止损】。
@@ -296,7 +302,7 @@ class TradingBot:
         正常运行下本函数不会报差异（_sync 以交易所订单状态为准），
         差异只来自：手动在交易所买卖、旧版遗留持仓、数据库丢失。
         """
-        _, coins = self.ex.balances()
+        _, _, coins = self.ex.balances()
         bad = []
         for sym, st in self.state["coins"].items():
             base = sym.split("/")[0]
@@ -313,14 +319,45 @@ class TradingBot:
             logger.warning("启动对账差异:\n" + "\n".join(bad))
 
     async def loop(self) -> None:
+        """
+        主循环。可被 stop() 优雅终止。
+
+        为什么不用 `while True: await asyncio.sleep(...)`：
+            进程收到 SIGTERM（Render 每次重新部署都会发）时，
+            正在 sleep 的任务被直接销毁，日志刷一行
+
+                Task was destroyed but it is pending!
+
+            虽然不影响新实例，但会让日志里混入上一次部署的错误，
+            干扰排查真实问题。更稳妥的是收到停止信号后
+            自己退出循环并保存状态。
+        """
         await self.check_consistency()
-        while True:
+        while not self._stop.is_set():
             try:
                 await self.step()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.exception(f"主循环异常: {e}")
                 await self._tell(f"⚠️ 主循环异常\n{e}")
-            await asyncio.sleep(max(3, int(self.p.get("poll"))))
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=max(3, int(self.p.get("poll"))))
+            except asyncio.TimeoutError:
+                pass
+        logger.info("主循环已停止")
+
+    def stop(self) -> None:
+        """请求停止主循环。可在任意线程调用。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.call_soon_threadsafe(self._stop.set)
+        else:
+            self._stop.set()
 
     # ─────────── 持久化 ───────────
 
@@ -348,6 +385,19 @@ class TradingBot:
             logger.error(f"推送失败: {e}")
 
     def _tell_nowait(self, text: str) -> None:
+        """
+        从【同步】上下文推送。
+
+        为什么需要它：
+            _on_fill / _liquidate 是同步函数（被 _sync、step 直接调用）。
+            里面写 self._tell(...) 的话，只是创建了一个协程对象
+            却没人 await —— 通知【静默丢失】，只在日志里留一行
+
+                RuntimeWarning: coroutine '_tell' was never awaited
+
+            真实后果：买入、卖出、区间止损三类通知一条都收不到。
+            而这三类恰恰是最该收到的。
+        """
         try:
             asyncio.get_running_loop().create_task(self._tell(text))
         except RuntimeError:
