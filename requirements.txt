@@ -1,2 +1,8 @@
-python-telegram-bot>=20.8,<21
+# python-telegram-bot 20.x 在 Python 3.13+ 上会崩：
+#   AttributeError: 'Updater' object has no attribute
+#   '_Updater__polling_cleanup_cb' and no __dict__ for setting new attributes
+# 原因：Python 3.13 起禁止给 __slots__ 类动态加属性。
+# 21.7+ 才修复。这里用环境标记自动选版本。
+python-telegram-bot>=20.8,<21; python_version < "3.13"
+python-telegram-bot>=22.5,<23; python_version >= "3.13"
 ccxt>=4.4.0

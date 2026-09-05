@@ -16,6 +16,7 @@
 "传播"到 root handler 的，根本不经过 root logger 的 filter，
 等于写了没用。
 """
+import importlib.metadata
 import logging
 import os
 import sys
@@ -23,8 +24,50 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+
+def _check_versions() -> None:
+    """
+    python-telegram-bot 20.x 在 Python 3.13+ 上必崩：
+        AttributeError: 'Updater' object has no attribute
+        '_Updater__polling_cleanup_cb' and no __dict__ for setting new attributes
+    因为 Python 3.13 起禁止给 __slots__ 类动态加属性，21.7+ 才修复。
+
+    这个报错极其晦涩，看不出是版本问题。这里提前检查，
+    不匹配就直接说明原因和修法。
+    """
+    if sys.version_info < (3, 13):
+        return
+    try:
+        v = importlib.metadata.version("python-telegram-bot")
+    except Exception:
+        return
+    major = int(v.split(".")[0])
+    if major < 21:
+        print("=" * 60, flush=True)
+        print("版本不兼容", flush=True)
+        print("=" * 60, flush=True)
+        print(f"  Python        {sys.version.split()[0]}", flush=True)
+        print(f"  telegram-bot  {v}", flush=True)
+        print(flush=True)
+        print("  python-telegram-bot 20.x 不支持 Python 3.13+。", flush=True)
+        print("  两个办法（任选其一）：", flush=True)
+        print(flush=True)
+        print("  A. 降 Python（推荐，走已测路径）", flush=True)
+        print("     Render → Environment → 加变量", flush=True)
+        print("     PYTHON_VERSION = 3.11.9", flush=True)
+        print("     或仓库根目录放 .python-version 文件，内容 3.11.9", flush=True)
+        print(flush=True)
+        print("  B. 升依赖（requirements.txt 已自动适配）", flush=True)
+        print("     当前依赖没装上 21+，检查 requirements.txt", flush=True)
+        print("     是否被改过，或构建缓存未清除。", flush=True)
+        print("=" * 60, flush=True)
+
+
+# 必须在 import telegram 之前 —— 崩了就看不到这段说明了
+_check_versions()
+
 # config 在 import 时校验必填变量，缺失即退出 —— 这是刻意的
-import config as C
+import config as C  # noqa: E402
 
 
 class RedactFilter(logging.Filter):
