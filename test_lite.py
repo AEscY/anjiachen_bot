@@ -322,6 +322,126 @@ check("挂单已撤", "o9" in b.ex.cancelled)
 check("中枢已重置", st["center"] == 80.0, f"{st['center']}")
 
 
+# ═══════════════════════════════════════════════════════════
+# 交易所：致命错误分类
+#
+# 起因：真实部署日志里出现
+#     okx {"msg":"APIKey does not match current environment.","code":"50101"}
+# 每 10 秒刷一行 WARNING，永不停止。而 Telegram 是唯一通知渠道，
+# 用户完全不知道机器人其实什么都没做。
+#
+# 同时发现 exchange._make() 给【公开行情实例】也传了密钥 ——
+# 公开接口本不需要认证，带上后被交易所校验，
+# 模拟盘 key 请求真实域名就返回 50101，连取价都失败。
+# ═══════════════════════════════════════════════════════════
+
+import ccxt
+import exchange
+
+print("\n    交易所：致命错误分类")
+
+
+def _raise(exc):
+    raise exc
+
+
+def _blank_exchange():
+    """构造一个不连网的 Exchange 实例，仅用于测错误分类。"""
+    e = exchange.Exchange.__new__(exchange.Exchange)
+    e._on_fatal = None
+    e.fatal = None
+    e.ex = exchange._make(True, with_auth=True)
+    e.pub = exchange._make(False, with_auth=False)
+    e.markets = {}
+    return e
+
+
+# ── 公开行情实例不得带密钥 ──
+# 注意：必须检查【真实构造出来的实例】，而不是 _make() 函数本身。
+# 只测 _make(False, with_auth=False) 的话，即使 __init__ 里写成
+# _make(False, with_auth=True) 测试照样通过 —— 那是假守卫。
+check("_make() 不加认证时不带密钥",
+      not exchange._make(False, with_auth=False).apiKey)
+check("_make() 加认证时带密钥",
+      bool(exchange._make(True, with_auth=True).apiKey))
+
+_orig_load = exchange.Exchange._load_markets
+exchange.Exchange._load_markets = lambda self: {}   # 跳过联网
+try:
+    _real = exchange.Exchange()
+finally:
+    exchange.Exchange._load_markets = _orig_load
+
+check("实际构造 pub 不带 apiKey", not _real.pub.apiKey,
+      f"apiKey={_real.pub.apiKey!r}")
+check("实际构造 pub 不带 secret", not _real.pub.secret)
+check("实际构造 pub 不带 password",
+      not getattr(_real.pub, "password", None))
+check("实际构造 ex 保留密钥（交易需要）", bool(_real.ex.apiKey))
+
+# ── 错误分类 ──
+_e = _blank_exchange()
+for _name, _exc in [("认证错误", ccxt.AuthenticationError("okx 50101")),
+                    ("权限不足", ccxt.PermissionDenied("denied")),
+                    ("消息含50101", ccxt.ExchangeError('{"code":"50101"}')),
+                    ("消息含50111", ccxt.ExchangeError('{"code":"50111"}'))]:
+    check(f"{_name} → fatal", _e._is_fatal(_exc))
+
+for _name, _exc in [("网络错误", ccxt.NetworkError("timeout")),
+                    ("限频", ccxt.RateLimitExceeded("too many")),
+                    ("交易所不可用", ccxt.ExchangeNotAvailable("down"))]:
+    check(f"{_name} → transient（可重试）", not _e._is_fatal(_exc))
+
+# ── fatal 后只报一次、只请求一次 ──
+_pushed = []
+_calls = {"n": 0}
+_e = _blank_exchange()
+_e._on_fatal = lambda t: _pushed.append(t)
+
+
+def _boom(*a, **k):
+    _calls["n"] += 1
+    raise ccxt.AuthenticationError('okx {"code":"50101"}')
+
+
+_e.ex.fetch_balance = _boom
+for _ in range(5):
+    _free, _coins = _e.balances()
+
+check("fatal 后只请求交易所 1 次（不刷屏）", _calls["n"] == 1,
+      f"实际请求 {_calls['n']} 次")
+check("fatal 只推送用户 1 次", len(_pushed) == 1,
+      f"实际推送 {len(_pushed)} 次")
+check("fatal 后余额安全返回空", _free == 0.0 and _coins == {})
+check("fatal 后查挂单返回空", _e.open_orders("SOL/USDT") == [])
+check("fatal 后买入返回 None",
+      _e.limit_buy("SOL/USDT", 1.0, 100.0) is None)
+check("fatal 后卖出返回 None",
+      _e.limit_sell("SOL/USDT", 1.0, 100.0) is None)
+check("fatal 后市价卖返回 None",
+      _e.market_sell("SOL/USDT", 1.0) is None)
+check("fatal 后查单返回 None",
+      _e.fetch_order("oid", "SOL/USDT") is None)
+
+# ── 告警内容必须给出修法 ──
+if _pushed:
+    _t = _pushed[0]
+    for _kw in ("不是网络问题", "模拟盘", "实盘", "OKX_SANDBOX"):
+        check(f"告警含关键信息「{_kw}」", _kw in _t)
+else:
+    check("告警已生成", False, "没有任何推送内容")
+
+# ── 网络错误不得误判为 fatal ──
+_pushed2 = []
+_e = _blank_exchange()
+_e._on_fatal = lambda t: _pushed2.append(t)
+_e.ex.fetch_balance = lambda *a, **k: _raise(ccxt.NetworkError("timeout"))
+_free2, _ = _e.balances()
+check("网络错误不触发 fatal 告警", not _pushed2)
+check("网络错误不置 fatal 状态", _e.fatal is None)
+check("网络错误仍安全返回空", _free2 == 0.0)
+
+
 print("\n" + "=" * 70)
 print(f"通过: {len(PASS)} 项 | 失败: {len(FAIL)} 项")
 if FAIL:
@@ -330,3 +450,4 @@ if FAIL:
         print(f"   ❌ {f}")
 print("=" * 70)
 sys.exit(1 if FAIL else 0)
+

@@ -32,6 +32,7 @@ import time
 from telegram import Bot
 
 import config as C
+import notify
 import store
 from exchange import Exchange
 from grid import below_stop, buy_prices, effective_sell, sell_price
@@ -46,7 +47,9 @@ class TradingBot:
         self.state = store.load(C.STATE_FILE, store.empty_state())
         self.p = Params(self.state.get("params"))
         self.risk = Risk(self.state["risk"], self.p)
-        self.ex = Exchange()
+        # 认证失败等致命错误必须立刻送达 —— 用同步推送，
+        # 因为此处还没有事件循环，_tell() 用不了
+        self.ex = Exchange(on_fatal=notify.push)
         self.tg = Bot(token=C.TG_TOKEN)
         self.running = bool(self.state.get("running", True))
         self._last_save = 0.0

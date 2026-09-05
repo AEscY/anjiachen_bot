@@ -264,3 +264,67 @@
 
 关于自动备份：Render 免费层磁盘不持久，重启必丢状态。
 建议每周手动发一次 /backup，或要求补上定时推送。
+
+
+═══════════════════════════════════════════════════════════
+十一、v2：交易所致命错误分类（真实部署日志暴露）
+═══════════════════════════════════════════════════════════
+
+部署后出现：
+    okx {"msg":"APIKey does not match current environment.","code":"50101"}
+    SOL/USDT 取不到价格，跳过
+每 10 秒一行，永不停止。机器人"活着"，但什么都没做。
+
+【缺陷 1】公开行情实例误带密钥（代码 bug）
+
+    def _make(sandbox):
+        ex = cls({"apiKey": C.API_KEY, ...})   # ← pub 也带上了
+    self.pub = _make(False)
+
+公开行情接口本就不需要认证。带上密钥后交易所会去校验它 ——
+模拟盘 key 请求真实域名就返回 50101，连最基础的取价都被卡死。
+文档字符串明明写着"pub —— 行情用，永远真实"，代码却把密钥也塞进去了。
+
+修复：pub = _make(False, with_auth=False)
+
+【缺陷 2】永久错误被当成临时错误
+
+原写法：所有异常一律 except → warning → 返回空值 → 下轮重试。
+但 key 配错是【永久】错误，重试一万次也不会好。
+后果：日志刷屏、浪费额度，而 Telegram 是唯一通知渠道，用户完全不知情。
+
+修复：错误分两类
+    fatal     —— AuthenticationError / PermissionDenied / 50101 等码
+    transient —— 网络超时、限频、交易所不可用（正常重试）
+
+fatal 的处理：
+    · 立刻同步推送用户（含具体修法）
+    · 只推一次，不重复打扰
+    · 只请求一次，后续快速返回空（不刷屏）
+    · 所有交易动作安全返回空，绝不带着错误状态下单
+
+【为什么用同步推送】
+
+Exchange 在 TradingBot.__init__ 里构造，那时还没有事件循环，
+async 的 _tell() 用不了（get_running_loop 会抛 RuntimeError）。
+结果是：最该送达的告警反而送不出去。
+所以新增 notify.py —— 用 urllib 直接调 Telegram API，
+不引入新依赖，任何时机都能发，失败只记日志不影响启动。
+
+【本轮教训：假守卫】
+
+第一版测试这么写：
+    pub = exchange._make(False, with_auth=False)
+    assert not pub.apiKey
+然后把 bug 改回去验证守卫 —— 测试【依然通过】。
+因为它测的是函数本身，不是 __init__ 里实际怎么调用。
+__init__ 写成 _make(False, with_auth=True) 时，
+测试调的还是 _make(False, with_auth=False)，当然通过。
+
+修正：检查真实构造出来的实例
+    exchange.Exchange._load_markets = lambda self: {}
+    real = exchange.Exchange()
+    assert not real.pub.apiKey
+重新验证：改回 bug → 3 项失败；还原 → 80 项全绿。守卫这才算真的有效。
+
+【测试】80 项单元 + 8 项端到端全绿（本轮新增 28 项）
