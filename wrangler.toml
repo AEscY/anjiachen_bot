@@ -1,0 +1,10 @@
+name = "anjiachen-bot"
+main = "worker.js"
+compatibility_date = "2026-09-06"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID"
