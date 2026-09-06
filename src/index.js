@@ -71,7 +71,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/webhook' && request.method === 'POST') {
       const update = await request.json();
-      if (update.message && update.message.text === '/status') {
+      if (update.message && update.message.text && update.message.text.startsWith('/status')) {
         await handleStatusCommand(env, update.message.chat.id);
       }
       return new Response('OK');
