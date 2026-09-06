@@ -9,20 +9,19 @@ async function signOKX(secret, timestamp, method, path, body = '') {
   const msg = timestamp + method.toUpperCase() + path + body;
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
-    'raw', enc.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false, ['sign']
+    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(msg));
-  return btoa(String.fromCharCode(...new Uint8Array(sig)));
+  const signed = await crypto.subtle.sign('HMAC', key, enc.encode(msg));
+  return btoa(String.fromCharCode(...new Uint8Array(signed)));
 }
 
-// ---- OKX 请求封装 ----
+// ---- OKX 请求封装（支持虚拟盘/实盘切换） ----
 async function okxFetch(env, method, endpoint, params = null, body = null) {
-  const ts = new Date().toISOString();
+  const ts = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const qs = params ? '?' + new URLSearchParams(params).toString() : '';
   const path = endpoint + qs;
   const bodyStr = body ? JSON.stringify(body) : '';
+  
   const sign = await signOKX(env.OKX_SECRET, ts, method, path, bodyStr);
 
   const headers = {
@@ -33,17 +32,24 @@ async function okxFetch(env, method, endpoint, params = null, body = null) {
     'Content-Type': 'application/json'
   };
 
+  // ✅ 模拟盘/实盘切换开关
+  if (env.OKX_MODE === 'demo') {
+    headers['x-simulated-trading'] = '1';
+  }
+
   const url = 'https://www.okx.com' + path;
   const opts = { method, headers };
   if (body) opts.body = bodyStr;
 
   const res = await fetch(url, opts);
   const data = await res.json();
-  if (data.code !== '0') throw new Error(`OKX Error: ${data.msg}`);
+  if (data.code !== '0') {
+    throw new Error(`OKX API Error: ${data.msg} (Code: ${data.code})`);
+  }
   return data.data;
 }
 
-// ---- Telegram 通知 ----
+// ---- Telegram 推送 ----
 async function sendTG(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -53,110 +59,120 @@ async function sendTG(env, text) {
     body: JSON.stringify({
       chat_id: env.TELEGRAM_CHAT_ID,
       text: text,
-      parse_mode: 'Markdown'
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: true
     })
   });
 }
 
-// ---- 获取 OKX 现货价格 ----
-async function getOKXPrice(ticker) {
-  const data = await okxFetch(null, 'GET', '/api/v5/market/ticker', { instId: ticker });
-  return parseFloat(data[0].last);
-}
-
-// ---- 获取 OKX 账户余额 ----
-async function getBalance(env, ccy) {
-  const data = await okxFetch(env, 'GET', '/api/v5/account/balance', { ccy });
-  return data[0]?.details?.[0]?.availBal ? parseFloat(data[0].details[0].availBal) : 0;
-}
-
-// ---- 策略1: CEX-DEX 套利监控 ----
-async function runArbitrage(env) {
-  const pairs = env.ARBITRAGE_PAIRS ? env.ARBITRAGE_PAIRS.split(',') : ['BTC-USDT', 'ETH-USDT'];
-  const threshold = parseFloat(env.ARBITRAGE_THRESHOLD || '0.02'); // 2% 价差
-
-  for (const pair of pairs) {
-    try {
-      const cexPrice = await getOKXPrice(pair);
-      // DEX 价格通过 Chainlink/Uniswap 获取（简化版：用 OKX 作为基准）
-      // 实际项目中替换为链上价格源
-      const dexPrice = cexPrice * (1 + (Math.random() - 0.5) * 0.04); // 模拟
-
-      const diff = Math.abs(cexPrice - dexPrice) / cexPrice;
-
-      if (diff > threshold) {
-        const direction = cexPrice > dexPrice ? 'CEX→DEX' : 'DEX→CEX';
-        const msg = `🔔 套利机会！\n\n` +
-          `交易对: ${pair}\n` +
-          `方向: ${direction}\n` +
-          `CEX价格: ${cexPrice.toFixed(2)}\n` +
-          `DEX价格: ${dexPrice.toFixed(2)}\n` +
-          `价差: ${(diff * 100).toFixed(3)}%\n` +
-          `时间: ${new Date().toISOString()}`;
-        await sendTG(env, msg);
-      }
-    } catch (e) {
-      console.error(`Arbitrage error for ${pair}:`, e.message);
-    }
-  }
-}
-
-// ---- 策略2: 双网格交易 ----
-async function runGrid(env) {
-  const gridConfig = {
-    instId: env.GRID_INST_ID || 'BTC-USDT',
-    lower: parseFloat(env.GRID_LOWER || '50000'),
-    upper: parseFloat(env.GRID_UPPER || '75000'),
-    grids: parseInt(env.GRID_GRIDS || '10'),
-    amount: parseFloat(env.GRID_AMOUNT || '0.001')
-  };
-
-  try {
-    const price = await getOKXPrice(gridConfig.instId);
-    const step = (gridConfig.upper - gridConfig.lower) / gridConfig.grids;
-
-    let action = null;
-    if (price <= gridConfig.lower + step) {
-      action = `买入 ${gridConfig.amount} ${gridConfig.instId.split('-')[0]} @ ${price.toFixed(2)}`;
-    } else if (price >= gridConfig.upper - step) {
-      action = `卖出 ${gridConfig.amount} ${gridConfig.instId.split('-')[0]} @ ${price.toFixed(2)}`;
-    }
-
-    // 读取上次操作时间，避免频繁交易
-    const lastTrade = await env.KV.get(`last_trade_${gridConfig.instId}`);
-    const now = Date.now();
-    const minInterval = 30 * 60 * 1000; // 30分钟冷却
-
-    if (action && (!lastTrade || now - parseInt(lastTrade) > minInterval)) {
-      await env.KV.put(`last_trade_${gridConfig.instId}`, now.toString());
-
-      const msg = `📊 网格交易信号\n\n` +
-        `交易对: ${gridConfig.instId}\n` +
-        `当前价: ${price.toFixed(2)}\n` +
-        `操作: ${action}\n` +
-        `网格区间: ${gridConfig.lower} - ${gridConfig.upper}\n` +
-        `网格数: ${gridConfig.grids}\n` +
-        `时间: ${new Date().toISOString()}`;
-      await sendTG(env, msg);
-    }
-
-    console.log(`Grid: ${gridConfig.instId} price=${price.toFixed(2)}, action=${action || 'none'}`);
-  } catch (e) {
-    console.error(`Grid error:`, e.message);
-  }
-}
-
-// ---- 主入口：Cron 触发器 ----
+// ---- Telegram 机器人命令监听 (Webhook) ----
 export default {
-  async scheduled(event, env, ctx) {
-    console.log('⏰ Bot 启动:', new Date().toISOString());
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === '/webhook' && request.method === 'POST') {
+      const update = await request.json();
+      if (update.message && update.message.text === '/status') {
+        await handleStatusCommand(env, update.message.chat.id);
+      }
+      return new Response('OK');
+    }
+    return new Response('Anjiachen Bot is running.');
+  },
 
+  // ---- 定时任务触发 ----
+  async scheduled(event, env, ctx) {
     try {
-      await runArbitrage(env);
-      await runGrid(env);
-      console.log('✅ 本轮执行完成');
+      await runStrategies(env);
     } catch (e) {
-      await sendTG(env, `❌ Bot 运行错误:\n${e.message}`);
+      await sendTG(env, `⚠️ *策略运行错误*:\n\`\`\`\n${e.message}\n\`\`\``);
     }
   }
 };
+
+// ---- Telegram /status 命令处理 ----
+async function handleStatusCommand(env, chatId) {
+  let msg = "🟢 *Anjiachen Bot 运行状态*\n\n";
+  msg += `🕹 *交易模式*: ${env.OKX_MODE === 'demo' ? '模拟盘 (Demo)' : '实盘 (Live)'}\n`;
+  
+  try {
+    // 获取模拟/实盘账户余额
+    const balances = await okxFetch(env, 'GET', '/api/v5/account/balance');
+    const totalEquity = balances[0]?.totalEq || '0';
+    msg += `💰 *账户权益*: ${totalEquity} USDT\n\n`;
+    
+    // 获取当前持仓
+    const positions = await okxFetch(env, 'GET', '/api/v5/account/positions');
+    if (positions.length > 0) {
+      msg += `📊 *当前持仓*:\n`;
+      positions.slice(0, 5).forEach(pos => {
+        msg += `- ${pos.instId}: ${pos.pos} (${pos.upl} USDT)\n`;
+      });
+    } else {
+      msg += `📊 *当前持仓*: 无\n`;
+    }
+  } catch (e) {
+    msg += `❌ *获取数据失败*: ${e.message}`;
+  }
+  
+  // 直接推送给对应 chat_id
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: msg,
+      parse_mode: 'MarkdownV2'
+    })
+  });
+}
+
+// ---- 核心策略逻辑 ----
+async function runStrategies(env) {
+  const modeStr = env.OKX_MODE === 'demo' ? '【模拟盘】' : '【实盘】';
+  
+  // === 策略1: CEX-DEX 价差监控 ===
+  await checkArbitrage(env);
+  
+  // === 策略2: 双网格交易 ===
+  await runGridTrading(env);
+}
+
+async function checkArbitrage(env) {
+  // 示例：检查 BTC 价格在 OKX 和 链上/其他CEX 的价差
+  // 实际应用中可通过 API 获取其他平台价格进行对比
+  const okxBtc = await okxFetch(env, 'GET', '/api/v5/market/ticker', { instId: 'BTC-USDT' });
+  const btcPrice = parseFloat(okxBtc[0].last);
+  
+  // 模拟一个价差逻辑（实际可接入 DEX API 如 Uniswap）
+  const dexPrice = btcPrice * 1.0015; // 假设 DEX 价格高出 0.15%
+  const diffPercent = ((dexPrice - btcPrice) / btcPrice) * 100;
+
+  if (diffPercent > 0.1) {
+    const msg = `🚨 *套利机会发现 ${env.OKX_MODE === 'demo' ? '(模拟)' : ''}*\n\n` +
+                `币种: BTC\n` +
+                `OKX 价格: ${btcPrice}\n` +
+                `DEX 价格: ${dexPrice.toFixed(2)}\n` +
+                `价差: ${diffPercent.toFixed(3)}%\n` +
+                `建议: 买入OKX / 卖出DEX`;
+    await sendTG(env, msg);
+  }
+}
+
+async function runGridTrading(env) {
+  // 示例：双网格逻辑 - 检查资金费率，决定网格偏向
+  const fundingRate = await okxFetch(env, 'GET', '/api/v5/public/funding-rate', { instId: 'BTC-USDT-SWAP' });
+  const rate = parseFloat(fundingRate[0].fundingRate);
+  
+  let gridMsg = `📉 *双网格运行中 ${env.OKX_MODE === 'demo' ? '(模拟)' : ''}*\n\n`;
+  gridMsg += `BTC 资金费率: ${(rate * 100).toFixed(4)}%\n`;
+  
+  if (rate > 0.0001) {
+    gridMsg += `状态: 费率为正，优先执行*做空网格*收割费率。\n`;
+  } else if (rate < -0.0001) {
+    gridMsg += `状态: 费率为负，优先执行*做多网格*收割费率。\n`;
+  } else {
+    gridMsg += `状态: 费率中性，执行*双向中性网格*。\n`;
+  }
+  
+  await sendTG(env, gridMsg);
+}
