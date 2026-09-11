@@ -1,25 +1,24 @@
-# app.py — OKX 多币种超前版策略引擎 v3.4 完整版
+# app.py — OKX 多币种策略引擎 v3.6 完整版
 # ============================================================
-# 架构原则:
-#   1. 交易所是唯一账本: 持仓/均价/手续费/日盈亏 启动时从OKX实时数据重建
-#   2. 全实时数据: 价格/K线/余额/成交一律API, 虚拟数字仅存在于DRY_RUN模拟
-#   3. 自诊断: 引擎异常/API失败/行情停滞/对账差异 → 主动报警, 不等用户发现
-#   4. Fail-Safe: 余额或行情不可得 → 暂停交易, 绝不用旧数据硬撑
+# 数据铁律 (全链路无任何假设值):
+#   1. 余额/价格/K线/指标/盘口/费率/成交记录 → 一律OKX实时API
+#   2. 网格每格记录真实买入成交价; 回合盈亏 = 真实卖价−真实买价−双边真实手续费
+#   3. 模拟模式成交价 = 真实盘口一档价(卖吃bid/买吃ask); 手续费 = 真实费率
+#   4. 重启重建: 持仓/均价/每格买价/日盈亏 全部从交易所成交记录回放
+#   5. 日切不清零 → 重新查询当日真实成交
+#   6. DRY_RUN唯一作用: 拦截发往交易所的订单
 # ============================================================
 import os, time, json, math, hmac, base64, hashlib, threading, requests
 from datetime import datetime, timezone
 from flask import Flask, jsonify
 
-# ===== 配置: 只有密钥与开关, 无资金参数 (资金一律实时API) =====
 TG_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 API_KEY   = os.environ.get("OKX_API_KEY", "")
 SECRET    = os.environ.get("OKX_SECRET_KEY", "")
 PASSPHR   = os.environ.get("OKX_PASSPHRASE", "")
 DRY_RUN   = os.environ.get("DRY_RUN", "1") == "1"
-DRY_FUNDS = float(os.environ.get("DRY_FUNDS", "300"))          # 仅模拟模式用
-COIN_PATH = os.environ.get("STATE_PATH", "/tmp/coins.json")    # 仅存币种列表
-FEE_EST   = 0.002   # 仅模拟模式估算; 实盘一律用成交回查的真实fee
+COIN_PATH = os.environ.get("STATE_PATH", "/tmp/coins.json")   # 仅存币种列表(用户配置)
 TG  = f"https://api.telegram.org/bot{TG_TOKEN}"
 OKX = "https://www.okx.com"
 
@@ -27,33 +26,27 @@ def log(*a):
     print(datetime.now().strftime("%d日%H:%M:%S"), *a, flush=True)
 
 # ============================================================
-# Telegram 发送 (带限流: >18条/分钟 自动合并为摘要)
+# Telegram (限流合并)
 # ============================================================
 TG_LOCK = threading.Lock()
-TG_SENT_TS = []      # 最近发送时间戳
-TG_PENDING = []      # 被限流暂存的消息
-
-def _tg_post(payload):
-    try: requests.post(f"{TG}/sendMessage", json=payload, timeout=15)
-    except Exception as e: log("tg:", e)
+TG_SENT_TS, TG_PENDING = [], []
 
 def tg_send(text, kb=None, edit=None):
-    if edit:  # 编辑消息不占发送配额
+    if edit:
         try:
-            requests.post(f"{TG}/editMessageText",
-                json={"chat_id": CHAT_ID, "message_id": edit, "text": text,
-                      "parse_mode": "HTML",
-                      **({"reply_markup": {"inline_keyboard": kb}} if kb else {})},
-                timeout=15)
+            p = {"chat_id": CHAT_ID, "message_id": edit, "text": text,
+                 "parse_mode": "HTML"}
+            if kb: p["reply_markup"] = {"inline_keyboard": kb}
+            requests.post(f"{TG}/editMessageText", json=p, timeout=15)
         except Exception as e: log("tg edit:", e)
         return
     now = time.time()
     with TG_LOCK:
         TG_SENT_TS[:] = [t for t in TG_SENT_TS if now - t < 60]
-        if len(TG_SENT_TS) >= 18:                    # 触发限流
+        if len(TG_SENT_TS) >= 18:
             TG_PENDING.append(text)
             if len(TG_PENDING) >= 5:
-                merged = "📨 <b>高频成交摘要</b>\n" + "\n".join(TG_PENDING[-5:])
+                merged = "📨 <b>高频消息摘要</b>\n" + "\n".join(TG_PENDING[-5:])
                 TG_PENDING.clear()
             else:
                 return
@@ -62,7 +55,8 @@ def tg_send(text, kb=None, edit=None):
             merged = text
     p = {"chat_id": CHAT_ID, "text": merged, "parse_mode": "HTML"}
     if kb: p["reply_markup"] = {"inline_keyboard": kb}
-    _tg_post(p)
+    try: requests.post(f"{TG}/sendMessage", json=p, timeout=15)
+    except Exception as e: log("tg:", e)
 
 def btn(t, d): return {"text": t, "callback_data": d}
 
@@ -90,21 +84,21 @@ def okx(method, path, params=None, body=None):
             r = requests.request(method, OKX + full, headers=headers,
                                  data=body_s or None, timeout=15)
             j = r.json()
-            if j.get("code") != "0":
-                SELF.api_fail(path) if "SELF" in globals() else None
+            if j.get("code") != "0" and "SELF" in globals():
+                SELF.api_fail(path)
             return j
         except Exception:
             time.sleep(2)
     return {"code": "-1", "msg": "网络错误"}
 
 def place_market(inst, side, sz):
-    """市价单. sz统一为币本位数量 (买单显式指定tgtCcy=base_ccy)"""
+    """DRY_RUN唯一作用点: 模拟→不发真实订单"""
     if DRY_RUN:
         return {"code": "0", "ordId": f"DRY{int(time.time()*1000)}"}
     body = {"instId": inst, "tdMode": "cash", "side": side,
             "ordType": "market", "sz": str(sz)}
     if side == "buy":
-        body["tgtCcy"] = "base_ccy"   # 🆕 关键: 买单sz按币数量, 与卖单语义一致
+        body["tgtCcy"] = "base_ccy"
     r = okx("POST", "/api/v5/trade/order", body=body)
     if r.get("code") == "0" and r.get("data"):
         r["ordId"] = r["data"][0].get("ordId", "")
@@ -118,8 +112,19 @@ def get_price(inst):
     except Exception: pass
     return None
 
+def get_book_px(inst, side):
+    """真实盘口一档价: 卖吃bid / 买吃ask — 模拟模式成交价来源"""
+    try:
+        r = requests.get(f"{OKX}/api/v5/market/books",
+            params={"instId": inst, "sz": "1"}, timeout=10).json()
+        if r.get("code") == "0" and r.get("data"):
+            b = r["data"][0]
+            return (float(b["bids"][0][0]) if side == "sell"
+                    else float(b["asks"][0][0]))
+    except Exception: pass
+    return None
+
 def fetch_instrument(inst):
-    """一次性取最小下单量/数量步长, 缓存在Strategy上"""
     try:
         r = requests.get(f"{OKX}/api/v5/public/instruments",
             params={"instType": "SPOT", "instId": inst}, timeout=10).json()
@@ -130,7 +135,7 @@ def fetch_instrument(inst):
     return None, None
 
 # ============================================================
-# 指标层 + 缓存 (消灭限频炸弹)
+# 指标层 + 缓存
 # ============================================================
 class Indicators:
     @staticmethod
@@ -197,17 +202,14 @@ class Indicators:
         cs = cls.get_candles(inst, bar, period)
         if len(cs) < period: return None
         rets = [(cs[i-1][3] - cs[i][3]) / cs[i][3] for i in range(1, len(cs))]
-        var, lam = 0.0, 0.94
-        w = 1 - lam
+        var, lam, w = 0.0, 0.94, 0.06
         for r in rets:
             var = lam * var + w * r * r
         return math.sqrt(var)
 
 class IndicatorCache:
-    """日线指标缓存5分钟 — 消除每10秒循环的重复请求"""
     TTL = 300
     _c = {}
-
     @classmethod
     def get(cls, fn, inst, bar="1D", *args):
         key = (inst, fn.__name__, bar, args)
@@ -262,7 +264,7 @@ class DynamicParams:
         return p["dip"], p["rally"], p["coef"]
 
 # ============================================================
-# 实时余额 (资金唯一真源)
+# 实时余额 — 资金唯一真源 (任何模式)
 # ============================================================
 class LiveBalance:
     TTL = 30
@@ -277,9 +279,9 @@ class LiveBalance:
         if r.get("code") == "0" and r.get("data"):
             for d in (r["data"][0].get("details") or []):
                 if d.get("ccy") == "USDT":
-                    self._cache = {"avail": float(d.get("availEq") or 0),
-                                   "eq":    float(d.get("eq") or 0),
-                                   "frozen":float(d.get("frozenBal") or 0)}
+                    self._cache = {"avail":  float(d.get("availEq") or 0),
+                                   "eq":     float(d.get("eq") or 0),
+                                   "frozen": float(d.get("frozenBal") or 0)}
                     self._ts, self.last_err = now, None
                     return self._cache
         self.last_err = r.get("msg", "unknown")
@@ -299,23 +301,204 @@ class LiveBalance:
 LIVE = LiveBalance()
 
 def get_funds():
-    """模拟→虚拟值(标注🧪) / 实盘→强制实时API, 失败返回None触发Fail-Safe"""
-    if DRY_RUN:
-        return {"avail": DRY_FUNDS, "eq": DRY_FUNDS, "frozen": 0}, "🧪模拟"
+    """任何模式都查真实API, 无虚拟分支. 失败→None触发Fail-Safe"""
     bal = LIVE.get()
     return (bal, "🟢实时") if bal else (None, "⚠️API失败")
+
+# ============================================================
+# 真实费率 (从你的历史成交推导)
+# ============================================================
+class FeeProfile:
+    _rate, _ts = None, 0
+    @classmethod
+    def rate(cls):
+        if cls._rate and time.time() - cls._ts < 86400:
+            return cls._rate
+        try:
+            r = okx("GET", "/api/v5/trade/fills-history",
+                    params={"instType": "SPOT", "limit": "50"})
+            notional, fees = 0.0, 0.0
+            if r.get("code") == "0":
+                for f in r.get("data", []):
+                    notional += float(f["fillPx"]) * float(f["fillSz"])
+                    fees += abs(float(f["fee"]))
+            if notional > 0:
+                cls._rate, cls._ts = fees / notional, time.time()
+                return cls._rate
+        except Exception: pass
+        return None   # 无历史成交→诚实返回None
+
+# ============================================================
+# 真实成交引擎 (回查/分页/持仓与买价重建)
+# ============================================================
+class FillEngine:
+    @staticmethod
+    def get_fill(ord_id, inst):
+        """实盘: 回查订单真实成交均价与实扣手续费"""
+        time.sleep(1)
+        r = okx("GET", "/api/v5/trade/fills",
+                params={"instId": inst, "ordId": ord_id})
+        if r.get("code") != "0" or not r.get("data"): return None
+        fills = r["data"]
+        total_sz = sum(float(f["fillSz"]) for f in fills)
+        if total_sz == 0: return None
+        avg_px = sum(float(f["fillPx"]) * float(f["fillSz"]) for f in fills) / total_sz
+        fee = sum(abs(float(f["fee"])) for f in fills)
+        return {"px": avg_px, "sz": total_sz, "fee": fee}
+
+    @staticmethod
+    def fills_paged(inst, pages=3, limit=100):
+        """分页拉取成交记录(3页≈300笔), 时间倒序去重 — 用于重建每格真实买价"""
+        out, seen = [], set()
+        for ep in ("/api/v5/trade/fills", "/api/v5/trade/fills-history"):
+            after = None
+            for _ in range(pages):
+                params = {"instType": "SPOT", "instId": inst, "limit": str(limit)}
+                if after: params["after"] = after
+                r = okx("GET", ep, params=params)
+                if r.get("code") != "0": break
+                rows = r.get("data", [])
+                if not rows: break
+                for f in rows:
+                    if f["billId"] not in seen:
+                        seen.add(f["billId"])
+                        out.append(f)
+                after = rows[-1]["billId"]
+        out.sort(key=lambda f: int(f["ts"]), reverse=True)
+        return out
+
+class PositionAudit:
+    @staticmethod
+    def real_ccy(ccy):
+        r = okx("GET", "/api/v5/account/balance", params={"ccy": ccy})
+        if r.get("code") == "0" and r.get("data"):
+            for d in (r["data"][0].get("details") or []):
+                if d.get("ccy") == ccy:
+                    return (float(d.get("availEq") or 0)
+                            + float(d.get("frozenBal") or 0))
+        return None
+
+    @staticmethod
+    def audit(st):
+        real = PositionAudit.real_ccy(st.inst.split("-")[0])
+        if real is None or not st.g["sz"]: return None, real
+        mem = st.s["pos"] + sum(d["qty"] for d in st.g["inv"].values()) * st.g["sz"]
+        return round(real - mem, 8), real
+
+class RebuildEngine:
+    """启动重建: 持仓/均价/每格真实买价/日盈亏 全部从交易所回放"""
+
+    @classmethod
+    def rebuild_swing(cls, inst):
+        ccy = inst.split("-")[0]
+        real = PositionAudit.real_ccy(ccy)
+        if not real or real <= 0:
+            return {"pos": 0.0, "entry_avg": None}
+        pos, cost, seen = 0.0, 0.0, set()
+        for f in FillEngine.fills_paged(inst, pages=2):
+            if f["ordId"] in seen: continue
+            seen.add(f["ordId"])
+            sz = float(f["fillSz"])
+            if f["side"] == "buy":
+                pos += sz
+                cost += sz * float(f["fillPx"])
+                if pos >= real * 0.999: break
+        avg = round(cost / pos, 2) if pos >= real * 0.999 and pos > 0 else None
+        return {"pos": real, "entry_avg": avg}
+
+    @classmethod
+    def rebuild_grid(cls, st):
+        """从真实成交回放每格买价: 每笔买入按最近格线归位"""
+        if st.g["step"] is None:
+            st.g["step"] = DynamicParams.grid_step(st.inst)
+        if st.g["step"] is None or st.g["lo"] is None: return
+        ccy = st.inst.split("-")[0]
+        real = PositionAudit.real_ccy(ccy)
+        if real is None: return
+        grid_amt = real - st.s["pos"]
+        units = int(grid_amt / st.g["sz"]) if st.g["sz"] > 0 else 0
+        st.g["inv"] = {}
+        if units <= 0: return
+        # 回放买入成交, 按真实买价归位到最近格线
+        filled = 0
+        for f in FillEngine.fills_paged(st.inst, pages=3):
+            if filled >= units: break
+            if f["side"] != "buy": continue
+            px = float(f["fillPx"])
+            line = round((px - st.g["lo"]) / st.g["step"])
+            if line < 0 or line > st.g["n"]: continue
+            if line in st.g["inv"]: continue
+            st.g["inv"][line] = {"qty": 1, "buy_px": px,
+                                 "fee": abs(float(f["fee"]))}
+            filled += 1
+        if filled < units:
+            tg_send(f"⚠️ {st.inst} 网格重建: {filled}/{units}格找到真实买价\n"
+                    f"其余{units-filled}格成交记录已超分页深度, 请核查")
+        log(f"📦 {st.inst} 网格重建: {filled}格(含真实买价)")
+
+    @classmethod
+    def refresh_daily_pnl(cls):
+        """日盈亏 = 当日真实成交回放 (现金流口径: 卖出所得−买入支出)"""
+        pnl = 0.0
+        for inst in list(STRATS.keys()):
+            for f in FillEngine.fills_paged(inst, pages=1):
+                if time.time() - int(f["ts"])/1000 > 86400: break
+                v = float(f["fillPx"]) * float(f["fillSz"])
+                pnl += (v + abs(float(f["fee"]))) if f["side"] == "sell" else -v
+        RISK.daily_pnl = round(pnl, 2)
+        return RISK.daily_pnl
+
+    @classmethod
+    def full_rebuild(cls):
+        report = []
+        with STRATS_LOCK:
+            for inst, st in STRATS.items():
+                s = cls.rebuild_swing(inst)
+                st.s["pos"] = s["pos"]
+                st.s["entry_avg"] = s["entry_avg"]
+                if s["pos"] > 0 and s["entry_avg"]:
+                    st.s["trail_stop"] = s["entry_avg"] * 0.95
+                cls.rebuild_grid(st)
+                diff, real = PositionAudit.audit(st)
+                ok_ = diff is not None and abs(diff) < 0.00001
+                n_px = sum(1 for d in st.g["inv"].values() if d["buy_px"])
+                report.append(f"{'✅' if ok_ else '⚠️'} {inst}: "
+                              f"低吸{s['pos']} 网格{len(st.g['inv'])}格"
+                              f"(真实买价{n_px}) 交易所={real}")
+        pnl = cls.refresh_daily_pnl()
+        tg_send("📦 <b>启动重建完成</b> (数据源: 交易所实时成交记录)\n\n"
+                + ("\n".join(report) or "无币种")
+                + f"\n当日真实盈亏: {pnl:+.2f}U")
+
+class ConfigStore:
+    """仅持久化币种列表(用户配置); 账本类状态一律交易所重建"""
+    @staticmethod
+    def save_coins():
+        try: json.dump(list(STRATS.keys()), open(COIN_PATH, "w"))
+        except Exception: pass
+
+    @staticmethod
+    def load_coins():
+        try:
+            if os.path.exists(COIN_PATH):
+                for inst in json.load(open(COIN_PATH)):
+                    add_symbol(inst, notify=False)
+                log(f"📦 币种列表已恢复: {list(STRATS.keys())}")
+        except Exception as e: log("coins load:", e)
 
 # ============================================================
 # 多币种注册表 (线程安全)
 # ============================================================
 STRATS = {}
 STRATS_LOCK = threading.RLock()
+TOTAL_AVAIL = 0.0
 
 class Strategy:
     def __init__(self, inst):
         self.inst = inst
         self.cap = 0.0
         self.min_sz, self.lot_sz = fetch_instrument(inst)
+        # inv 结构: {line: {"qty": int, "buy_px": 真实买价, "fee": 真实买侧手续费}}
         self.g = {"running": False, "lo": None, "hi": None, "n": 10,
                   "sz": None, "max_inv": 10, "step": None, "last_iv": None,
                   "inv": {}, "rounds": 0, "fees": 0.0,
@@ -328,10 +511,8 @@ class Strategy:
         return self.s["pos"] > 0 or bool(self.g["inv"])
 
     def autofit(self, price):
-        """按资金适配每格数量; 有持仓时冻结参数防账本污染"""
         if price <= 0: return
-        if self.has_holding():
-            return
+        if self.has_holding(): return
         sz = self.cap * 0.6 / self.g["max_inv"] / price
         if self.min_sz and sz < self.min_sz:
             sz = self.min_sz
@@ -345,14 +526,6 @@ def round_to_lot(st, amt):
     if st.lot_sz:
         return round(math.floor(amt / st.lot_sz) * st.lot_sz, 8)
     return round(amt, 8)
-
-def _redistribute():
-    n = len(STRATS)
-    if n == 0: return
-    for st in STRATS.values():
-        st.cap = TOTAL_AVAIL * 0.9 / n
-
-TOTAL_AVAIL = 0.0   # 实时可用USDT, 每轮主循环刷新
 
 def add_symbol(inst, notify=True):
     inst = inst.strip().upper()
@@ -371,7 +544,7 @@ def add_symbol(inst, notify=True):
     ConfigStore.save_coins()
     msg = (f"✅ <b>已添加 {inst}</b>\n"
            f"区间: {st.g['lo']:,}~{st.g['hi']:,}\n"
-           f"每格: {st.g['sz']} (最小{st.min_sz}) · 格数上限{st.g['max_inv']}\n"
+           f"每格: {st.g['sz']} (最小{st.min_sz}) 格数上限{st.g['max_inv']}\n"
            f"发 <code>start {inst}</code> 启动")
     if notify: tg_send(msg)
     return msg
@@ -382,7 +555,7 @@ def del_symbol(inst, notify=True):
         st = STRATS.get(inst)
         if not st: return f"❌ {inst} 不在列表"
         if st.has_holding():
-            return (f"⚠️ {inst} 有持仓\n先发 <code>close {inst}</code>")
+            return f"⚠️ {inst} 有持仓, 先发 <code>close {inst}</code>"
         del STRATS[inst]
     ConfigStore.save_coins()
     if notify: tg_send(f"🗑️ {inst} 已移除")
@@ -399,17 +572,21 @@ def close_symbol(inst, notify=True):
             if amt > 0:
                 r = place_market(inst, "sell", amt)
                 if r.get("code") == "0":
-                    msgs.append(f"平低吸{amt}")
-                    st.s.update({"pos": 0, "layers": [], "layer_idx": 0,
-                                 "entry_avg": None, "trail_stop": None})
-        units = sum(st.g["inv"].values())
+                    s = _settle(r, st, "sell", amt)
+                    if s:
+                        msgs.append(f"平低吸{amt}@{s['px']:,.2f}")
+                        st.s.update({"pos": 0, "layers": [], "layer_idx": 0,
+                                     "entry_avg": None, "trail_stop": None})
+        units = sum(d["qty"] for d in st.g["inv"].values())
         if units > 0 and st.g["sz"]:
             amt = round_to_lot(st, units * st.g["sz"])
             if amt > 0:
                 r = place_market(inst, "sell", amt)
                 if r.get("code") == "0":
-                    msgs.append(f"平网格{units}格")
-                    st.g["inv"] = {}
+                    s = _settle(r, st, "sell", amt)
+                    if s:
+                        msgs.append(f"平网格{units}格@{s['px']:,.2f}")
+                        st.g["inv"] = {}
     msg = "✅ " + " | ".join(msgs) if msgs else "ℹ️ 无持仓"
     if notify: tg_send(msg)
     return msg
@@ -441,7 +618,7 @@ def stop_symbol(inst):
     return "ok"
 
 # ============================================================
-# 三层风控 (以实时权益为基准)
+# 三层风控 (实时权益基准)
 # ============================================================
 class RiskEngine:
     def __init__(self):
@@ -453,10 +630,13 @@ class RiskEngine:
         self.live_funds = None
 
     def reset_daily(self):
+        """日切: 重新查询当日真实成交, 不清零装作没发生"""
         today = datetime.now().date()
         if today != self.daily_date:
-            self.daily_date, self.daily_pnl = today, 0.0
+            self.daily_date = today
             self.L3_daily_stop = False
+            try: RebuildEngine.refresh_daily_pnl()
+            except Exception: pass
 
     def update_funds(self, bal):
         if bal: self.live_funds = bal["eq"]
@@ -470,7 +650,7 @@ class RiskEngine:
         if total < -self.live_funds * 0.08 and not self.L2_float_stop:
             self.L2_float_stop = True
             tg_send(f"🛡️ <b>L2浮亏熔断</b> {total:.2f}U "
-                    f"(权益{self.live_funds:.0f}U的8%)")
+                    f"(实时权益{self.live_funds:.0f}U的8%)")
         if self.daily_pnl < -self.live_funds * 0.04 and not self.L3_daily_stop:
             self.L3_daily_stop = True
             tg_send(f"🛑 <b>L3日亏熔断</b> {self.daily_pnl:.2f}U, 停机至明日")
@@ -488,146 +668,30 @@ class RiskEngine:
 RISK = RiskEngine()
 
 # ============================================================
-# 真实成交引擎 (成交回查/记录合并/持仓重建)
+# 统一结算 — 两个模式都用真实市场数据
 # ============================================================
-class FillEngine:
-    @staticmethod
-    def get_fill(ord_id, inst):
-        """下单后回查真实成交价与真实手续费"""
-        time.sleep(1)
-        r = okx("GET", "/api/v5/trade/fills",
-                params={"instId": inst, "ordId": ord_id})
-        if r.get("code") != "0" or not r.get("data"): return None
-        fills = r["data"]
-        total_sz = sum(float(f["fillSz"]) for f in fills)
-        if total_sz == 0: return None
-        avg_px = sum(float(f["fillPx"]) * float(f["fillSz"]) for f in fills) / total_sz
-        fee = sum(abs(float(f["fee"])) for f in fills)
-        return {"px": avg_px, "sz": total_sz, "fee": fee}
-
-    @staticmethod
-    def fills_all(inst, limit=100):
-        """合并近3日成交 + 历史成交, 按时间倒序去重"""
-        out, seen = [], set()
-        for ep in ("/api/v5/trade/fills", "/api/v5/trade/fills-history"):
-            r = okx("GET", ep, params={"instType": "SPOT", "instId": inst,
-                                       "limit": str(limit)})
-            if r.get("code") == "0":
-                for f in r.get("data", []):
-                    if f["billId"] not in seen:
-                        seen.add(f["billId"])
-                        out.append(f)
-        out.sort(key=lambda f: int(f["ts"]), reverse=True)
-        return out
-
-class PositionAudit:
-    @staticmethod
-    def real_ccy(ccy):
-        r = okx("GET", "/api/v5/account/balance", params={"ccy": ccy})
-        if r.get("code") == "0" and r.get("data"):
-            for d in (r["data"][0].get("details") or []):
-                if d.get("ccy") == ccy:
-                    return (float(d.get("availEq") or 0)
-                            + float(d.get("frozenBal") or 0))
+def _settle(r, st, side, sz):
+    """
+    模拟: 真实盘口一档价 + 真实费率(成交记录推导)
+    实盘: 真实成交回查(实际成交均价 + OKX实扣手续费)
+    """
+    if DRY_RUN:
+        px = get_book_px(st.inst, side)
+        if px is None:
+            tg_send(f"🚨 {st.inst} 盘口不可得, 成交取消(Fail-Safe)")
+            return None
+        rate = FeeProfile.rate()
+        return {"px": px, "fee": px * sz * rate if rate else 0.0}
+    fill = FillEngine.get_fill(r.get("ordId"), st.inst)
+    if fill is None:
+        tg_send(f"🚨 <b>{st.inst} 成交回查失败</b>\n订单{r.get('ordId')}\n"
+                f"该币种已停机, 请人工核对!")
+        st.g["running"] = False; st.s["running"] = False
         return None
-
-    @staticmethod
-    def audit(st):
-        real = PositionAudit.real_ccy(st.inst.split("-")[0])
-        if real is None or not st.g["sz"]: return None, real
-        mem = st.s["pos"] + sum(st.g["inv"].values()) * st.g["sz"]
-        return round(real - mem, 8), real
-
-class RebuildEngine:
-    """启动重建: 一切状态从交易所实时数据推导"""
-    @classmethod
-    def rebuild_swing(cls, inst):
-        ccy = inst.split("-")[0]
-        real = PositionAudit.real_ccy(ccy)
-        if not real or real <= 0:
-            return {"pos": 0.0, "entry_avg": None}
-        pos, cost, seen = 0.0, 0.0, set()
-        for f in FillEngine.fills_all(inst):
-            if f["ordId"] in seen: continue
-            seen.add(f["ordId"])
-            sz = float(f["fillSz"])
-            if f["side"] == "buy":
-                pos += sz
-                cost += sz * float(f["fillPx"])
-                if pos >= real * 0.999: break
-        avg = round(cost / pos, 2) if pos >= real * 0.999 and pos > 0 else None
-        return {"pos": real, "entry_avg": avg}
-
-    @classmethod
-    def rebuild_grid(cls, st):
-        if st.g["step"] is None:
-            st.g["step"] = DynamicParams.grid_step(st.inst)
-        if st.g["step"] is None or not st.g["sz"]: return
-        ccy = st.inst.split("-")[0]
-        real = PositionAudit.real_ccy(ccy)
-        if real is None: return
-        grid_amt = real - st.s["pos"]
-        units = int(grid_amt / st.g["sz"]) if st.g["sz"] > 0 else 0
-        st.g["inv"] = {}
-        if units > 0:
-            p = get_price(st.inst)
-            if p is None: return
-            cur = _iv(st, p)
-            for k in range(cur, min(cur + units, st.g["n"])):
-                st.g["inv"][k] = 1
-        log(f"📦 {st.inst} 网格重建: {units}格")
-
-    @classmethod
-    def rebuild_daily_pnl(cls):
-        pnl = 0.0
-        for inst in list(STRATS.keys()):
-            for f in FillEngine.fills_all(inst, 50):
-                if time.time() - int(f["ts"])/1000 > 86400: break
-                v = float(f["fillPx"]) * float(f["fillSz"])
-                pnl += (v + abs(float(f["fee"]))) if f["side"] == "sell" else -v
-        RISK.daily_pnl = round(pnl, 2)
-        return RISK.daily_pnl
-
-    @classmethod
-    def full_rebuild(cls):
-        report = []
-        with STRATS_LOCK:
-            for inst, st in STRATS.items():
-                s = cls.rebuild_swing(inst)
-                st.s["pos"] = s["pos"]
-                st.s["entry_avg"] = s["entry_avg"]
-                if s["pos"] > 0 and s["entry_avg"]:
-                    st.s["trail_stop"] = s["entry_avg"] * 0.95
-                cls.rebuild_grid(st)
-                diff, real = PositionAudit.audit(st)
-                ok_ = diff is not None and abs(diff) < 0.00001
-                report.append(f"{'✅' if ok_ else '⚠️'} {inst}: "
-                              f"低吸{s['pos']} 网格{sum(st.g['inv'].values())}格 "
-                              f"交易所={real}")
-        pnl = cls.rebuild_daily_pnl()
-        tg_send("📦 <b>启动重建完成</b> (数据源: 交易所实时)\n\n"
-                + ("\n".join(report) or "无币种")
-                + f"\n今日已实现盈亏: {pnl:+.2f}U")
-
-class ConfigStore:
-    """仅持久化币种列表(配置); 运行状态一律交易所重建"""
-    @staticmethod
-    def save_coins():
-        try:
-            json.dump(list(STRATS.keys()), open(COIN_PATH, "w"))
-        except Exception: pass
-
-    @staticmethod
-    def load_coins():
-        try:
-            if os.path.exists(COIN_PATH):
-                for inst in json.load(open(COIN_PATH)):
-                    add_symbol(inst, notify=False)
-                log(f"📦 币种列表已恢复: {list(STRATS.keys())}")
-        except Exception as e: log("coins load:", e)
+    return fill
 
 # ============================================================
-# 自诊断系统 (主动发现问题)
+# 自诊断 + 心跳
 # ============================================================
 class SelfCheck:
     def __init__(self):
@@ -661,21 +725,21 @@ class SelfCheck:
         issues = []
         if LIVE.get() is None:
             issues.append(f"❌ 余额API失败: {LIVE.last_err}")
-        for inst, st in STRATS.items():
-            if st.g["running"] and time.time() - st.g["last_px_ts"] > 300:
-                issues.append(f"⚠️ {inst} 行情超5分钟未更新")
-            diff, real = PositionAudit.audit(st)
-            if diff is not None and abs(diff) > 0.00001:
-                issues.append(f"⚠️ {inst} 对账差异{diff} (交易所{real})")
+        with STRATS_LOCK:
+            for inst, st in STRATS.items():
+                if st.g["running"] and time.time() - st.g["last_px_ts"] > 300:
+                    issues.append(f"⚠️ {inst} 行情超5分钟未更新")
+                diff, real = PositionAudit.audit(st)
+                if diff is not None and abs(diff) > 0.00001:
+                    issues.append(f"⚠️ {inst} 对账差异{diff} (交易所{real})")
         if issues:
             tg_send("🩺 <b>自诊断报告</b>\n" + "\n".join(issues))
 
 SELF = SelfCheck()
-
-HEARTBEAT = {"ts": time.time()}   # 看狗线程监控用
+HEARTBEAT = {"ts": time.time()}
 
 # ============================================================
-# 网格引擎 (每币种独立)
+# 网格引擎 — 每格真实买价, 回合盈亏=真实卖价−真实买价−双边费
 # ============================================================
 PYRAMID_LAYERS = [{"trigger": 0.03,  "mult": 1.0},
                   {"trigger": 0.05,  "mult": 1.5},
@@ -695,10 +759,9 @@ def grid_tick(st):
     if st.g["step"] is None:
         st.g["step"] = DynamicParams.grid_step(st.inst)
         if st.g["step"] is None: return
-    # 格距刷新: 仅空仓时 (持仓中改格距会错位)
     if not st.g["inv"] and time.time() - st.g["last_step_ts"] > 21600:
         new_step = DynamicParams.grid_step(st.inst)
-        if new_step and abs(new_step - (st.g["step"] or 0)) / max(st.g["step"],1) > 0.2:
+        if new_step and abs(new_step - (st.g["step"] or 0)) / max(st.g["step"], 1) > 0.2:
             st.g["step"] = new_step
             tg_send(f"📊 {st.inst} ATR格距→{new_step:.0f}")
         st.g["last_step_ts"] = time.time()
@@ -707,54 +770,54 @@ def grid_tick(st):
     cur, last = _iv(st, p), st.g["last_iv"]
     if cur == last: return
     state = MarketState.detect(st.inst)
-    grid_float = sum((p - st.g["lo"] - k*st.g["step"]) * v
-                     for k, v in st.g["inv"].items()) * (st.g["sz"] or 0)
+    # 🆕 浮亏用每格真实买价计算
+    grid_float = sum((p - d["buy_px"]) * d["qty"]
+                     for d in st.g["inv"].values()) * (st.g["sz"] or 0)
     if not RISK.check(grid_float, 0): return
-    if cur < last and state != "TREND_DOWN":        # 跌穿→买
+    if cur < last and state != "TREND_DOWN":
         line = last
-        if (st.g["inv"].get(line, 0) == 0
-                and sum(st.g["inv"].values()) < st.g["max_inv"]
+        if (line not in st.g["inv"]
+                and sum(d["qty"] for d in st.g["inv"].values()) < st.g["max_inv"]
                 and st.g["sz"] and st.g["sz"] * p <= st.cap):
-            _g_trade(st, "buy", line, p)
-    elif cur > last:                                 # 升穿→卖
-        if st.g["inv"].get(last, 0) > 0:
-            _g_trade(st, "sell", last, p)
+            _g_trade(st, "buy", line)
+    elif cur > last:
+        if last in st.g["inv"]:
+            _g_trade(st, "sell", last)
     st.g["last_iv"] = cur
 
-def _settle(r, st, sz, px_assumed):
-    """模拟→假设价 / 实盘→强制真实成交回查, 失败则停机报警"""
-    if DRY_RUN:
-        return {"px": px_assumed, "fee": px_assumed * sz * FEE_EST}
-    fill = FillEngine.get_fill(r.get("ordId"), st.inst)
-    if fill is None:
-        tg_send(f"🚨 <b>{st.inst} 成交回查失败</b>\n订单{r.get('ordId')}\n"
-                f"该币种已停机, 请人工核对!")
-        st.g["running"] = False; st.s["running"] = False
-        return None
-    return fill
-
-def _g_trade(st, side, line, px_assumed):
+def _g_trade(st, side, line):
     r = place_market(st.inst, side, st.g["sz"])
     if r.get("code") != "0":
         tg_send(f"❌ {st.inst} 下单失败: {r.get('msg')}")
         return False
-    s = _settle(r, st, st.g["sz"], px_assumed)
+    s = _settle(r, st, side, st.g["sz"])
     if s is None: return False
     px, fee = s["px"], s["fee"]
     st.g["fees"] += fee
+    tag = "🧪" if DRY_RUN else ("🟢" if side == "buy" else "🔴")
     if side == "buy":
-        st.g["inv"][line] = st.g["inv"].get(line, 0) + 1
-        tg_send(f"🟢 {st.inst} 买 第{line}格 @{px:,.2f}")
+        st.g["inv"][line] = {"qty": 1, "buy_px": px, "fee": fee}  # 🆕 记真实买价
+        tg_send(f"{tag} {st.inst} 买 第{line}格 @{px:,.2f} 费{fee:.4f}")
     else:
-        st.g["inv"][line] = st.g["inv"].get(line, 0) - 1
+        d = st.g["inv"].pop(line, None)
+        buy_px = d["buy_px"] if d else None
+        buy_fee = d["fee"] if d else 0.0
         st.g["rounds"] += 1
-        pnl = st.g["step"] * st.g["sz"] - fee
+        if buy_px is not None:
+            # 🆕 回合盈亏 = 真实卖价 − 真实买价 − 双边真实手续费
+            pnl = (px - buy_px) * st.g["sz"] - buy_fee - fee
+        else:
+            # 买价不可考(超历史深度) → 诚实标注, 用现金流卖出所得计
+            pnl = px * st.g["sz"] - fee
+            tg_send(f"⚠️ {st.inst} 第{line}格买价不可考, 本回合按卖出所得计")
         RISK.on_trade(pnl)
-        tg_send(f"🔴 {st.inst} 卖 回合{st.g['rounds']} @{px:,.2f} 净{pnl:+.2f}U")
+        avg_note = f"买{buy_px:,.2f}→卖{px:,.2f}" if buy_px else f"卖{px:,.2f}"
+        tg_send(f"{tag} {st.inst} 卖 回合{st.g['rounds']} {avg_note} "
+                f"净{pnl:+.2f}U")
     return True
 
 # ============================================================
-# 低吸引擎 (金字塔+移动止损, 每币种独立)
+# 低吸引擎 (金字塔+移动止损)
 # ============================================================
 def swing_tick(st):
     if not st.s["running"]: return
@@ -770,7 +833,6 @@ def swing_tick(st):
         SELF.api_fail("rsi"); return
     dip, rally, coef = DynamicParams.swing_params(st.inst)
     dev = (p - st.s["base"]) / st.s["base"]
-    # 移动止损
     if st.s["pos"] > 0 and st.s["trail_stop"]:
         if p <= st.s["trail_stop"]:
             _sw_sell_all(st, p, "移动止损"); return
@@ -779,7 +841,6 @@ def swing_tick(st):
             if new_stop > st.s["trail_stop"]:
                 st.s["trail_stop"] = new_stop
     if time.time() - st.s["last_ts"] < 600: return
-    # 金字塔买入 (RSI日<30 且 4h>40 双确认)
     base_sz = st.cap * 0.12 / p if p > 0 else 0
     if (dev <= -dip and st.s["layer_idx"] < 4
             and rsi_d < 30 and (rsi_4h is None or rsi_4h > 40)):
@@ -796,7 +857,7 @@ def _sw_buy_layer(st, p, sz):
     r = place_market(st.inst, "buy", sz)
     if r.get("code") != "0":
         tg_send(f"❌ {st.inst} 买入失败: {r.get('msg')}"); return
-    s = _settle(r, st, sz, p)
+    s = _settle(r, st, "buy", sz)
     if s is None: return
     px = s["px"]
     st.s["layers"].append((sz, px))
@@ -806,7 +867,8 @@ def _sw_buy_layer(st, p, sz):
     st.s["entry_avg"] = sum(a*b for a, b in st.s["layers"]) / st.s["pos"]
     st.s["trail_stop"] = st.s["entry_avg"] * 0.95
     st.s["base"] = px
-    tg_send(f"🟢 {st.inst} 金字塔第{st.s['layer_idx']}层 {sz} @{px:,.2f} "
+    tag = "🧪" if DRY_RUN else "🟢"
+    tg_send(f"{tag} {st.inst} 金字塔第{st.s['layer_idx']}层 {sz} @{px:,.2f} "
             f"均价{st.s['entry_avg']:,.2f} 止损{st.s['trail_stop']:,.2f}")
 
 def _sw_sell_all(st, p, reason):
@@ -816,12 +878,13 @@ def _sw_sell_all(st, p, reason):
     r = place_market(st.inst, "sell", amt)
     if r.get("code") != "0":
         tg_send(f"❌ {st.inst} 卖出失败: {r.get('msg')}"); return
-    s = _settle(r, st, amt, p)
+    s = _settle(r, st, "sell", amt)
     if s is None: return
     pnl = (s["px"] - (st.s["entry_avg"] or s["px"])) * amt - s["fee"]
     RISK.on_trade(pnl)
     st.s["pnl_7d"] += pnl
-    tg_send(f"🔴 {st.inst} 全平[{reason}] @{s['px']:,.2f} 净{pnl:+.2f}U")
+    tag = "🧪" if DRY_RUN else "🔴"
+    tg_send(f"{tag} {st.inst} 全平[{reason}] @{s['px']:,.2f} 净{pnl:+.2f}U")
     st.s.update({"pos": 0, "layers": [], "layer_idx": 0,
                  "entry_avg": None, "trail_stop": None, "base": s["px"],
                  "last_ts": time.time()})
@@ -831,13 +894,19 @@ def _sw_sell_all(st, p, reason):
 # ============================================================
 def page_home():
     bal, tag = get_funds()
-    t = (f"🤖 <b>OKX 多币策略引擎 v3.4</b>\n\n"
-         f"💰 资金: {bal['avail']:.2f}U 可用 {tag}\n"
+    if bal is None:
+        return (f"🤖 <b>v3.6 引擎</b>\n\n⚠️ 余额API失败: {LIVE.last_err}\n"
+                f"Fail-Safe: 交易暂停",
+                [[btn("🔄 重试", "home")]])
+    rate = FeeProfile.rate()
+    t = (f"🤖 <b>OKX 多币策略引擎 v3.6</b>\n\n"
+         f"💰 实时可用: {bal['avail']:.2f}U ({tag})\n"
          f"🪙 币种: {len(STRATS)}个\n"
-         f"📅 日盈亏: {RISK.daily_pnl:+.2f}U\n"
+         f"📅 当日真实盈亏: {RISK.daily_pnl:+.2f}U\n"
          f"🛡️ 熔断: L2{'🔴' if RISK.L2_float_stop else '🟢'} "
          f"L3{'🔴' if RISK.L3_daily_stop else '🟢'}\n"
-         f"🧪 {'模拟DRY_RUN' if DRY_RUN else '⚠️实盘'}")
+         f"{'🧪 模拟(仅拦截下单)' if DRY_RUN else '⚠️ 实盘'}\n"
+         f"费率: {f'{rate*100:.3f}%' if rate else '无历史成交'}")
     kb = [[btn("🪙 币种", "coins"), btn("💰 余额", "bal")],
           [btn("🛡️ 风控", "risk"), btn("🔄 刷新", "home")]]
     return t, kb
@@ -848,16 +917,19 @@ def page_coins():
         for inst, st in STRATS.items():
             p = get_price(inst) or 0
             pos_v = st.s["pos"] * p
+            # 浮亏按真实买价
+            g_float = sum((p - d["buy_px"]) * d["qty"]
+                          for d in st.g["inv"].values()) * (st.g["sz"] or 0) \
+                      if st.g["sz"] else 0
             lines.append(
                 f"<b>{inst}</b> {p:,.2f} {MarketState.label(MarketState.detect(inst))}\n"
                 f"📐{'▶️' if st.g['running'] else '⏸️'}回合{st.g['rounds']} "
-                f"格{sum(st.g['inv'].values())}/{st.g['max_inv']} · "
+                f"格{len(st.g['inv'])}/{st.g['max_inv']} 浮{g_float:+.2f}U · "
                 f"📉{'▶️' if st.s['running'] else '⏸️'}仓{pos_v:.1f}U "
                 f"层{st.s['layer_idx']}/4\n"
                 f"份额{st.cap:.0f}U")
-    body = "\n\n".join(lines) if lines else "暂无币种\n发 <code>add BTC-USDT</code> 添加"
-    t = f"🪙 <b>币种管理</b>\n\n{body}\n\n" \
-        f"命令: add/del/close/start/stop + 币种名"
+    body = "\n\n".join(lines) if lines else "暂无币种\n发 <code>add BTC-USDT</code>"
+    t = f"🪙 <b>币种管理</b>\n\n{body}\n\n命令: add/del/close/start/stop + 币种名"
     return t, [[btn("⬅️ 主页", "home")]]
 
 def page_balance():
@@ -865,16 +937,16 @@ def page_balance():
     if bal is None:
         return (f"❌ 余额查询失败\n{LIVE.last_err}",
                 [[btn("🔄 重试", "bal")], [btn("⬅️ 主页", "home")]])
-    funding = LIVE.get_funding() if not DRY_RUN else 0
+    funding = LIVE.get_funding()
     t = (f"💰 <b>实时账户</b> {tag}\n\n"
          f"总权益: {bal['eq']:.2f} USDT\n"
          f"可用: {bal['avail']:.2f} USDT\n"
          f"冻结: {bal['frozen']:.2f} USDT\n"
-         + (f"资金账户(未划转): {funding:.2f} USDT\n" if not DRY_RUN else "")
-         + f"\n每币份额: {bal['avail']*0.9/max(len(STRATS),1):.1f}U × {len(STRATS)}币\n"
-           f"L2线: {bal['eq']*0.08:.1f}U / L3线: {bal['eq']*0.04:.1f}U")
+         f"资金账户: {funding if funding is not None else '查询失败'} USDT\n\n"
+         f"每币份额: {bal['avail']*0.9/max(len(STRATS),1):.1f}U × {len(STRATS)}币\n"
+         f"L2线: {bal['eq']*0.08:.1f}U / L3线: {bal['eq']*0.04:.1f}U")
     kb = [[btn("🔄 刷新", "bal")]]
-    if not DRY_RUN and funding and funding > 10:
+    if funding and funding > 10:
         kb.insert(0, [btn(f"⬆️ 划转{funding:.0f}U到交易账户", "tr_all")])
     kb.append([btn("⬅️ 主页", "home")])
     return t, kb
@@ -884,7 +956,7 @@ def page_risk():
          f"L2 浮亏熔断(8%): {'🔴触发' if RISK.L2_float_stop else '🟢正常'}\n"
          f"L3 日亏熔断(4%): {'🔴触发' if RISK.L3_daily_stop else '🟢正常'}\n"
          f"插针暂停: {'是' if time.time()<RISK.event_pause_until else '否'}\n\n"
-         f"今日盈亏: {RISK.daily_pnl:+.2f}U\n"
+         f"当日真实盈亏: {RISK.daily_pnl:+.2f}U (交易所成交回放)\n"
          f"实时权益: {RISK.live_funds or 0:.2f}U\n"
          f"引擎异常计数: {SELF.engine_err}")
     return t, [[btn("🔄 解除L2", "rk_l2"), btn("🔄 解除L3", "rk_l3")],
@@ -912,8 +984,7 @@ def on_cb(data, mid):
 
 def on_text(txt):
     t = txt.strip(); low = t.lower(); parts = t.split()
-    if t in ("/menu", "/start"):
-        tg_send(*page_home()); return
+    if t in ("/menu", "/start"): tg_send(*page_home()); return
     if t == "/coins": tg_send(*page_coins()); return
     if t == "/balance": tg_send(*page_balance()); return
     if t == "/risk": tg_send(*page_risk()); return
@@ -934,7 +1005,7 @@ def on_text(txt):
 _last_audit = 0
 
 def engine_loop():
-    global _last_audit
+    global _last_audit, TOTAL_AVAIL
     threading.current_thread().name = "engine"
     while True:
         try:
@@ -944,7 +1015,6 @@ def engine_loop():
                 log(f"⏸️ 资金不可用({tag}), 本轮跳过")
                 time.sleep(30); continue
             RISK.update_funds(bal)
-            global TOTAL_AVAIL
             TOTAL_AVAIL = bal["avail"]
             with STRATS_LOCK:
                 items = list(STRATS.items())
@@ -953,7 +1023,7 @@ def engine_loop():
                 if abs(st.cap - new_cap) > 0.5:
                     st.cap = new_cap
                     pp = get_price(inst)
-                    if pp: st.autofit(pp)   # 有持仓时autofit自动冻结
+                    if pp: st.autofit(pp)
                 grid_tick(st)
                 swing_tick(st)
             if time.time() - _last_audit > 600:
@@ -970,7 +1040,6 @@ def engine_loop():
         time.sleep(10)
 
 def watchdog_loop():
-    """看门狗: 引擎心跳停止>120秒 → 报警 (线程死亡检测)"""
     alerted = False
     while True:
         try:
@@ -1011,25 +1080,31 @@ app = Flask(__name__)
 def health():
     with STRATS_LOCK:
         coins = {i: {"grid": s.g["running"], "swing": s.s["running"],
-                     "rounds": s.g["rounds"], "pos": s.s["pos"]}
+                     "rounds": s.g["rounds"],
+                     "grid_lines": len(s.g["inv"]),
+                     "pos": s.s["pos"]}
                  for i, s in STRATS.items()}
     return jsonify({"status": "ok", "dry_run": DRY_RUN,
                     "heartbeat_age": round(time.time() - HEARTBEAT["ts"], 1),
-                    "funds": RISK.live_funds, "daily_pnl": RISK.daily_pnl,
+                    "live_funds": RISK.live_funds,
+                    "daily_pnl_real": RISK.daily_pnl,
+                    "fee_rate": FeeProfile.rate(),
                     "risk": {"L2": RISK.L2_float_stop, "L3": RISK.L3_daily_stop},
                     "coins": coins})
 
 if __name__ == "__main__":
-    tg_send("🤖 <b>v3.4 完整版启动</b>\n架构: 交易所即真源 + 全实时数据 + 自诊断")
+    tg_send("🤖 <b>v3.6 启动</b>\n"
+            "数据铁律: 全链路交易所实时数据\n"
+            "回合盈亏=真实买价→真实卖价−双边真实手续费")
     ConfigStore.load_coins()                       # 1. 恢复币种列表
     with STRATS_LOCK:
-        for st in STRATS.values():                 # 2. 每币种就绪区间与格距
+        for st in STRATS.values():                 # 2. 就绪区间/格距
             p = get_price(st.inst)
             if p and not st.g["lo"]:
                 st.g["lo"], st.g["hi"] = round(p*0.9), round(p*1.1)
                 st.autofit(p)
             st.g["step"] = DynamicParams.grid_step(st.inst)
-    RebuildEngine.full_rebuild()                   # 3. 交易所实时数据重建状态
+    RebuildEngine.full_rebuild()                   # 3. 交易所成交记录回放重建
     threading.Thread(target=engine_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=tg_poll_loop, daemon=True).start()
