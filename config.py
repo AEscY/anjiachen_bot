@@ -1,12 +1,14 @@
 # config.py
 import os
 
+
 def get_env(key, required=True, default=None):
     """安全读取环境变量，若为必填项且未配置则抛出明确错误"""
     val = os.environ.get(key, default)
     if required and val is None:
         raise ValueError(f"❌ 缺少必要环境变量: {key}。请检查 Render 面板中的 Environment 配置。")
     return val
+
 
 # ==================== OKX 配置 ====================
 OKX_API_KEY    = get_env("OKX_API_KEY")
@@ -20,12 +22,6 @@ TG_BOT_TOKEN   = get_env("TG_BOT_TOKEN")
 # 处理允许的 Telegram 用户 ID，支持逗号分隔的字符串
 _tg_ids_str    = get_env("TG_ALLOWED_IDS", required=False, default="")
 TG_ALLOWED_IDS = {int(x.strip()) for x in _tg_ids_str.split(",") if x.strip()}
-
-# ==================== GitHub 状态持久化配置 ====================
-GH_TOKEN       = get_env("GH_TOKEN")
-GH_REPO        = get_env("GH_REPO")              # 格式如 "user/okx-trader-state"
-GH_STATE_BRANCH = get_env("GH_STATE_BRANCH", required=False, default="state")
-GH_STATE_PATH  = "state.json"
 
 # ==================== 交易默认值 ====================
 DEFAULT_INST_ID = "BTC-USDT"
