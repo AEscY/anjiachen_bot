@@ -1,46 +1,27 @@
-# okx_client/rest.py
-import okx.Grid as Grid
-import okx.Trade as Trade
-import okx.Account as Account
-from config import OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, OKX_DEMO
+# okx_client/rest.py (在 OKXRest 类中添加)
 
-FLAG = "1" if OKX_DEMO else "0"
+def get_balance(self, ccy="USDT"):
+    """获取账户余额和权益信息"""
+    return self.account.get_account_balance(ccy=ccy)
+    # 对应 GET /api/v5/account/balance[reference:0]
 
-class OKXRest:
-    def __init__(self):
-        self.grid = Grid.GridAPI(OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, False, FLAG)
-        self.trade = Trade.TradeAPI(OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, False, FLAG)
-        self.account = Account.AccountAPI(OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, False, FLAG)
+def get_positions(self, inst_id=None, inst_type="SPOT"):
+    """获取当前持仓"""
+    kwargs = {"instType": inst_type}
+    if inst_id:
+        kwargs["instId"] = inst_id
+    return self.account.get_positions(**kwargs)
+    # 对应 GET /api/v5/account/positions[reference:1]
 
-    # --- 现货网格 ---
-    def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
-        return self.grid.grid_order_algo(
-            instId=inst_id, algoOrdType="grid",
-            maxPx=str(max_px), minPx=str(min_px),
-            gridNum=str(grid_num), quoteSz=str(quote_sz),
-            triggerType="1", runType="1"
-        )
+def get_pending_grids(self, inst_id=None):
+    """获取运行中的网格策略列表"""
+    kwargs = {"algoOrdType": "grid"}
+    if inst_id:
+        kwargs["instId"] = inst_id
+    return self.grid.grid_order_algo_list(**kwargs)
+    # 对应 GET /api/v5/tradingBot/grid/orders-algo-pending[reference:2]
 
-    def stop_grid(self, algo_id, inst_id):
-        return self.grid.grid_stop_algo(
-            algoId=algo_id, instId=inst_id, algoOrdType="grid", stopType="1"
-        )
-
-    def amend_grid(self, algo_id, inst_id, **kwargs):
-        return self.grid.grid_amend_algo(algoId=algo_id, instId=inst_id, **kwargs)
-
-    # --- 现货下单（低吸高卖用）---
-    def market_buy(self, inst_id, quote_sz):
-        return self.trade.place_order(
-            instId=inst_id, tdMode="cash", side="buy",
-            ordType="market", tgtCcy="quote_ccy", sz=str(quote_sz)
-        )
-
-    def market_sell(self, inst_id, base_sz):
-        return self.trade.place_order(
-            instId=inst_id, tdMode="cash", side="sell",
-            ordType="market", sz=str(base_sz)
-        )
-
-    def get_balance(self, ccy="USDT"):
-        return self.account.get_account_balance(ccy=ccy)
+def get_grid_details(self, algo_id, inst_id):
+    """获取指定网格策略的详细信息"""
+    return self.grid.grid_order_algo_details(algoId=algo_id, instId=inst_id)
+    # 对应 GET /api/v5/tradingBot/grid/orders-algo-details[reference:3]
