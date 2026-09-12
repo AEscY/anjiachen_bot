@@ -1,2 +1,6 @@
-flask==3.0.0
-requests==2.31.0
+aiogram>=3.0
+aiogram_dialog>=2.0
+websockets>=12.0
+httpx>=0.27
+python-dotenv>=1.0
+python-okx
