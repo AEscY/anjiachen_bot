@@ -7,15 +7,11 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, MenuButtonCommands, BotCommand
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# ---- 数据库相关导入 ----
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base
-from sqlalchemy_storage import SQLAlchemyStorage
-
-from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, WATCHLIST, DATABASE_URL
+from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, WATCHLIST
 from ui.dialogs import get_dialogs, _last_price
 import ui.dialogs as dlg
 from ui.states import MainSG
@@ -34,20 +30,9 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
 
-# ==================== 数据库初始化 ====================
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    connect_args={"ssl": "require"},
-)
-session_factory = async_sessionmaker(engine, expire_on_commit=False)
-
-Base = declarative_base()
-storage = SQLAlchemyStorage(sessionmaker=session_factory, metadata=Base.metadata)
-
+# 回归内存存储，重启后状态清空，但不影响交易引擎
 bot = Bot(token=TG_BOT_TOKEN)
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(storage=MemoryStorage())
 
 
 # ==================== 行情 / 订单回调 ====================
@@ -210,12 +195,12 @@ async def main():
         logger.info(f"Webhook 已设置: {webhook_full_url}")
     else:
         logger.error("WEBHOOK_URL 未设置！")
-        await alert("⚠️ WEBHOOK_URL 未配置，机器人将无法接收消息")
+        await alert("WEBHOOK_URL 未配置，机器人将无法接收消息")
 
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     await alert(
-        f"部署完成 (持久化存储)\n"
+        f"部署完成\n"
         f"Commit: {commit}\n"
         f"时间: {now}\n"
         f"币种: {', '.join(manager.all_inst_ids())}"
@@ -236,7 +221,6 @@ async def main():
         await priv_ws.close()
         await bot.session.close()
         await runner.cleanup()
-        await engine.dispose()
 
 
 if __name__ == "__main__":
