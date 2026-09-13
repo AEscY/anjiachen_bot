@@ -1,286 +1,204 @@
-# ui/dialogs.py
+# main.py
+import asyncio
 import logging
-from aiogram.types import CallbackQuery, Message
-from aiogram_dialog import Dialog, DialogManager, Window
-from aiogram_dialog.widgets.input import MessageInput
-from aiogram_dialog.widgets.kbd import Button, Back, Column, Select, ScrollingGroup
-from aiogram_dialog.widgets.text import Const, Format
+import os
+from datetime import datetime
 
-from ui.states import MainSG, CoinSG
+from aiohttp import web
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, MenuButtonCommands, BotCommand
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram_dialog import setup_dialogs, DialogManager, StartMode
+
+from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, WATCHLIST
+from ui.dialogs import get_dialogs, _last_price
+import ui.dialogs as dlg
+from ui.states import MainSG
+from okx_client.ws_public import PublicWS
+from okx_client.ws_private import PrivateWS
 from strategies.manager import StrategyManager
+from notifier import alert
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============ 全局引用（由 main.py 注入） ============
-MANAGER: "StrategyManager | None" = None
-PUB_WS = None                    # PublicWS 实例，用于动态订阅/退订
-_last_price: dict = {}
+bot = Bot(token=TG_BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
 
-# ==================== 主菜单回调 ====================
-async def on_coin_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
-    manager.dialog_data["inst_id"] = item_id
-    await manager.start(CoinSG.panel)
+# ==================== 行情 / 订单回调 ====================
+async def on_ticker(inst_id: str, price: float, raw: dict):
+    _last_price[inst_id] = price
+    if dlg.MANAGER:
+        await dlg.MANAGER.on_ticker(inst_id, price, raw)
 
 
-async def on_add_coin_click(cb: CallbackQuery, button, manager: DialogManager):
-    await manager.switch_to(MainSG.add_coin)
+async def on_order_update(order: dict):
+    await alert(f"📦 {order.get('instId')} {order.get('side')} "
+                f"{order.get('state')} @ {order.get('px')}")
 
 
-async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
-    if not MANAGER:
+# ==================== 命令处理 ====================
+def _allowed(user_id: int) -> bool:
+    return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
+
+
+@dp.message(CommandStart())
+async def cmd_start(msg: Message, dialog_manager: DialogManager):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
         return
-    inst_id = (msg.text or "").strip().upper()
-    if not inst_id:
-        await msg.answer("❌ 输入不能为空")
+    await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(msg: Message, dialog_manager: DialogManager):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
         return
-
-    ok, text = await MANAGER.add_inst(inst_id)
-    if ok:
-        await msg.answer(f"✅ {text}")
-        if PUB_WS:
-            try:
-                await PUB_WS.subscribe(inst_id)
-            except Exception as e:
-                logger.error(f"订阅 {inst_id} 失败: {e}")
-    else:
-        await msg.answer(f"❌ {text}")
-    await manager.start(MainSG.menu)
+    await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
 
-async def main_getter(dialog_manager: DialogManager, **kwargs):
-    if not MANAGER:
-        return {"coins": []}
-    coins = []
-    for iid in MANAGER.all_inst_ids():
-        price = _last_price.get(iid, "-")
-        coins.append({"id": iid, "name": iid, "price": price})
-    return {"coins": coins}
-
-
-main_menu_window = Window(
-    Format(
-        "📊 <b>OKX 多币种交易控制台</b>\n\n"
-        "当前监控 {coins} 个币种："
-    ),
-    ScrollingGroup(
-        Select(
-            Format("📈 {item[name]}  {item[price]}"),
-            id="coin_select",
-            item_id_getter=lambda x: x["id"],
-            itemster="coins",
-            on_click=on_coin_selected,
-        ),
-       = id="coins_scroll",
-        width=1,
-        height=8,
-    ),
-main    Button(Const("➕ 添加币种"), id="add_coin", on__getclick=on_add_coin_click),
-    state=MainSG.menu,
-    getter,
-)
-
-add_coin_window = Window(
-    Const("➕ <b>添加币种</b>\n\n请输入币种名称，例如 <code>BTC-USDT</code> 或 <code>SOL-USDT</code>："),
-    MessageInput(on_add_coin_input),
-    Button(Const("🔙 取消"), id="cancel", on_click=lambda c, b, m: m.start(MainSG.menu)),
-    state=MainSG.add_coin,
-)
-
-
-# ==================== 币种面板 ====================
-async def coin_getter(dialog_manager: DialogManager, **kwargs):
-    inst_id = dialog_manager.dialog_data.get("inst_id", "-")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    return {
-        "inst_id": inst_id,
-        "grid_status": "🟢 运行中" if (grid and grid.running) else "🔴 已停止",
-        "dip_status": "🟢 监控中" if (dip and dip.running) else "⏸ 已暂停",
-        "lastPx": _last_price.get(inst_id, "-"),
-    }
-
-
-async def on_enter_grid(cb: CallbackQuery, button, manager: DialogManager):
-    await manager.switch_to(CoinSG.grid)
-
-
-async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
-    await manager.switch_to(CoinSG.dip)
-
-
-async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id or not MANAGER:
-        await cb.answer("无效操作", show_alert=True)
+@dp.message(Command("list"))
+async def cmd_list(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
         return
-
-    ok, text = await MANAGER.remove_inst(inst_id)
-    if ok and PUB_WS:
-        try:
-            await PUB_WS.unsubscribe(inst_id)
-        except Exception as e:
-            logger.error(f"退订 {inst_id} 失败: {e}")
-
-    await cb.answer(text, show_alert=True)
-    await manager.start(MainSG.menu)
-
-
-coin_panel_window = Window(
-    Format(
-        "📊 <b>{inst_id}</b>\n"
-        "──────────────────\n"
-        "当前价: {lastPx}\n"
-        "网格: {grid_status}\n"
-        "低吸高卖: {dip_status}"
-    ),
-    Column(
-        Button(Const("📈 网格模式"), id="to_grid", on_click=on_enter_grid),
-        Button(Const("📉 低吸高卖"), id="to_dip", on_click=on_enter_dip),
-        Button(Const("🗑 删除此币种"), id="del_coin", on_click=on_delete_coin),
-        Button(Const("🔙 返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(MainSG.menu)),
-    ),
-    state=CoinSG.panel,
-    getter=coin_getter,
-)
-
-
-# ==================== 网格面板 ====================
-async def grid_getter(dialog_manager: DialogManager, **kwargs):
-    inst_id = dialog_manager.dialog_data.get("inst_id", "-")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if not grid:
-        return {"inst_id": inst_id, "status": "未初始化", "minPx": "-", "maxPx": "-",
-                "gridNum": "-", "lastPx": "-", "algo_id": "-"}
-    s = grid.snapshot()
-    return {
-        "inst_id": inst_id,
-        "status": "🟢 运行中" if s["running"] else "🔴 已停止",
-        "minPx": s["params"].get("minPx", "-"),
-        "maxPx": s["params"].get("maxPx", "-"),
-        "gridNum": s["params"].get("gridNum", "-"),
-        "lastPx": _last_price.get(inst_id, "-"),
-        "algo_id": s.get("algo_id") or "-",
-    }
-
-
-async def on_start_grid(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if not grid:
-        await cb.answer("未初始化", show_alert=True)
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
         return
-    if grid.running:
-        await cb.answer("已在运行", show_alert=True)
+    lines = [f"• {iid}  {_last_price.get(iid, '-')}" for iid in dlg.MANAGER.all_inst_ids()]
+    await msg.answer("📋 <b>监控币种</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("add"))
+async def cmd_add(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
         return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("用法：<code>/add BTC-USDT</code>", parse_mode="HTML")
+        return
+    inst_id = parts[1].strip().upper()
+    ok, text = await dlg.MANAGER.add_inst(inst_id)
+    if ok and dlg.PUB_WS:
+        await dlg.PUB_WS.subscribe(inst_id)
+    await msg.answer(("✅ " if ok else "❌ ") + text)
+
+
+@dp.message(Command("remove"))
+async def cmd_remove(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("用法：<code>/remove BTC-USDT</code>", parse_mode="HTML")
+        return
+    inst_id = parts[1].strip().upper()
+    ok, text = await dlg.MANAGER.remove_inst(inst_id)
+    if ok and dlg.PUB_WS:
+        await dlg.PUB_WS.unsubscribe(inst_id)
+    await msg.answer(("✅ " if ok else "❌ ") + text)
+
+
+@dp.message(Command("status"))
+async def cmd_status(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    lines = []
+    for iid in dlg.MANAGER.all_inst_ids():
+        g = dlg.MANAGER.grids.get(iid)
+        d = dlg.MANAGER.dips.get(iid)
+        gs = "🟢" if (g and g.running) else "🔴"
+        ds = "🟢" if (d and d.running) else "⏸"
+        lines.append(f"{iid}  网格{gs}  低吸高卖{ds}  {_last_price.get(iid, '-')}")
+    await msg.answer("📊 <b>状态总览</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+
+# ==================== 菜单按钮 / 命令 ====================
+async def setup_menu():
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    await bot.set_my_commands([
+        BotCommand(command="start",  description="启动机器人"),
+        BotCommand(command="menu",   description="打开主菜单"),
+        BotCommand(command="list",   description="列出监控币种"),
+        BotCommand(command="add",    description="添加币种，如 /add BTC-USDT"),
+        BotCommand(command="remove", description="删除币种，如 /remove BTC-USDT"),
+        BotCommand(command="status", description="查看状态总览"),
+    ])
+
+
+# ==================== Render 健康检查 ====================
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+
+
+# ==================== 入口 ====================
+async def main():
+    # 初始化 Manager 并注入到 UI 模块
+    manager = StrategyManager()
+    dlg.MANAGER = manager
+
+    # 添加配置中的初始币种
+    for iid in WATCHLIST:
+        ok, text = await manager.add_inst(iid)
+        logger.info(text)
+
+    # 注册 dialogs
+    for dialog in get_dialogs():
+        dp.include_router(dialog)
+    setup_dialogs(dp)
+
+    # 菜单按钮
+    await setup_menu()
+
+    # 从 OKX 恢复状态
     try:
-        await grid.start()
-        await cb.answer("✅ 网格已启动")
+        await manager.restore_all()
     except Exception as e:
-        await cb.answer(f"启动失败: {e}", show_alert=True)
-    await manager.update()
+        await alert(f"⚠️ 状态恢复失败: {e}")
+
+    # WebSocket
+    pub_ws = PublicWS(on_ticker)
+    priv_ws = PrivateWS(on_order_update)
+    asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
+    asyncio.create_task(priv_ws.connect())
+
+    # 将 pub_ws 注入到 UI 模块，供动态订阅/退订使用
+    dlg.PUB_WS = pub_ws
+
+    # 健康检查
+    asyncio.create_task(start_health_server())
+
+    # 部署提示
+    commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await alert(
+        f"🚀 <b>部署完成</b>\n"
+        f"Commit: <code>{commit}</code>\n"
+        f"时间: {now}\n"
+        f"币种: {', '.join(manager.all_inst_ids())}"
+    )
+
+    await dp.start_polling(bot)
 
 
-async def on_stop_grid(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if not grid or not grid.running:
-        await cb.answer("未在运行", show_alert=True)
-        return
-    try:
-        await grid.stop()
-        await cb.answer("🛑 已停止")
-    except Exception as e:
-        await cb.answer(f"停止失败: {e}", show_alert=True)
-    await manager.update()
-
-
-grid_panel_window = Window(
-    Format(
-        "📊 <b>{inst_id} 网格</b>\n"
-        "──────────────────\n"
-        "状态: {status}\n"
-        "价格区间: {minPx} — {maxPx}\n"
-        "网格数: {gridNum}\n"
-        "当前价: {lastPx}\n"
-        "Algo ID: {algo_id}"
-    ),
-    Column(
-        Button(Const("▶️ 启动网格"), id="grid_start", on_click=on_start_grid),
-        Button(Const("🛑 停止并撤销"), id="grid_stop", on_click=on_stop_grid),
-        Back(Const("🔙 返回币种面板")),
-    ),
-    state=CoinSG.grid,
-    getter=grid_getter,
-)
-
-
-# ==================== 低吸高卖面板 ====================
-async def dip_getter(dialog_manager: DialogManager, **kwargs):
-    inst_id = dialog_manager.dialog_data.get("inst_id", "-")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        return {"inst_id": inst_id, "status": "未初始化", "base_px": "-",
-                "buy_px": "-", "sell_px": "-", "lastPx": "-", "position": "-"}
-    s = dip.snapshot()
-    return {
-        "inst_id": inst_id,
-        "status": "🟢 监控中" if s["running"] else "⏸ 已暂停",
-        "base_px": s.get("base_px", "-"),
-        "buy_px": round(s.get("buy_px", 0), 6),
-        "sell_px": round(s.get("sell_px", 0), 6),
-        "lastPx": _last_price.get(inst_id, "-"),
-        "position": f"{s.get('position', 0):.6f}",
-    }
-
-
-async def on_start_dip(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        await cb.answer("未初始化", show_alert=True)
-        return
-    await dip.start()
-    await cb.answer("✅ 已启动")
-    await manager.update()
-
-
-async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        await cb.answer("未初始化", show_alert=True)
-        return
-    await dip.stop()
-    await cb.answer("⏸ 已暂停")
-    await manager.update()
-
-
-dip_panel_window = Window(
-    Format(
-        "📉 <b>{inst_id} 低吸高卖</b>\n"
-        "──────────────────\n"
-        "状态: {status}\n"
-        "基准价: {base_px}\n"
-        "买入线: ≤ {buy_px}\n"
-        "卖出线: ≥ {sell_px}\n"
-        "当前价: {lastPx}\n"
-        "持仓: {position}"
-    ),
-    Column(
-        Button(Const("▶️ 启动监控"), id="dip_start", on_click=on_start_dip),
-        Button(Const("⏸ 暂停"), id="dip_stop", on_click=on_stop_dip),
-        Back(Const("🔙 返回币种面板")),
-    ),
-    state=CoinSG.dip,
-    getter=dip_getter,
-)
-
-
-# ==================== Dialog 对象 ====================
-main_dialog  = Dialog(main_menu_window, add_coin_window)
-coin_dialog  = Dialog(coin_panel_window, grid_panel_window, dip_panel_window)
-
-
-def get_dialogs() -> list:
-    return [main_dialog, coin_dialog]
+if __name__ == "__main__":
+    asyncio.run(main())
