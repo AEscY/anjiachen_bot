@@ -47,21 +47,21 @@ async def on_order_update(order: dict):
 async def restore_from_okx():
     rest = OKXRest()
 
+    # 恢复网格策略
     try:
         grids_resp = rest.get_pending_grids(DEFAULT_INST_ID)
         if grids_resp.get("code") == "0" and grids_resp.get("data"):
             latest = grids_resp["data"][0]
             dlg.GRID.algo_id = latest["algoId"]
-            dlg.GRID.params.update({
-                "minPx": float(latest.get("minPx", 0)),
-                "maxPx": float(latest.get("maxPx", 0)),
-                "gridNum": int(latest.get("gridNum", 0)),
-            })
+            dlg.GRID.params["minPx"] = float(latest.get("minPx", 0))
+            dlg.GRID.params["maxPx"] = float(latest.get("maxPx", 0))
+            dlg.GRID.params["gridNum"] = int(latest.get("gridNum", 0))
             dlg.GRID.running = True
             await alert(f"✅ 已从 OKX 恢复网格策略: {latest['algoId']}")
     except Exception as e:
         await alert(f"⚠️ 网格状态恢复失败: {e}")
 
+    # 恢复低吸高卖持仓
     try:
         bal_resp = rest.get_balance("USDT")
         if bal_resp.get("code") == "0" and bal_resp.get("data"):
@@ -139,11 +139,11 @@ async def main():
     dlg.GRID = GridStrategy(DEFAULT_INST_ID)
     dlg.DIP = DipSellStrategy(DEFAULT_INST_ID)
 
-    # 注册所有 Dialog（Dialog 本身就是 Router）
+    # 注册所有 Dialog
     for dialog in get_dialogs():
         dp.include_router(dialog)
 
-    # 初始化 aiogram_dialog 中间件与核心 handler（不需要赋值）
+    # 初始化 aiogram_dialog 中间件
     setup_dialogs(dp)
 
     # 从 OKX 恢复状态
@@ -158,7 +158,7 @@ async def main():
     asyncio.create_task(pub.connect(DEFAULT_INST_ID))
     asyncio.create_task(priv.connect())
 
-    # 启动健康检查服务（应对 Render 端口扫描）
+    # 启动健康检查服务
     asyncio.create_task(start_health_server())
 
     # 部署完成提示
