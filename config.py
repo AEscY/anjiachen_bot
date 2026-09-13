@@ -3,32 +3,27 @@ import os
 
 
 def get_env(key, required=True, default=None):
-    """安全读取环境变量，若为必填项且未配置则抛出明确错误"""
     val = os.environ.get(key, default)
     if required and val is None:
-        raise ValueError(f"❌ 缺少必要环境变量: {key}。请检查 Render 面板中的 Environment 配置。")
+        raise ValueError(f"❌ 缺少必要环境变量: {key}")
     return val
 
 
-# ==================== OKX 配置 ====================
+# ==================== OKX ====================
 OKX_API_KEY    = get_env("OKX_API_KEY")
 OKX_SECRET_KEY = get_env("OKX_SECRET_KEY")
 OKX_PASSPHRASE = get_env("OKX_PASSPHRASE")
-# 1 表示模拟盘，0 表示实盘
 OKX_DEMO       = get_env("OKX_DEMO", required=False, default="1") == "1"
 
-# ==================== Telegram 配置 ====================
+# ==================== Telegram ====================
 TG_BOT_TOKEN   = get_env("TG_BOT_TOKEN")
-# 处理允许的 Telegram 用户 ID，支持逗号分隔的字符串
 _tg_ids_str    = get_env("TG_ALLOWED_IDS", required=False, default="")
 TG_ALLOWED_IDS = {int(x.strip()) for x in _tg_ids_str.split(",") if x.strip()}
 
-# ==================== 交易默认值 ====================
-DEFAULT_INST_ID = "BTC-USDT"
-GRID_DEFAULT = {"minPx": 58000, "maxPx": 62000, "gridNum": 20}
-DIP_DEFAULT  = {"buyPct": 0.98, "sellPct": 1.03, "basePx": 60000}
+# ==================== 关注币种 ====================
+# Render 环境变量 WATCHLIST 可配置初始币种，逗号分隔
+_watchlist_str = get_env("WATCHLIST", required=False, default="BTC-USDT,ETH-USDT")
+WATCHLIST = [x.strip().upper() for x in _watchlist_str.split(",") if x.strip()]
 
-# ==================== 风控参数 ====================
+# ==================== 风控 ====================
 MAX_POSITION_USDT = 500.0
-DAILY_LOSS_LIMIT  = 50.0
-MAX_DRAWDOWN_PCT  = 0.10
