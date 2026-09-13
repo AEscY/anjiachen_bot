@@ -1,8 +1,10 @@
 # main.py
 import asyncio
 import logging
-from aiohttp import web
+import os
+from datetime import datetime
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
@@ -46,13 +48,13 @@ async def restore_from_okx():
     rest = OKXRest()
 
     try:
-)),
         grids_resp = rest.get_pending_grids(DEFAULT_INST_ID)
         if grids_resp.get("code") == "0" and grids_resp.get("data"):
             latest = grids_resp["data"][0]
             dlg.GRID.algo_id = latest["algoId"]
             dlg.GRID.params.update({
-                "minPx": float(latest.get("minPx", 0                "maxPx": float(latest.get("maxPx", 0)),
+                "minPx": float(latest.get("minPx", 0)),
+                "maxPx": float(latest.get("maxPx", 0)),
                 "gridNum": int(latest.get("gridNum", 0)),
             })
             dlg.GRID.running = True
@@ -141,7 +143,7 @@ async def main():
     for dialog in get_dialogs():
         dp.include_router(dialog)
 
-    # 初始化 aiogram_dialog 的中间件与核心 handler
+    # 初始化 aiogram_dialog 中间件与核心 handler（不需要赋值）
     setup_dialogs(dp)
 
     # 从 OKX 恢复状态
@@ -159,7 +161,16 @@ async def main():
     # 启动健康检查服务（应对 Render 端口扫描）
     asyncio.create_task(start_health_server())
 
-    await alert("✅ OKX Trader 已启动")
+    # 部署完成提示
+    commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await alert(
+        f"🚀 <b>部署完成</b>\n"
+        f"Commit: <code>{commit}</code>\n"
+        f"时间: {now}\n"
+        f"机器人已启动，监听中…"
+    )
+
     await dp.start_polling(bot)
 
 
