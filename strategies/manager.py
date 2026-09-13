@@ -3,6 +3,10 @@ import logging
 from okx_client.rest import OKXRest
 from strategies.grid import GridStrategy
 from strategies.dip_sell import DipSellStrategy
+from config import (
+    GRID_RANGE_PCT, GRID_NUM, GRID_QUOTE_SZ,
+    DIP_BUY_PCT, DIP_SELL_PCT, DIP_MAX_SPEND,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +40,18 @@ class StrategyManager:
         except Exception as e:
             return False, f"获取行情失败: {e}"
 
+        # 使用 config.py 中的常量计算参数，避免硬编码
         grid_params = {
-            "minPx": round(price * 0.95, 6),
-            "maxPx": round(price * 1.05, 6),
-            "gridNum": 20,
+            "minPx": round(price * (1 - GRID_RANGE_PCT), 6),
+            "maxPx": round(price * (1 + GRID_RANGE_PCT), 6),
+            "gridNum": GRID_NUM,
+            "quoteSz": GRID_QUOTE_SZ,
         }
         dip_params = {
             "basePx": price,
-            "buyPct": 0.98,
-            "sellPct": 1.03,
+            "buyPct": DIP_BUY_PCT,
+            "sellPct": DIP_SELL_PCT,
+            "maxSpend": DIP_MAX_SPEND,
         }
 
         self.grids[inst_id] = GridStrategy(inst_id, grid_params)
