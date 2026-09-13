@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # ============ 全局引用（由 main.py 注入） ============
 MANAGER: "StrategyManager | None" = None
-PUB_WS = None                    # PublicWS 实例，用于动态订阅/退订
+PUB_WS = None
 _last_price: dict = {}
 
 
@@ -68,16 +68,16 @@ main_menu_window = Window(
             Format("📈 {item[name]}  {item[price]}"),
             id="coin_select",
             item_id_getter=lambda x: x["id"],
-            itemster="coins",
+            items="coins",
             on_click=on_coin_selected,
         ),
-       = id="coins_scroll",
+        id="coins_scroll",
         width=1,
         height=8,
     ),
-main    Button(Const("➕ 添加币种"), id="add_coin", on__getclick=on_add_coin_click),
+    Button(Const("➕ 添加币种"), id="add_coin", on_click=on_add_coin_click),
     state=MainSG.menu,
-    getter,
+    getter=main_getter,
 )
 
 add_coin_window = Window(
