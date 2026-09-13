@@ -15,6 +15,7 @@ PUB_WS = None
 _last_price: dict = {}
 
 
+# ==================== 解析工具 ====================
 def _parse_float(text: str):
     try:
         return float(text.strip()), None
@@ -39,6 +40,13 @@ def _parse_range(text: str):
         return None, None, "价格必须为有效数字"
 
 
+async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
+    """通用会话过期处理：提示并返回主菜单"""
+    await cb.answer("页面已过期，请重新选择币种", show_alert=True)
+    await manager.start(MainSG.menu)
+
+
+# ==================== 主菜单 ====================
 async def on_coin_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
     manager.dialog_data["inst_id"] = item_id
     await manager.start(CoinSG.panel)
@@ -99,6 +107,7 @@ add_coin_window = Window(
 )
 
 
+# ==================== 币种面板 ====================
 async def coin_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
@@ -114,7 +123,7 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
 async def on_enter_grid(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.grid)
 
@@ -122,22 +131,36 @@ async def on_enter_grid(cb: CallbackQuery, button, manager: DialogManager):
 async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.dip)
 
 
 async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
+
+    # 如果上下文丢失（机器人重启导致的失忆），尝试自动恢复逻辑
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
-        return
-    if not MANAGER:
-        await cb.answer("策略管理器未初始化", show_alert=True)
-        return
+        if MANAGER:
+            current_coins = MANAGER.all_inst_ids()
+            if len(current_coins) == 1:
+                # 如果只剩下一个币种，直接锁定它进行删除，不用再麻烦用户
+                inst_id = current_coins[0]
+                logger.info(f"会话过期，自动锁定唯一币种 {inst_id} 执行删除")
+            else:
+                # 如果有多个币种，无法猜测用户原本想删哪个，只能提示重选
+                await cb.answer("页面已过期，请重新点击菜单选择要删除的币种", show_alert=True)
+                await manager.start(MainSG.menu)
+                return
+        else:
+            await cb.answer("策略管理器未初始化", show_alert=True)
+            return
+
+    # 执行真正的删除
     ok, text = await MANAGER.remove_inst(inst_id)
     if ok and PUB_WS:
         await PUB_WS.unsubscribe(inst_id)
+
     await cb.answer(text, show_alert=True)
     await manager.start(MainSG.menu)
 
@@ -160,6 +183,7 @@ coin_panel_window = Window(
 )
 
 
+# ==================== 网格面板 ====================
 async def grid_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
@@ -182,7 +206,7 @@ async def on_start_grid(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
     if not grid:
-        await cb.answer("未初始化", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     if grid.running:
         await cb.answer("已在运行", show_alert=True)
@@ -198,7 +222,10 @@ async def on_start_grid(cb: CallbackQuery, button, manager: DialogManager):
 async def on_stop_grid(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if not grid or not grid.running:
+    if not grid:
+        await _handle_expired(cb, manager)
+        return
+    if not grid.running:
         await cb.answer("未在运行", show_alert=True)
         return
     try:
@@ -212,7 +239,7 @@ async def on_stop_grid(cb: CallbackQuery, button, manager: DialogManager):
 async def on_edit_grid_range(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.grid_edit_range)
 
@@ -220,7 +247,7 @@ async def on_edit_grid_range(cb: CallbackQuery, button, manager: DialogManager):
 async def on_edit_grid_num(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.grid_edit_num)
 
@@ -293,6 +320,7 @@ grid_edit_num_window = Window(
 )
 
 
+# ==================== 低吸高卖面板 ====================
 async def dip_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
@@ -315,7 +343,7 @@ async def on_start_dip(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
-        await cb.answer("未初始化", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await dip.start()
     await cb.answer("已启动")
@@ -326,7 +354,7 @@ async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
-        await cb.answer("未初始化", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await dip.stop()
     await cb.answer("已暂停")
@@ -336,7 +364,7 @@ async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
 async def on_edit_dip_buy(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.dip_edit_buy)
 
@@ -344,7 +372,7 @@ async def on_edit_dip_buy(cb: CallbackQuery, button, manager: DialogManager):
 async def on_edit_dip_sell(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.dip_edit_sell)
 
@@ -352,7 +380,7 @@ async def on_edit_dip_sell(cb: CallbackQuery, button, manager: DialogManager):
 async def on_edit_dip_base(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
-        await cb.answer("会话已过期，请点击菜单重新选择币种", show_alert=True)
+        await _handle_expired(cb, manager)
         return
     await manager.switch_to(CoinSG.dip_edit_base)
 
@@ -446,6 +474,7 @@ dip_edit_base_window = Window(
 )
 
 
+# ==================== Dialog 组装 ====================
 main_dialog = Dialog(main_menu_window, add_coin_window)
 coin_dialog = Dialog(
     coin_panel_window,
