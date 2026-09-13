@@ -1,0 +1,101 @@
+# strategies/manager.py
+import logging
+from okx_client.rest import OKXRest
+from strategies.grid import GridStrategy
+from strategies.dip_sell import DipSellStrategy
+
+logger = logging.getLogger(__name__)
+
+
+class StrategyManager:
+    """统一管理多币种、多策略实例"""
+
+    def __init__(self):
+        self.rest = OKXRest()
+        self.grids: dict = {}   # inst_id -> GridStrategy
+        self.dips: dict = {}    # inst_id -> DipSellStrategy
+        self._inst_ids: list = []
+
+    # ==================== 币种管理 ====================
+    def all_inst_ids(self) -> list:
+        return list(self._inst_ids)
+
+    async def add_inst(self, inst_id: str):
+        """添加币种，自动从当前价生成默认参数"""
+        inst_id = inst_id.upper().strip()
+        if not inst_id or "-" not in inst_id:
+            return False, "格式错误，示例: BTC-USDT"
+        if inst_id in self.grids:
+            return False, f"{inst_id} 已在监控中"
+
+        try:
+            resp = self.rest.get_ticker(inst_id)
+            if resp.get("code") != "0" or not resp.get("data"):
+                return False, f"无法获取 {inst_id} 行情"
+            price = float(resp["data"][0]["last"])
+        except Exception as e:
+            return False, f"获取行情失败: {e}"
+
+        grid_params = {
+            "minPx": round(price * 0.95, 6),
+            "maxPx": round(price * 1.05, 6),
+            "gridNum": 20,
+        }
+        dip_params = {
+            "basePx": price,
+            "buyPct": 0.98,
+            "sellPct": 1.03,
+        }
+
+        self.grids[inst_id] = GridStrategy(inst_id, grid_params)
+        self.dips[inst_id] = DipSellStrategy(inst_id, dip_params)
+        self._inst_ids.append(inst_id)
+        logger.info(f"已添加 {inst_id} @ {price}")
+        return True, f"已添加 {inst_id}，当前价 {price}"
+
+    async def remove_inst(self, inst_id: str):
+        """删除币种，先停止其所有策略"""
+        inst_id = inst_id.upper().strip()
+        if inst_id not in self.grids:
+            return False, f"{inst_id} 不在监控中"
+
+        grid = self.grids.pop(inst_id)
+        dip = self.dips.pop(inst_id)
+        try:
+            if grid.running:
+                await grid.stop()
+        except Exception as e:
+            logger.error(f"停止 {inst_id} 网格失败: {e}")
+        try:
+            if dip.running:
+                await dip.stop()
+        except Exception as e:
+            logger.error(f"停止 {inst_id} 低吸高卖失败: {e}")
+
+        self._inst_ids.remove(inst_id)
+        return True, f"已删除 {inst_id}"
+
+    # ==================== 行情分发 ====================
+    async def on_ticker(self, inst_id: str, price: float, raw: dict):
+        if inst_id in self.grids:
+            await self.grids[inst_id].on_ticker(price, raw)
+        if inst_id in self.dips:
+            await self.dips[inst_id].on_ticker(price, raw)
+
+    # ==================== 状态恢复 ====================
+    async def restore_all(self):
+        """从 OKX 恢复所有币种的运行状态"""
+        for inst_id in self.all_inst_ids():
+            try:
+                resp = self.rest.get_pending_grids(inst_id)
+                if resp.get("code") == "0" and resp.get("data"):
+                    latest = resp["data"][0]
+                    grid = self.grids[inst_id]
+                    grid.algo_id = latest["algoId"]
+                    grid.params["minPx"] = float(latest.get("minPx", 0))
+                    grid.params["maxPx"] = float(latest.get("maxPx", 0))
+                    grid.params["gridNum"] = int(latest.get("gridNum", 0))
+                    grid.running = True
+                    logger.info(f"{inst_id} 网格已恢复: {latest['algoId']}")
+            except Exception as e:
+                logger.error(f"{inst_id} 网格恢复失败: {e}")
