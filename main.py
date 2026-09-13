@@ -7,13 +7,10 @@ from aiogram.types import Message
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 
-from config import (
-    TG_BOT_TOKEN, TG_ALLOWED_IDS, DEFAULT_INST_ID
-)
+from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, DEFAULT_INST_ID
 from ui.dialogs import setup_dialogs as setup_ui_dialogs, _last_price
 import ui.dialogs as dlg
 from ui.states import MainSG
-from state import StateStore
 from okx_client.ws_public import PublicWS
 from okx_client.ws_private import PrivateWS
 from okx_client.rest import OKXRest
@@ -26,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-store = StateStore()
 dialog_manager = None  # 由 setup_dialogs 赋值
 
 
@@ -40,7 +36,7 @@ async def on_ticker(price: float, raw: dict):
 
 
 async def on_order_update(order: dict):
-    """订单更新回调（可在此处更新策略持仓）"""
+    """订单更新回调"""
     await alert(f"📦 订单更新\n{order.get('instId')} {order.get('side')} "
                 f"{order.get('state')} @ {order.get('px')}")
 
@@ -83,22 +79,8 @@ async def restore_from_okx():
         await alert(f"⚠️ 持仓恢复失败: {e}")
 
 
-async def persist_loop():
-    """定期备份状态到 GitHub（30 分钟一次）"""
-    while True:
-        await asyncio.sleep(1800)
-        try:
-            await store.save({
-                "grid": dlg.GRID.snapshot() if dlg.GRID else {},
-                "dip": dlg.DIP.snapshot() if dlg.DIP else {},
-            })
-        except Exception as e:
-            logger.error(f"持久化失败: {e}")
-
-
 @dp.message(CommandStart())
 async def start_cmd(msg: Message, dialog_manager: DialogManager):
-    # 如果配置了 TG_ALLOWED_IDS，则进行鉴权；未配置时允许所有用户（方便调试）
     if TG_ALLOWED_IDS and msg.from_user.id not in TG_ALLOWED_IDS:
         await msg.answer("⛔ 无权访问")
         return
@@ -116,25 +98,17 @@ async def main():
     dp.include_router(setup_ui_dialogs())
     dialog_manager = setup_dialogs(dp)
 
-    # 优先从 OKX 恢复状态，失败则回退到 state.json
+    # 从 OKX API 恢复状态
     try:
         await restore_from_okx()
     except Exception as e:
-        await alert(f"⚠️ OKX 状态恢复失败，尝试本地备份: {e}")
-        saved = await store.load()
-        if saved.get("grid"):
-            dlg.GRID.params.update(saved["grid"])
-        if saved.get("dip"):
-            dlg.DIP.params.update(saved["dip"])
+        await alert(f"⚠️ OKX 状态恢复失败: {e}")
 
-    # 启动 WebSocket（公共行情 + 私有订单）
+    # 启动 WebSocket
     pub = PublicWS(on_ticker)
     priv = PrivateWS(on_order_update)
     asyncio.create_task(pub.connect(DEFAULT_INST_ID))
     asyncio.create_task(priv.connect())
-
-    # 启动定期持久化备份
-    asyncio.create_task(persist_loop())
 
     await alert("✅ OKX Trader 已启动")
     await dp.start_polling(bot)
