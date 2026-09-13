@@ -1,16 +1,15 @@
 import asyncio
 import logging
 import os
-import signal
 from datetime import datetime
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramConflictError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, MenuButtonCommands, BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, WATCHLIST
 from ui.dialogs import get_dialogs, _last_price
@@ -24,13 +23,21 @@ from notifier import alert
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ==================== Webhook 配置 ====================
+# Render 环境变量中务必设置 WEBHOOK_URL，例如 https://anjiachen-bot.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")  # 可选，但建议设置
+
+# Render 要求服务监听 0.0.0.0，端口用 Render 分配的 PORT 环境变量
+WEB_SERVER_HOST = "0.0.0.0"
+WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
+
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# 关闭信号标记
-_shutdown = asyncio.Event()
 
-
+# ==================== 行情 / 订单回调 ====================
 async def on_ticker(inst_id: str, price: float, raw: dict):
     _last_price[inst_id] = price
     if dlg.MANAGER:
@@ -41,6 +48,7 @@ async def on_order_update(order: dict):
     await alert(f"订单更新: {order.get('instId')} {order.get('side')} {order.get('state')} @ {order.get('px')}")
 
 
+# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -123,6 +131,7 @@ async def cmd_status(msg: Message):
     await msg.answer("状态总览:\n" + "\n".join(lines))
 
 
+# ==================== 菜单按钮 / 命令 ====================
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -135,91 +144,100 @@ async def setup_menu():
     ])
 
 
+# ==================== 健康检查 ====================
 async def health(request):
     return web.Response(text="OK")
 
 
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 10000)
-    await site.start()
-    return runner
-
-
-async def _sigterm_handler():
-    """处理 Render 的 SIGTERM 信号，优雅退出"""
-    loop = asyncio.get_event_loop()
-    try:
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, _shutdown.set)
-    except NotImplementedError:
-        pass
-
-
+# ==================== 启动入口 ====================
 async def main():
-    # 1. 处理信号
-    await _sigterm_handler()
-
-    # 2. 先删除 webhook，避免与 polling 冲突
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logger.warning(f"删除 webhook 失败: {e}")
-
-    # 3. 初始化 Manager
+    # 1. 初始化 Manager
     manager = StrategyManager()
     dlg.MANAGER = manager
 
     for iid in WATCHLIST:
-        await manager.add_inst(iid)
+        ok, text = await manager.add_inst(iid)
+        logger.info(text)
 
-    # 4. 注册 dialogs
+    # 2. 注册 dialogs
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
 
-    # 5. 菜单
+    # 3. 菜单
     await setup_menu()
 
-    # 6. 恢复状态
+    # 4. 恢复状态
     try:
         await manager.restore_all()
     except Exception as e:
         await alert(f"状态恢复失败: {e}")
 
-    # 7. WebSocket
+    # 5. WebSocket
     pub_ws = PublicWS(on_ticker)
     priv_ws = PrivateWS(on_order_update)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
-    # 8. 健康检查
-    runner = await start_health_server()
+    # 6. 创建 aiohttp 应用
+    app = web.Application()
 
-    # 9. 部署提示
+    # 注册健康检查端点（Render 需要）
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    # 注册 Webhook 处理器
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET or None,
+    )
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+
+    # 设置 dispatcher 生命周期钩子
+    setup_application(app, dp, bot=bot)
+
+    # 7. 设置 Webhook URL
+    if WEBHOOK_URL:
+        webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
+        await bot.set_webhook(
+            url=webhook_full_url,
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True,
+        )
+        logger.info(f"Webhook 已设置: {webhook_full_url}")
+    else:
+        logger.error("WEBHOOK_URL 未设置，Telegram 将无法推送更新！")
+        await alert("⚠️ WEBHOOK_URL 未配置，机器人将无法接收消息")
+
+    # 8. 部署提示
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await alert(f"部署完成\nCommit: {commit}\n时间: {now}\n币种: {', '.join(manager.all_inst_ids())}")
+    await alert(
+        f"部署完成 (Webhook 模式)\n"
+        f"Commit: {commit}\n"
+        f"时间: {now}\n"
+        f"币种: {', '.join(manager.all_inst_ids())}"
+    )
 
-    # 10. Polling，带 Conflict 重试
+    # 9. 启动 Web 服务器（不再使用 dp.start_polling）
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WEB_SERVER_HOST, WEB_SERVER_PORT)
+    await site.start()
+    logger.info(f"Web 服务器已启动: http://{WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+
+    # 10. 保持运行
     try:
-        await dp.start_polling(bot, drop_pending_updates=True)
-    except TelegramConflictError as e:
-        logger.error(f"轮询冲突（旧实例未退出）: {e}")
+        await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
-        # 11. 清理
         await pub_ws.close()
         await priv_ws.close()
         await bot.session.close()
         await runner.cleanup()
-        logger.info("已优雅关闭")
 
 
 if __name__ == "__main__":
