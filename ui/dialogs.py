@@ -11,14 +11,16 @@ from strategies.manager import StrategyManager
 
 logger = logging.getLogger(__name__)
 
+# ============ 全局引用（由 main.py 注入） ============
 MANAGER: "StrategyManager | None" = None
+PUB_WS = None                    # PublicWS 实例，用于动态订阅/退订
 _last_price: dict = {}
 
 
-# ==================== 主菜单 ====================
+# ==================== 主菜单回调 ====================
 async def on_coin_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
     manager.dialog_data["inst_id"] = item_id
-    await manager.switch_to(CoinSG.panel)
+    await manager.start(CoinSG.panel)
 
 
 async def on_add_coin_click(cb: CallbackQuery, button, manager: DialogManager):
@@ -28,16 +30,22 @@ async def on_add_coin_click(cb: CallbackQuery, button, manager: DialogManager):
 async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
     if not MANAGER:
         return
-    ok, text = await MANAGER.add_inst(msg.text or "")
+    inst_id = (msg.text or "").strip().upper()
+    if not inst_id:
+        await msg.answer("❌ 输入不能为空")
+        return
+
+    ok, text = await MANAGER.add_inst(inst_id)
     if ok:
         await msg.answer(f"✅ {text}")
-        # 订阅新币种行情
-        ws = manager.middleware_data.get("ws_public")
-        if ws:
-            await ws.subscribe(msg.text.strip().upper())
+        if PUB_WS:
+            try:
+                await PUB_WS.subscribe(inst_id)
+            except Exception as e:
+                logger.error(f"订阅 {inst_id} 失败: {e}")
     else:
         await msg.answer(f"❌ {text}")
-    await manager.switch_to(MainSG.menu)
+    await manager.start(MainSG.menu)
 
 
 async def main_getter(dialog_manager: DialogManager, **kwargs):
@@ -60,22 +68,22 @@ main_menu_window = Window(
             Format("📈 {item[name]}  {item[price]}"),
             id="coin_select",
             item_id_getter=lambda x: x["id"],
-            items="coins",
+            itemster="coins",
             on_click=on_coin_selected,
         ),
-        id="coins_scroll",
+       = id="coins_scroll",
         width=1,
         height=8,
     ),
-    Button(Const("➕ 添加币种"), id="add_coin", on_click=on_add_coin_click),
+main    Button(Const("➕ 添加币种"), id="add_coin", on__getclick=on_add_coin_click),
     state=MainSG.menu,
-    getter=main_getter,
+    getter,
 )
 
 add_coin_window = Window(
     Const("➕ <b>添加币种</b>\n\n请输入币种名称，例如 <code>BTC-USDT</code> 或 <code>SOL-USDT</code>："),
     MessageInput(on_add_coin_input),
-    Button(Const("🔙 取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(MainSG.menu)),
+    Button(Const("🔙 取消"), id="cancel", on_click=lambda c, b, m: m.start(MainSG.menu)),
     state=MainSG.add_coin,
 )
 
@@ -106,12 +114,16 @@ async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id or not MANAGER:
         await cb.answer("无效操作", show_alert=True)
         return
+
     ok, text = await MANAGER.remove_inst(inst_id)
-    ws = manager.middleware_data.get("ws_public")
-    if ok and ws:
-        await ws.unsubscribe(inst_id)
+    if ok and PUB_WS:
+        try:
+            await PUB_WS.unsubscribe(inst_id)
+        except Exception as e:
+            logger.error(f"退订 {inst_id} 失败: {e}")
+
     await cb.answer(text, show_alert=True)
-    await manager.switch_to(MainSG.menu)
+    await manager.start(MainSG.menu)
 
 
 coin_panel_window = Window(
@@ -126,7 +138,7 @@ coin_panel_window = Window(
         Button(Const("📈 网格模式"), id="to_grid", on_click=on_enter_grid),
         Button(Const("📉 低吸高卖"), id="to_dip", on_click=on_enter_dip),
         Button(Const("🗑 删除此币种"), id="del_coin", on_click=on_delete_coin),
-        Button(Const("🔙 返回主菜单"), id="back_main", on_click=lambda c, b, m: m.switch_to(MainSG.menu)),
+        Button(Const("🔙 返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(MainSG.menu)),
     ),
     state=CoinSG.panel,
     getter=coin_getter,
