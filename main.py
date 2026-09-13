@@ -1,19 +1,20 @@
 # main.py
 import asyncio
 import logging
+import os
+from datetime import datetime
+
+from aiohttp import web
 from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, MenuButtonCommands, BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 
-from config import (
-    TG_BOT_TOKEN, TG_ALLOWED_IDS, DEFAULT_INST_ID
-)
-from ui.dialogs import setup_dialogs as setup_ui_dialogs, _last_price
+from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, DEFAULT_INST_ID
+from ui.dialogs import get_dialogs, _last_price
 import ui.dialogs as dlg
 from ui.states import MainSG
-from state import StateStore
 from okx_client.ws_public import PublicWS
 from okx_client.ws_private import PrivateWS
 from okx_client.rest import OKXRest
@@ -26,12 +27,10 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-store = StateStore()
-dialog_manager = None  # 由 setup_dialogs 赋值
 
 
+# ==================== 行情 / 订单回调 ====================
 async def on_ticker(price: float, raw: dict):
-    """行情推送回调"""
     _last_price[DEFAULT_INST_ID] = price
     if dlg.GRID:
         await dlg.GRID.on_ticker(price, raw)
@@ -40,37 +39,32 @@ async def on_ticker(price: float, raw: dict):
 
 
 async def on_order_update(order: dict):
-    """订单更新回调（可在此处更新策略持仓）"""
     await alert(f"📦 订单更新\n{order.get('instId')} {order.get('side')} "
                 f"{order.get('state')} @ {order.get('px')}")
 
 
+# ==================== 从 OKX 恢复状态 ====================
 async def restore_from_okx():
-    """从 OKX API 恢复策略状态"""
     rest = OKXRest()
 
-    # 1. 恢复网格策略
     try:
         grids_resp = rest.get_pending_grids(DEFAULT_INST_ID)
         if grids_resp.get("code") == "0" and grids_resp.get("data"):
             latest = grids_resp["data"][0]
             dlg.GRID.algo_id = latest["algoId"]
-            dlg.GRID.params.update({
-                "minPx": float(latest.get("minPx", 0)),
-                "maxPx": float(latest.get("maxPx", 0)),
-                "gridNum": int(latest.get("gridNum", 0)),
-            })
+            dlg.GRID.params["minPx"] = float(latest.get("minPx", 0))
+            dlg.GRID.params["maxPx"] = float(latest.get("maxPx", 0))
+            dlg.GRID.params["gridNum"] = int(latest.get("gridNum", 0))
             dlg.GRID.running = True
             await alert(f"✅ 已从 OKX 恢复网格策略: {latest['algoId']}")
     except Exception as e:
         await alert(f"⚠️ 网格状态恢复失败: {e}")
 
-    # 2. 恢复低吸高卖策略（从现货余额解析持仓）
     try:
         bal_resp = rest.get_balance("USDT")
         if bal_resp.get("code") == "0" and bal_resp.get("data"):
             details = bal_resp["data"][0].get("details", [])
-            base_ccy = DEFAULT_INST_ID.split("-")[0]  # 例如 BTC
+            base_ccy = DEFAULT_INST_ID.split("-")[0]
             for d in details:
                 if d.get("ccy") == base_ccy:
                     pos = float(d.get("eq", 0))
@@ -83,60 +77,122 @@ async def restore_from_okx():
         await alert(f"⚠️ 持仓恢复失败: {e}")
 
 
-async def persist_loop():
-    """定期备份状态到 GitHub（30 分钟一次）"""
-    while True:
-        await asyncio.sleep(1800)
-        try:
-            await store.save({
-                "grid": dlg.GRID.snapshot() if dlg.GRID else {},
-                "dip": dlg.DIP.snapshot() if dlg.DIP else {},
-            })
-        except Exception as e:
-            logger.error(f"持久化失败: {e}")
+# ==================== 命令处理 ====================
+def _allowed(user_id: int) -> bool:
+    return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
 
 @dp.message(CommandStart())
-async def start_cmd(msg: Message, dialog_manager: DialogManager):
-    # 如果配置了 TG_ALLOWED_IDS，则进行鉴权；未配置时允许所有用户（方便调试）
-    if TG_ALLOWED_IDS and msg.from_user.id not in TG_ALLOWED_IDS:
+async def cmd_start(msg: Message, dialog_manager: DialogManager):
+    if not _allowed(msg.from_user.id):
         await msg.answer("⛔ 无权访问")
         return
     await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
 
-async def main():
-    global dialog_manager
+@dp.message(Command("menu"))
+async def cmd_menu(msg: Message, dialog_manager: DialogManager):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
+        return
+    await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
-    # 初始化策略实例
+
+@dp.message(Command("status"))
+async def cmd_status(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("⛔ 无权访问")
+        return
+    grid = dlg.GRID.snapshot() if dlg.GRID else {}
+    dip = dlg.DIP.snapshot() if dlg.DIP else {}
+    text = (
+        f"📊 <b>当前状态</b>\n"
+        f"网格: {'🟢 运行中' if grid.get('running') else '🔴 已停止'}\n"
+        f"网格 AlgoID: {grid.get('algo_id') or '-'}\n"
+        f"低吸高卖: {'🟢 监控中' if dip.get('running') else '⏸ 已暂停'}\n"
+        f"持仓: {dip.get('position', 0):.6f}"
+    )
+    await msg.answer(text, parse_mode="HTML")
+
+
+# ==================== 设置菜单按钮 ====================
+async def setup_menu_button():
+    """设置 Telegram 菜单按钮，显示命令列表"""
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
+    )
+    logger.info("菜单按钮已设置为显示命令列表")
+
+
+async def setup_bot_commands():
+    """注册机器人命令列表，显示在菜单中"""
+    commands = [
+        BotCommand(command="start", description="启动机器人"),
+        BotCommand(command="menu", description="打开主菜单"),
+        BotCommand(command="status", description="查看当前状态"),
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("命令列表已注册")
+
+
+# ==================== Render 健康检查 ====================
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+    logger.info("健康检查服务已启动，端口 10000")
+
+
+# ==================== 启动入口 ====================
+async def main():
+    # 初始化策略
     dlg.GRID = GridStrategy(DEFAULT_INST_ID)
     dlg.DIP = DipSellStrategy(DEFAULT_INST_ID)
 
-    # 注册 UI dialogs 并获取 dialog_manager
-    dp.include_router(setup_ui_dialogs())
-    dialog_manager = setup_dialogs(dp)
+    # 注册所有 Dialog
+    for dialog in get_dialogs():
+        dp.include_router(dialog)
 
-    # 优先从 OKX 恢复状态，失败则回退到 state.json
+    # 初始化 aiogram_dialog 中间件
+    setup_dialogs(dp)
+
+    # 设置菜单按钮和命令列表
+    await setup_menu_button()
+    await setup_bot_commands()
+
+    # 从 OKX 恢复状态
     try:
         await restore_from_okx()
     except Exception as e:
-        await alert(f"⚠️ OKX 状态恢复失败，尝试本地备份: {e}")
-        saved = await store.load()
-        if saved.get("grid"):
-            dlg.GRID.params.update(saved["grid"])
-        if saved.get("dip"):
-            dlg.DIP.params.update(saved["dip"])
+        await alert(f"⚠️ OKX 状态恢复失败: {e}")
 
-    # 启动 WebSocket（公共行情 + 私有订单）
+    # 启动 WebSocket
     pub = PublicWS(on_ticker)
     priv = PrivateWS(on_order_update)
     asyncio.create_task(pub.connect(DEFAULT_INST_ID))
     asyncio.create_task(priv.connect())
 
-    # 启动定期持久化备份
-    asyncio.create_task(persist_loop())
+    # 启动健康检查服务
+    asyncio.create_task(start_health_server())
 
-    await alert("✅ OKX Trader 已启动")
+    # 部署完成提示
+    commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await alert(
+        f"🚀 <b>部署完成</b>\n"
+        f"Commit: <code>{commit}</code>\n"
+        f"时间: {now}\n"
+        f"机器人已启动，监听中…"
+    )
+
     await dp.start_polling(bot)
 
 

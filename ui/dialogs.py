@@ -24,7 +24,7 @@ _last_price: dict = {}
 
 # ==================== 主菜单回调 ====================
 async def on_switch_to_grid(cb: CallbackQuery, button, manager: DialogManager):
-    await manager.start(GridSG.panel)  # 默认 NORMAL 模式，压栈保留返回路径
+    await manager.start(GridSG.panel)
 
 
 async def on_switch_to_dip(cb: CallbackQuery, button, manager: DialogManager):
@@ -211,11 +211,7 @@ grid_dialog = Dialog(grid_panel_window)
 dip_dialog = Dialog(dip_panel_window)
 
 
-# ==================== Router（供 main.py 调用） ====================
-def setup_dialogs() -> Router:
-    """组装所有 Dialog 到 Router 中，返回给 Dispatcher 注册"""
-    router = Router()
-    router.include_router(main_dialog)
-    router.include_router(grid_dialog)
-    router.include_router(dip_dialog)
-    return router
+# ==================== 供 main.py 调用 ====================
+def get_dialogs() -> list:
+    """返回所有 Dialog 对象，由 main.py 直接注册到 Dispatcher"""
+    return [main_dialog, grid_dialog, dip_dialog]
