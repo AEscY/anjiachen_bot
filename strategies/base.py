@@ -1,6 +1,7 @@
 # strategies/base.py
 from abc import ABC, abstractmethod
 
+
 class BaseStrategy(ABC):
     def __init__(self, inst_id: str, params: dict):
         self.inst_id = inst_id
@@ -20,4 +21,8 @@ class BaseStrategy(ABC):
         ...
 
     def snapshot(self) -> dict:
-        return {"inst_id": self.inst_id, "running": self.running, "params": self.params}
+        return {
+            "inst_id": self.inst_id,
+            "running": self.running,
+            "params": self.params,
+        }
