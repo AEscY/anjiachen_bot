@@ -1,15 +1,13 @@
 # ui/states.py
 from aiogram.filters.state import StatesGroup, State
 
+
 class MainSG(StatesGroup):
-    menu = State()
+    menu     = State()
+    add_coin = State()
 
-class GridSG(StatesGroup):
-    panel = State()
-    edit_range = State()
-    edit_grid_num = State()
 
-class DipSG(StatesGroup):
-    panel = State()
-    edit_buy_pct = State()
-    edit_sell_pct = State()
+class CoinSG(StatesGroup):
+    panel = State()   # 币种总览
+    grid  = State()   # 网格控制
+    dip   = State()   # 低吸高卖控制
