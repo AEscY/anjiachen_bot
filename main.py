@@ -10,9 +10,10 @@ from aiogram.types import Message, MenuButtonCommands, BotCommand
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# ---- 新增：数据库相关导入 ----
+# ---- 数据库相关导入 ----
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from aiogram.fsm.storage.sqlalchemy import SQLAlchemyStorage
+from sqlalchemy.orm import declarative_base
+from sqlalchemy_storage import SQLAlchemyStorage
 
 from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, WATCHLIST, DATABASE_URL
 from ui.dialogs import get_dialogs, _last_price
@@ -38,13 +39,15 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    connect_args={"ssl": "require"},   # Aiven 要求 SSL
+    connect_args={"ssl": "require"},
 )
 session_factory = async_sessionmaker(engine, expire_on_commit=False)
-storage = SQLAlchemyStorage(session_factory, engine)
+
+Base = declarative_base()
+storage = SQLAlchemyStorage(sessionmaker=session_factory, metadata=Base.metadata)
 
 bot = Bot(token=TG_BOT_TOKEN)
-dp = Dispatcher(storage=storage)   # 使用 PostgreSQL 持久化存储，替代 MemoryStorage
+dp = Dispatcher(storage=storage)
 
 
 # ==================== 行情 / 订单回调 ====================
@@ -161,7 +164,6 @@ async def health(request):
 
 # ==================== 启动入口 ====================
 async def main():
-    # 1. 初始化 Manager
     manager = StrategyManager()
     dlg.MANAGER = manager
 
@@ -169,28 +171,23 @@ async def main():
         ok, text = await manager.add_inst(iid)
         logger.info(text)
 
-    # 2. 注册 dialogs
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
 
-    # 3. 菜单
     await setup_menu()
 
-    # 4. 恢复状态
     try:
         await manager.restore_all()
     except Exception as e:
         await alert(f"状态恢复失败: {e}")
 
-    # 5. WebSocket
     pub_ws = PublicWS(on_ticker)
     priv_ws = PrivateWS(on_order_update)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
-    # 6. Webhook
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -215,7 +212,6 @@ async def main():
         logger.error("WEBHOOK_URL 未设置！")
         await alert("⚠️ WEBHOOK_URL 未配置，机器人将无法接收消息")
 
-    # 7. 部署提示
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     await alert(
@@ -225,14 +221,12 @@ async def main():
         f"币种: {', '.join(manager.all_inst_ids())}"
     )
 
-    # 8. 启动 Web 服务器
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_SERVER_HOST, WEB_SERVER_PORT)
     await site.start()
     logger.info(f"Web 服务器已启动: http://{WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
-    # 9. 保持运行
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
@@ -242,7 +236,7 @@ async def main():
         await priv_ws.close()
         await bot.session.close()
         await runner.cleanup()
-        await engine.dispose()   # 关闭数据库连接
+        await engine.dispose()
 
 
 if __name__ == "__main__":
