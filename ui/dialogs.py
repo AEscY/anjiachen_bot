@@ -67,13 +67,13 @@ async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
 
 async def main_getter(dialog_manager: DialogManager, **kwargs):
     if not MANAGER:
-        return {"coins": []}
+        return {"coins": [], "coins_count": 0}
     coins = [{"id": iid, "name": iid, "price": _last_price.get(iid, "-")} for iid in MANAGER.all_inst_ids()]
-    return {"coins": coins}
+    return {"coins": coins, "coins_count": len(coins)}
 
 
 main_menu_window = Window(
-    Format("OKX 多币种控制台\n\n当前监控 {coins} 个币种："),
+    Format("OKX 多币种控制台\n\n当前监控 {coins_count} 个币种："),
     ScrollingGroup(
         Select(
             Format("{item[name]}  {item[price]}"),
