@@ -29,7 +29,3 @@ GRID_QUOTE_SZ = 100
 DIP_BUY_PCT = 0.98
 DIP_SELL_PCT = 1.03
 DIP_MAX_SPEND = 100
-
-# ==================== 数据库配置 ====================
-# Aiven PostgreSQL 连接串
-DATABASE_URL = get_env("DATABASE_URL")
