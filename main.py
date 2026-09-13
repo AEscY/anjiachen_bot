@@ -7,7 +7,7 @@ from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, MenuButtonCommands, BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 
@@ -47,7 +47,6 @@ async def on_order_update(order: dict):
 async def restore_from_okx():
     rest = OKXRest()
 
-    # 恢复网格策略
     try:
         grids_resp = rest.get_pending_grids(DEFAULT_INST_ID)
         if grids_resp.get("code") == "0" and grids_resp.get("data"):
@@ -61,7 +60,6 @@ async def restore_from_okx():
     except Exception as e:
         await alert(f"⚠️ 网格状态恢复失败: {e}")
 
-    # 恢复低吸高卖持仓
     try:
         bal_resp = rest.get_balance("USDT")
         if bal_resp.get("code") == "0" and bal_resp.get("data"):
@@ -117,6 +115,26 @@ async def cmd_status(msg: Message):
     await msg.answer(text, parse_mode="HTML")
 
 
+# ==================== 设置菜单按钮 ====================
+async def setup_menu_button():
+    """设置 Telegram 菜单按钮，显示命令列表"""
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
+    )
+    logger.info("菜单按钮已设置为显示命令列表")
+
+
+async def setup_bot_commands():
+    """注册机器人命令列表，显示在菜单中"""
+    commands = [
+        BotCommand(command="start", description="启动机器人"),
+        BotCommand(command="menu", description="打开主菜单"),
+        BotCommand(command="status", description="查看当前状态"),
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("命令列表已注册")
+
+
 # ==================== Render 健康检查 ====================
 async def health(request):
     return web.Response(text="OK")
@@ -145,6 +163,10 @@ async def main():
 
     # 初始化 aiogram_dialog 中间件
     setup_dialogs(dp)
+
+    # 设置菜单按钮和命令列表
+    await setup_menu_button()
+    await setup_bot_commands()
 
     # 从 OKX 恢复状态
     try:
