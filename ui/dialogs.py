@@ -43,7 +43,6 @@ def _parse_range(text: str):
 
 
 async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
-    """通用会话过期处理：提示并返回主菜单"""
     await cb.answer("页面已过期，请重新选择币种", show_alert=True)
     await manager.start(MainSG.menu)
 
@@ -51,7 +50,7 @@ async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
 # ==================== 主菜单 ====================
 async def on_coin_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
     manager.dialog_data["inst_id"] = item_id
-    await manager.start(CoinSG.panel)
+    await manager.switch_to(CoinSG.panel)
 
 
 async def on_add_coin_click(cb: CallbackQuery, button, manager: DialogManager):
@@ -62,7 +61,7 @@ async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
     if not MANAGER:
         return
     text = (msg.text or "").strip()
-    # 关键修复：如果用户输入的是命令（以 / 开头），不拦截，交给命令处理器
+    # 关键：输入命令时直接放行，交给命令处理器
     if text.startswith("/"):
         return
     if not text:
@@ -76,7 +75,7 @@ async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
             await PUB_WS.subscribe(inst_id)
     else:
         await msg.answer(result)
-    await manager.start(MainSG.menu)
+    await manager.switch_to(MainSG.menu)
 
 
 async def main_getter(dialog_manager: DialogManager, **kwargs):
@@ -108,7 +107,7 @@ main_menu_window = Window(
 add_coin_window = Window(
     Const("添加币种\n\n请输入币种名称，例如 BTC-USDT："),
     MessageInput(on_add_coin_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.start(MainSG.menu)),
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(MainSG.menu)),
     state=MainSG.add_coin,
 )
 
@@ -144,13 +143,11 @@ async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
 
 async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
-
     if not inst_id:
         if MANAGER:
             current_coins = MANAGER.all_inst_ids()
             if len(current_coins) == 1:
                 inst_id = current_coins[0]
-                logger.info(f"会话过期，自动锁定唯一币种 {inst_id} 执行删除")
             else:
                 await cb.answer("页面已过期，请重新点击菜单选择要删除的币种", show_alert=True)
                 await manager.start(MainSG.menu)
@@ -504,9 +501,10 @@ dip_edit_base_window = Window(
 )
 
 
-# ==================== Dialog 组装 ====================
-main_dialog = Dialog(main_menu_window, add_coin_window)
-coin_dialog = Dialog(
+# ==================== Dialog 组装（合并为一个，解决跨 Dialog 丢失 inst_id 的问题） ====================
+main_dialog = Dialog(
+    main_menu_window,
+    add_coin_window,
     coin_panel_window,
     grid_panel_window,
     grid_edit_range_window,
@@ -519,4 +517,4 @@ coin_dialog = Dialog(
 
 
 def get_dialogs() -> list:
-    return [main_dialog, coin_dialog]
+    return [main_dialog]
