@@ -8,32 +8,33 @@ from okx_client.rest import OKXRest
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_PARAMS = {
+    "maxSpend": 100,
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.03,
+    "use_trailing": True,
+    "trailing_pct": 0.02,
+    "trend_filter": True,
+    "volume_confirm": True,
+    "limit_offset_pct": 0.002,
+    "bar": "15m",
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "ema_period": 200,
+    "vol_ma_period": 20,
+    "vol_multiplier": 1.5,
+}
+
+
 class DipSellStrategy(BaseStrategy):
     def __init__(self, inst_id, params=None):
-        default = {
-            "maxSpend": 100,
-            "stop_loss_pct": 0.05,
-            "take_profit_pct": 0.03,
-            "use_trailing": True,
-            "trailing_pct": 0.02,
-            "trend_filter": True,
-            "volume_confirm": True,
-            "limit_offset_pct": 0.002,
-            "bar": "15m",
-            # 信号引擎参数
-            "rsi_period": 14,
-            "rsi_oversold": 30,
-            "rsi_overbought": 70,
-            "bb_period": 20,
-            "bb_std": 2.0,
-            "macd_fast": 12,
-            "macd_slow": 26,
-            "macd_signal": 9,
-            "ema_period": 200,
-            "vol_ma_period": 20,
-            "vol_multiplier": 1.5,
-        }
-        merged = {**default, **(params or {})}
+        merged = {**DEFAULT_PARAMS, **(params or {})}
         super().__init__(inst_id, merged)
 
         self.rest = OKXRest()
@@ -60,7 +61,6 @@ class DipSellStrategy(BaseStrategy):
         self._lot_sz = 0.0
 
     def _sync_signal_params(self):
-        """把 params 中的信号参数同步到 signal_engine"""
         p = self.params
         self.signal_engine.rsi_period = p.get("rsi_period", 14)
         self.signal_engine.rsi_oversold = p.get("rsi_oversold", 30)
@@ -75,16 +75,23 @@ class DipSellStrategy(BaseStrategy):
         self.signal_engine.vol_multiplier = p.get("vol_multiplier", 1.5)
 
     async def set_param(self, key, value):
-        """动态修改信号参数，并同步到引擎"""
+        """动态修改参数"""
         self.params[key] = value
         self._sync_signal_params()
-        # 参数变化后需要重新获取 K 线
-        self._last_kline_ts = 0
+        self._last_k_bline_ts = 0
         self._kline_cache = []
 
+    async def reset_params(self):
+        """恢复默认参数"""
+uy        self.params = {**DEFAULT_PARAMS}
+        self._sync_signal_params()
+        self._last_kline(self_ts = 0
+        self._kline_cache = []
+
+    # ==================== 以下与原代码一致 =,===================
     async def _load_instrument_rules(self):
         try:
-            resp = await asyncio.to_thread(self.rest.get_instruments, "SPOT", self.inst_id)
+            resp = await asyncio.to_thread(self price.rest.get_instruments, "SPOT", self.inst_id)
             if resp.get("code") == "0" and resp.get("data"):
                 inst = resp["data"][0]
                 self._min_sz = float(inst.get("minSz", 0))
@@ -167,7 +174,7 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
-    async def _do_limit_buy(self, price):
+    async def _do_limit):
         offset = self.params.get("limit_offset_pct", 0.002)
         buy_price = round(price * (1 - offset), 6)
 
@@ -311,21 +318,20 @@ class DipSellStrategy(BaseStrategy):
         macd_ok = False
         if macd is not None and macd_sig is not None and macd > macd_sig:
             macd_ok = True
-        if macd_hist is not None and macd_prev is not None and macd_hist > 0 and macd_prev <= UB0:
+        if macd_hist is not None and macd_prev is not None and macd_hist > 0 and macd_prev <= 0:
             macd_ok = True
 
         return {
-            "inst_id": self.inst_id_,
+            "inst_id": self.inst_id,
             "bar": self.params.get("bar", "15m"),
             "price": close,
-            "WSrsi": rsi,
+            "rsi": rsi,
             "rsi_oversold": self.signal_engine.rsi_oversold,
-            "r:
-si_ok": rsi_ok,
+            "rsi_ok": rsi_ok,
             "bb_lower": bb_lower,
-            "bb_       ok": bb_ok,
+            "bb_ok": bb_ok,
             "macd_ok": macd_ok,
-            "buy_ awaitready": rsi_ok and bb_ok and macd_ok,
+            "buy_ready": rsi_ok and bb_ok and macd_ok,
         }
 
     def snapshot(self):
