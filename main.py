@@ -17,20 +17,19 @@ import ui.dialogs as dlg
 from ui.states import MainSG
 from okx_client.ws_public import PublicWS
 from okx_client.ws_private import PrivateWS
+from okx_client.rest import OKXRest
 from strategies.manager import StrategyManager
 from notifier import alert
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== Webhook 配置 ====================
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
 
-# 回归内存存储，重启后状态清空，但不影响交易引擎
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -129,7 +128,69 @@ async def cmd_status(msg: Message):
     await msg.answer("状态总览:\n" + "\n".join(lines))
 
 
-# ==================== 菜单按钮 / 命令 ====================
+@dp.message(Command("balance"))
+async def cmd_balance(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    try:
+        rest = OKXRest()
+        resp = await asyncio.to_thread(rest.get_balance, "USDT")
+        if resp.get("code") != "0" or not resp.get("data"):
+            await msg.answer("查询余额失败")
+            return
+        details = resp["data"][0].get("details", [])
+        lines = ["账户余额"]
+        for d in details:
+            ccy = d.get("ccy", "")
+            try:
+                eq = float(d.get("eq", 0))
+                avail = float(d.get("availBal", 0))
+            except (ValueError, TypeError):
+                continue
+            if eq > 0:
+                lines.append(f"{ccy}: 总额 {eq:.6f} | 可用 {avail:.6f}")
+        await msg.answer("\n".join(lines) if len(lines) > 1 else "账户无资产")
+    except Exception as e:
+        await msg.answer(f"查询失败: {e}")
+
+
+@dp.message(Command("profit"))
+async def cmd_profit(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    lines = ["获利与手续费统计"]
+    total_profit = 0.0
+    total_fee = 0.0
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if dip:
+            s = dip.snapshot()
+            profit = s.get("total_profit", 0)
+            fee = s.get("total_fee", 0)
+            total_profit += profit
+            total_fee += fee
+            lines.append(
+                f"\n{iid}\n"
+                f"  已实现盈亏: {profit:.4f} USDT\n"
+                f"  手续费: {fee:.4f} USDT\n"
+                f"  成交次数: {s.get('trade_count', 0)}"
+            )
+    net = total_profit - total_fee
+    lines.append(
+        f"\n合计\n"
+        f"  已实现盈亏: {total_profit:.4f} USDT\n"
+        f"  累计手续费: {total_fee:.4f} USDT\n"
+        f"  净收益: {net:.4f} USDT"
+    )
+    await msg.answer("\n".join(lines))
+
+
+# ==================== 菜单按钮 ====================
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -139,6 +200,8 @@ async def setup_menu():
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
         BotCommand(command="status", description="状态"),
+        BotCommand(command="balance", description="查询余额"),
+        BotCommand(command="profit", description="获利与手续费"),
     ])
 
 
