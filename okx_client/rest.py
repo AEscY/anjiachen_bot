@@ -20,11 +20,15 @@ class OKXRest:
 
     # ==================== 网格 ====================
     def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
+        # 修复: 删除了 SDK 不支持的 triggerType 参数
         return self.grid.grid_order_algo(
-            instId=inst_id, algoOrdType="grid",
-            maxPx=str(max_px), minPx=str(min_px),
-            gridNum=str(grid_num), quoteSz=str(quote_sz),
-            triggerType="1", runType="1",
+            instId=inst_id,
+            algoOrdType="grid",
+            maxPx=str(max_px),
+            minPx=str(min_px),
+            gridNum=str(grid_num),
+            quoteSz=str(quote_sz),
+            runType="1",
         )
 
     def stop_grid(self, algo_id, inst_id):
@@ -67,14 +71,12 @@ class OKXRest:
 
     # ==================== 成交明细 ====================
     def get_fills(self, inst_type="SPOT", inst_id=None, limit=100):
-        """获取成交明细（最近3天）"""
         kwargs = {"instType": inst_type, "limit": str(limit)}
         if inst_id:
             kwargs["instId"] = inst_id
         return self.trade.get_fills(**kwargs)
 
     def get_fills_history(self, inst_type="SPOT", inst_id=None, limit=100):
-        """获取历史成交明细（最近3个月）"""
         kwargs = {"instType": inst_type, "limit": str(limit)}
         if inst_id:
             kwargs["instId"] = inst_id
@@ -82,5 +84,4 @@ class OKXRest:
 
     # ==================== 账户账单 ====================
     def get_bills(self, inst_type="SPOT", limit=100):
-        """获取账户账单流水（含手续费记录）"""
         return self.account.get_bills(instType=inst_type, limit=str(limit))
