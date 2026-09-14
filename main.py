@@ -7,7 +7,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, MenuButtonCommands, BotCommand
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -35,7 +34,6 @@ bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# ==================== 行情 / 订单回调 ====================
 async def on_ticker(inst_id: str, price: float, raw: dict):
     _last_price[inst_id] = price
     if dlg.MANAGER:
@@ -46,32 +44,31 @@ async def on_order_update(order: dict):
     await alert(f"订单更新: {order.get('instId')} {order.get('side')} {order.get('state')} @ {order.get('px')}")
 
 
-# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
 
+# ==================== 命令处理 ====================
+# 注意：这里不再有 await state.clear()，由 aiogram_dialog 自己管理状态
+
 @dp.message(CommandStart())
-async def cmd_start(msg: Message, dialog_manager: DialogManager, state: FSMContext):
+async def cmd_start(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
-    await state.clear()
     await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
 
 @dp.message(Command("menu"))
-async def cmd_menu(msg: Message, dialog_manager: DialogManager, state: FSMContext):
+async def cmd_menu(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
-    await state.clear()
     await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
 
 @dp.message(Command("list"))
-async def cmd_list(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_list(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -83,8 +80,7 @@ async def cmd_list(msg: Message, state: FSMContext):
 
 
 @dp.message(Command("add"))
-async def cmd_add(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_add(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -103,8 +99,7 @@ async def cmd_add(msg: Message, state: FSMContext):
 
 
 @dp.message(Command("remove"))
-async def cmd_remove(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_remove(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -123,8 +118,7 @@ async def cmd_remove(msg: Message, state: FSMContext):
 
 
 @dp.message(Command("status"))
-async def cmd_status(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_status(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -142,8 +136,7 @@ async def cmd_status(msg: Message, state: FSMContext):
 
 
 @dp.message(Command("balance"))
-async def cmd_balance(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_balance(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -170,8 +163,7 @@ async def cmd_balance(msg: Message, state: FSMContext):
 
 
 @dp.message(Command("profit"))
-async def cmd_profit(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_profit(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -205,7 +197,6 @@ async def cmd_profit(msg: Message, state: FSMContext):
     await msg.answer("\n".join(lines))
 
 
-# ==================== 菜单按钮 ====================
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -220,12 +211,10 @@ async def setup_menu():
     ])
 
 
-# ==================== 健康检查 ====================
 async def health(request):
     return web.Response(text="OK")
 
 
-# ==================== 启动入口 ====================
 async def main():
     manager = StrategyManager()
     dlg.MANAGER = manager
