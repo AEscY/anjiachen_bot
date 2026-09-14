@@ -3,10 +3,7 @@ import logging
 from okx_client.rest import OKXRest
 from strategies.grid import GridStrategy
 from strategies.dip_sell import DipSellStrategy
-from config import (
-    GRID_RANGE_PCT, GRID_NUM, GRID_QUOTE_SZ,
-    DIP_BUY_PCT, DIP_SELL_PCT, DIP_MAX_SPEND,
-)
+from config import GRID_QUOTE_SZ, DIP_MAX_SPEND
 
 logger = logging.getLogger(__name__)
 
@@ -36,24 +33,8 @@ class StrategyManager:
         except Exception as e:
             return False, f"获取行情失败: {e}"
 
-        grid_params = {
-            "minPx": round(price * (1 - GRID_RANGE_PCT), 6),
-            "maxPx": round(price * (1 + GRID_RANGE_PCT), 6),
-            "gridNum": GRID_NUM,
-            "quoteSz": GRID_QUOTE_SZ,
-        }
-        dip_params = {
-            "basePx": price,
-            "buyPct": DIP_BUY_PCT,
-            "sellPct": DIP_SELL_PCT,
-            "maxSpend": DIP_MAX_SPEND,
-            "use_signal": False,
-            "use_trend_filter": False,
-            "use_volume": False,
-        }
-
-        self.grids[inst_id] = GridStrategy(inst_id, grid_params)
-        self.dips[inst_id] = DipSellStrategy(inst_id, dip_params)
+        self.grids[inst_id] = GridStrategy(inst_id, {"quoteSz": GRID_QUOTE_SZ})
+        self.dips[inst_id] = DipSellStrategy(inst_id, {"maxSpend": DIP_MAX_SPEND})
         self._inst_ids.append(inst_id)
         logger.info(f"已添加 {inst_id} @ {price}")
         return True, f"已添加 {inst_id}，当前价 {price}"
@@ -62,7 +43,6 @@ class StrategyManager:
         inst_id = inst_id.upper().strip()
         if inst_id not in self.grids:
             return False, f"{inst_id} 不在监控中"
-
         grid = self.grids.pop(inst_id)
         dip = self.dips.pop(inst_id)
         try:
@@ -75,7 +55,6 @@ class StrategyManager:
                 await dip.stop()
         except Exception as e:
             logger.error(f"停止 {inst_id} 低吸高卖失败: {e}")
-
         self._inst_ids.remove(inst_id)
         return True, f"已删除 {inst_id}"
 
@@ -100,54 +79,3 @@ class StrategyManager:
                     logger.info(f"{inst_id} 网格已恢复: {latest['algoId']}")
             except Exception as e:
                 logger.error(f"{inst_id} 网格恢复失败: {e}")
-
-    async def _calc_atr(self, inst_id, period=14):
-        try:
-            resp = await asyncio.to_thread(self.rest.get_candles, inst_id, "1H", period + 1)
-            if resp.get("code") != "0" or not resp.get("data"):
-                return None
-            candles = list(reversed(resp["data"]))
-            if len(candles) < 2:
-                return None
-            trs = []
-            for i in range(1, len(candles)):
-                high = float(candles[i][2])
-                low = float(candles[i][3])
-                prev_close = float(candles[i - 1][4])
-                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-                trs.append(tr)
-            if not trs:
-                return None
-            return sum(trs) / len(trs)
-        except Exception as e:
-            logger.error(f"计算 {inst_id} ATR 失败: {e}")
-            return None
-
-    async def get_recommend_params(self, inst_id):
-        try:
-            resp = await asyncio.to_thread(self.rest.get_ticker, inst_id)
-            if resp.get("code") != "0" or not resp.get("data"):
-                return None
-            price = float(resp["data"][0]["last"])
-        except Exception as e:
-            logger.error(f"获取 {inst_id} 价格失败: {e}")
-            return None
-
-        atr = await self._calc_atr(inst_id)
-        if atr is None:
-            atr = price * 0.015
-
-        range_pct = 0.15
-        grid_num = 20
-        min_px = round(price * (1 - range_pct), 6)
-        max_px = round(price * (1 + range_pct), 6)
-        buy_px = round(price - 1.5 * atr, 6)
-        sell_px = round(price + 1.5 * atr, 6)
-
-        return {
-            "inst_id": inst_id,
-            "price": price,
-            "atr": atr,
-            "grid": {"minPx": min_px, "maxPx": max_px, "gridNum": grid_num},
-            "dip": {"buyPx": buy_px, "sellPx": sell_px},
-        }
