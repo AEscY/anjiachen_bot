@@ -17,7 +17,6 @@ PUB_WS = None
 _last_price: dict = {}
 
 
-# ==================== 解析工具 ====================
 def _parse_float(text: str):
     try:
         return float(text.strip()), None
@@ -211,7 +210,6 @@ async def on_apply_recommend(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id or not MANAGER:
         await cb.answer("请先选择币种", show_alert=True)
         return
-
     r = await MANAGER.get_recommend_params(inst_id)
     if not r:
         await cb.answer("获取推荐参数失败", show_alert=True)
@@ -231,7 +229,7 @@ async def on_apply_recommend(cb: CallbackQuery, button, manager: DialogManager):
         dip.params["buyPct"] = round(dip.buy_px / dip.base_px, 6)
         dip.params["sellPct"] = round(dip.sell_px / dip.base_px, 6)
 
-    await cb.answer("已应用推荐参数，请检查面板确认", show_alert=True)
+    await cb.answer("已应用推荐参数", show_alert=True)
     await manager.update()
 
 
@@ -405,8 +403,9 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
     if not dip:
         return {"inst_id": inst_id, "status": "未初始化", "base_px": "-",
                 "buy_px": "-", "sell_px": "-", "lastPx": "-", "position": "-",
-                "profit": "0", "fee": "0"}
+                "profit": "0", "fee": "0", "mode": "-"}
     s = dip.snapshot()
+    mode = "信号模式" if dip.params.get("use_signal") else "阈值模式"
     return {
         "inst_id": inst_id,
         "status": "监控中" if s["running"] else "已暂停",
@@ -417,6 +416,7 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
         "position": f"{s.get('position', 0):.6f}",
         "profit": f"{s.get('total_profit', 0):.4f}",
         "fee": f"{s.get('total_fee', 0):.4f}",
+        "mode": mode,
     }
 
 
@@ -439,6 +439,42 @@ async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
         return
     await dip.stop()
     await cb.answer("已暂停")
+    await manager.update()
+
+
+async def on_toggle_signal(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    if not dip:
+        await _handle_expired(cb, manager)
+        return
+    dip.params["use_signal"] = not dip.params.get("use_signal", False)
+    mode = "信号模式" if dip.params["use_signal"] else "阈值模式"
+    await cb.answer(f"已切换为 {mode}", show_alert=True)
+    await manager.update()
+
+
+async def on_toggle_trend(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    if not dip:
+        await _handle_expired(cb, manager)
+        return
+    dip.params["use_trend_filter"] = not dip.params.get("use_trend_filter", False)
+    state = "开启" if dip.params["use_trend_filter"] else "关闭"
+    await cb.answer(f"趋势过滤已{state}", show_alert=True)
+    await manager.update()
+
+
+async def on_toggle_volume(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    if not dip:
+        await _handle_expired(cb, manager)
+        return
+    dip.params["use_volume"] = not dip.params.get("use_volume", False)
+    state = "开启" if dip.params["use_volume"] else "关闭"
+    await cb.answer(f"成交量确认已{state}", show_alert=True)
     await manager.update()
 
 
@@ -515,6 +551,7 @@ dip_panel_window = Window(
     Format(
         "{inst_id} 低吸高卖\n"
         "状态: {status}\n"
+        "模式: {mode}\n"
         "基准价: {base_px}\n"
         "买入线: <= {buy_px}\n"
         "卖出线: >= {sell_px}\n"
@@ -526,6 +563,9 @@ dip_panel_window = Window(
     Column(
         Button(Const("启动监控"), id="dip_start", on_click=on_start_dip),
         Button(Const("暂停"), id="dip_stop", on_click=on_stop_dip),
+        Button(Const("切换信号模式"), id="toggle_signal", on_click=on_toggle_signal),
+        Button(Const("切换趋势过滤"), id="toggle_trend", on_click=on_toggle_trend),
+        Button(Const("切换成交量确认"), id="toggle_volume", on_click=on_toggle_volume),
         Button(Const("修改买入线"), id="dip_edit_buy", on_click=on_edit_dip_buy),
         Button(Const("修改卖出线"), id="dip_edit_sell", on_click=on_edit_dip_sell),
         Button(Const("修改基准价"), id="dip_edit_base", on_click=on_edit_dip_base),
