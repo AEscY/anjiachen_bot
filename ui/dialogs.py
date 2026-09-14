@@ -8,7 +8,6 @@ from aiogram_dialog.widgets.text import Const, Format
 
 from ui.states import AppSG
 from strategies.manager import StrategyManager
-from okx_client.rest import OKXRest
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +28,6 @@ def _parse_int(text: str):
         return int(text.strip()), None
     except ValueError:
         return None, "输入必须为整数"
-
-
-def _parse_range(text: str):
-    parts = text.replace(",", " ").split()
-    if len(parts) != 2:
-        return None, None, "格式错误，请输入：最低价 最高价，例如 55000 60000"
-    try:
-        return float(parts[0]), float(parts[1]), None
-    except ValueError:
-        return None, None, "价格必须为有效数字"
 
 
 async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
@@ -84,7 +73,7 @@ async def main_getter(dialog_manager: DialogManager, **kwargs):
 
 
 main_menu_window = Window(
-    Format("OKX 多币种控制台\n\n当前监控 {coins_count} 个币种："),
+    Format("OKX 全自动控制台\n\n当前监控 {coins_count} 个币种："),
     ScrollingGroup(
         Select(
             Format("{item[name]}  {item[price]}"),
@@ -123,6 +112,59 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
     }
 
 
+async def on_start_all(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    if not inst_id or not MANAGER:
+        await _handle_expired(cb, manager)
+        return
+
+    grid = MANAGER.grids.get(inst_id)
+    dip = MANAGER.dips.get(inst_id)
+    messages = []
+
+    if grid and not grid.running:
+        try:
+            await grid.start()
+            messages.append("网格已启动")
+        except Exception as e:
+            messages.append(f"网格启动失败: {e}")
+
+    if dip and not dip.running:
+        try:
+            await dip.start()
+            messages.append("低吸高卖已启动")
+        except Exception as e:
+            messages.append(f"低吸高卖启动失败: {e}")
+
+    text = " / ".join(messages) if messages else "已在运行"
+    await cb.answer(text, show_alert=True)
+    await manager.update()
+
+
+async def on_stop_all(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    if not inst_id or not MANAGER:
+        await _handle_expired(cb, manager)
+        return
+
+    grid = MANAGER.grids.get(inst_id)
+    dip = MANAGER.dips.get(inst_id)
+
+    if grid and grid.running:
+        try:
+            await grid.stop()
+        except Exception as e:
+            logger.error(f"停止网格失败: {e}")
+    if dip and dip.running:
+        try:
+            await dip.stop()
+        except Exception as e:
+            logger.error(f"停止低吸高卖失败: {e}")
+
+    await cb.answer("已停止全部策略", show_alert=True)
+    await manager.update()
+
+
 async def on_enter_grid(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
@@ -147,13 +189,12 @@ async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
             if len(current_coins) == 1:
                 inst_id = current_coins[0]
             else:
-                await cb.answer("页面已过期，请重新点击菜单选择要删除的币种", show_alert=True)
+                await cb.answer("页面已过期，请重新选择", show_alert=True)
                 await manager.start(AppSG.menu)
                 return
         else:
             await cb.answer("策略管理器未初始化", show_alert=True)
             return
-
     ok, text = await MANAGER.remove_inst(inst_id)
     if ok and PUB_WS:
         await PUB_WS.unsubscribe(inst_id)
@@ -161,91 +202,19 @@ async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     await manager.start(AppSG.menu)
 
 
-async def on_query_balance(cb: CallbackQuery, button, manager: DialogManager):
-    try:
-        rest = OKXRest()
-        resp = await asyncio.to_thread(rest.get_balance, "USDT")
-        if resp.get("code") != "0" or not resp.get("data"):
-            await cb.answer("查询失败", show_alert=True)
-            return
-        details = resp["data"][0].get("details", [])
-        lines = []
-        for d in details:
-            try:
-                eq = float(d.get("eq", 0))
-                avail = float(d.get("availBal", 0))
-            except (ValueError, TypeError):
-                continue
-            if eq > 0:
-                lines.append(f"{d.get('ccy')}: {eq:.4f} (可用 {avail:.4f})")
-        text = "\n".join(lines) if lines else "账户无资产"
-        await cb.answer(text, show_alert=True)
-    except Exception as e:
-        await cb.answer(f"查询失败: {e}", show_alert=True)
-
-
-async def on_show_recommend(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id or not MANAGER:
-        await cb.answer("请先选择币种", show_alert=True)
-        return
-    recommend = await MANAGER.get_recommend_params(inst_id)
-    if not recommend:
-        await cb.answer("获取推荐参数失败", show_alert=True)
-        return
-    text = (
-        f"{inst_id} 推荐参数\n"
-        f"当前价: {recommend['price']:.6f}\n"
-        f"ATR(14): {recommend['atr']:.6f}\n"
-        f"网格区间: {recommend['grid']['minPx']} - {recommend['grid']['maxPx']}\n"
-        f"网格数: {recommend['grid']['gridNum']}\n"
-        f"买入线: {recommend['dip']['buyPx']}\n"
-        f"卖出线: {recommend['dip']['sellPx']}"
-    )
-    await cb.answer(text, show_alert=True)
-
-
-async def on_apply_recommend(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id or not MANAGER:
-        await cb.answer("请先选择币种", show_alert=True)
-        return
-    r = await MANAGER.get_recommend_params(inst_id)
-    if not r:
-        await cb.answer("获取推荐参数失败", show_alert=True)
-        return
-
-    grid = MANAGER.grids.get(inst_id)
-    if grid:
-        grid.params["minPx"] = r["grid"]["minPx"]
-        grid.params["maxPx"] = r["grid"]["maxPx"]
-        grid.params["gridNum"] = r["grid"]["gridNum"]
-
-    dip = MANAGER.dips.get(inst_id)
-    if dip:
-        dip.base_px = r["price"]
-        dip.buy_px = r["dip"]["buyPx"]
-        dip.sell_px = r["dip"]["sellPx"]
-        dip.params["buyPct"] = round(dip.buy_px / dip.base_px, 6)
-        dip.params["sellPct"] = round(dip.sell_px / dip.base_px, 6)
-
-    await cb.answer("已应用推荐参数", show_alert=True)
-    await manager.update()
-
-
 coin_panel_window = Window(
     Format(
         "{inst_id}\n"
         "当前价: {lastPx}\n"
         "网格: {grid_status}\n"
-        "低吸高卖: {dip_status}"
+        "低吸高卖: {dip_status}\n"
+        "\n全自动模式：机器自己判断买卖点，无需手动改参数。"
     ),
     Column(
-        Button(Const("网格模式"), id="to_grid", on_click=on_enter_grid),
-        Button(Const("低吸高卖"), id="to_dip", on_click=on_enter_dip),
-        Button(Const("推荐参数"), id="show_recommend", on_click=on_show_recommend),
-        Button(Const("一键应用推荐参数"), id="apply_recommend", on_click=on_apply_recommend),
-        Button(Const("查询余额"), id="query_balance", on_click=on_query_balance),
+        Button(Const("启动全自动"), id="start_all", on_click=on_start_all),
+        Button(Const("停止全部"), id="stop_all", on_click=on_stop_all),
+        Button(Const("网格详情"), id="to_grid", on_click=on_enter_grid),
+        Button(Const("低吸高卖详情"), id="to_dip", on_click=on_enter_dip),
         Button(Const("删除此币种"), id="del_coin", on_click=on_delete_coin),
         Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(AppSG.menu)),
     ),
@@ -254,13 +223,13 @@ coin_panel_window = Window(
 )
 
 
-# ==================== 网格面板 ====================
+# ==================== 网格详情 ====================
 async def grid_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
     if not grid:
         return {"inst_id": inst_id, "status": "未初始化", "minPx": "-", "maxPx": "-",
-                "gridNum": "-", "lastPx": "-", "algo_id": "-"}
+                "gridNum": "-", "lastPx": "-", "algo_id": "-", "rebuilds": "0"}
     s = grid.snapshot()
     return {
         "inst_id": inst_id,
@@ -270,153 +239,52 @@ async def grid_getter(dialog_manager: DialogManager, **kwargs):
         "gridNum": s["params"].get("gridNum", "-"),
         "lastPx": _last_price.get(inst_id, "-"),
         "algo_id": s.get("algo_id") or "-",
+        "rebuilds": s.get("rebuild_count", 0),
     }
-
-
-async def on_start_grid(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if not grid:
-        await _handle_expired(cb, manager)
-        return
-    if grid.running:
-        await cb.answer("已在运行", show_alert=True)
-        return
-    try:
-        await grid.start()
-        await cb.answer("网格已启动")
-    except Exception as e:
-        await cb.answer(f"启动失败: {e}", show_alert=True)
-    await manager.update()
-
-
-async def on_stop_grid(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if not grid:
-        await _handle_expired(cb, manager)
-        return
-    if not grid.running:
-        await cb.answer("未在运行", show_alert=True)
-        return
-    try:
-        await grid.stop()
-        await cb.answer("已停止")
-    except Exception as e:
-        await cb.answer(f"停止失败: {e}", show_alert=True)
-    await manager.update()
-
-
-async def on_edit_grid_range(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.grid_edit_range)
-
-
-async def on_edit_grid_num(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.grid_edit_num)
-
-
-async def on_grid_range_input(msg: Message, widget, manager: DialogManager):
-    min_px, max_px, err = _parse_range(msg.text or "")
-    if err:
-        await msg.answer(err)
-        return
-    if min_px >= max_px:
-        await msg.answer("最低价必须小于最高价")
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if grid:
-        grid.params["minPx"] = min_px
-        grid.params["maxPx"] = max_px
-        await msg.answer(f"区间已修改为 {min_px} - {max_px}")
-    await manager.switch_to(AppSG.grid)
-
-
-async def on_grid_num_input(msg: Message, widget, manager: DialogManager):
-    num, err = _parse_int(msg.text or "")
-    if err:
-        await msg.answer(err)
-        return
-    if not (2 <= num <= 200):
-        await msg.answer("网格数应在 2-200 之间")
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    grid = MANAGER.grids.get(inst_id) if MANAGER else None
-    if grid:
-        grid.params["gridNum"] = num
-        await msg.answer(f"网格数已修改为 {num}")
-    await manager.switch_to(AppSG.grid)
 
 
 grid_panel_window = Window(
     Format(
-        "{inst_id} 网格\n"
+        "{inst_id} 全自动网格\n"
         "状态: {status}\n"
-        "价格区间: {minPx} - {maxPx}\n"
+        "自动区间: {minPx} - {maxPx}\n"
         "网格数: {gridNum}\n"
         "当前价: {lastPx}\n"
-        "Algo ID: {algo_id}"
+        "自动重建次数: {rebuilds}\n"
+        "Algo ID: {algo_id}\n"
+        "\n区间由 ATR 自动计算，价格接近边界时自动重建。"
     ),
     Column(
-        Button(Const("启动网格"), id="grid_start", on_click=on_start_grid),
-        Button(Const("停止并撤销"), id="grid_stop", on_click=on_stop_grid),
-        Button(Const("修改区间"), id="grid_edit_range", on_click=on_edit_grid_range),
-        Button(Const("修改网格数"), id="grid_edit_num", on_click=on_edit_grid_num),
         Back(Const("返回币种面板")),
     ),
     state=AppSG.grid,
     getter=grid_getter,
 )
 
-grid_edit_range_window = Window(
-    Const(
-        "修改价格区间\n\n"
-        "请输入两个价格，用空格或逗号分隔：\n"
-        "格式：最低价 最高价\n"
-        "示例：55000 60000"
-    ),
-    MessageInput(on_grid_range_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.grid)),
-    state=AppSG.grid_edit_range,
-)
 
-grid_edit_num_window = Window(
-    Const("修改网格数量\n\n请输入整数，建议 10-100："),
-    MessageInput(on_grid_num_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.grid)),
-    state=AppSG.grid_edit_num,
-)
-
-
-# ==================== 低吸高卖面板 ====================
+# ==================== 低吸高卖详情 ====================
 async def dip_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
-        return {"inst_id": inst_id, "status": "未初始化", "base_px": "-",
-                "buy_px": "-", "sell_px": "-", "lastPx": "-", "position": "-",
-                "profit": "0", "fee": "0", "mode": "-"}
+        return {"inst_id": inst_id, "status": "未初始化", "lastPx": "-",
+                "avg_buy_price": "-", "position": "-", "profit": "0", "fee": "0",
+                "sl": "5", "tp": "3", "last_action": "-"}
     s = dip.snapshot()
-    mode = "信号模式" if dip.params.get("use_signal") else "阈值模式"
+    avg = s.get("avg_buy_price", 0)
+    la = s.get("last_action")
+    la_text = f"{la[0]} @ {la[1]:.2f}" if la else "-"
     return {
         "inst_id": inst_id,
         "status": "监控中" if s["running"] else "已暂停",
-        "base_px": s.get("base_px", "-"),
-        "buy_px": round(s.get("buy_px", 0), 6),
-        "sell_px": round(s.get("sell_px", 0), 6),
         "lastPx": _last_price.get(inst_id, "-"),
+        "avg_buy_price": f"{avg:.6f}" if avg > 0 else "-",
         "position": f"{s.get('position', 0):.6f}",
         "profit": f"{s.get('total_profit', 0):.4f}",
         "fee": f"{s.get('total_fee', 0):.4f}",
-        "mode": mode,
+        "sl": f"{dip.params.get('stop_loss_pct', 0.05) * 100:.1f}",
+        "tp": f"{dip.params.get('take_profit_pct', 0.03) * 100:.1f}",
+        "last_action": la_text,
     }
 
 
@@ -442,158 +310,27 @@ async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
     await manager.update()
 
 
-async def on_toggle_signal(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        await _handle_expired(cb, manager)
-        return
-    dip.params["use_signal"] = not dip.params.get("use_signal", False)
-    mode = "信号模式" if dip.params["use_signal"] else "阈值模式"
-    await cb.answer(f"已切换为 {mode}", show_alert=True)
-    await manager.update()
-
-
-async def on_toggle_trend(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        await _handle_expired(cb, manager)
-        return
-    dip.params["use_trend_filter"] = not dip.params.get("use_trend_filter", False)
-    state = "开启" if dip.params["use_trend_filter"] else "关闭"
-    await cb.answer(f"趋势过滤已{state}", show_alert=True)
-    await manager.update()
-
-
-async def on_toggle_volume(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        await _handle_expired(cb, manager)
-        return
-    dip.params["use_volume"] = not dip.params.get("use_volume", False)
-    state = "开启" if dip.params["use_volume"] else "关闭"
-    await cb.answer(f"成交量确认已{state}", show_alert=True)
-    await manager.update()
-
-
-async def on_edit_dip_buy(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_buy)
-
-
-async def on_edit_dip_sell(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_sell)
-
-
-async def on_edit_dip_base(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_base)
-
-
-async def on_dip_buy_input(msg: Message, widget, manager: DialogManager):
-    px, err = _parse_float(msg.text or "")
-    if err:
-        await msg.answer(err)
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.buy_px = px
-        if dip.base_px > 0:
-            dip.params["buyPct"] = round(px / dip.base_px, 6)
-        await msg.answer(f"买入线已修改为 {px}")
-    await manager.switch_to(AppSG.dip)
-
-
-async def on_dip_sell_input(msg: Message, widget, manager: DialogManager):
-    px, err = _parse_float(msg.text or "")
-    if err:
-        await msg.answer(err)
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.sell_px = px
-        if dip.base_px > 0:
-            dip.params["sellPct"] = round(px / dip.base_px, 6)
-        await msg.answer(f"卖出线已修改为 {px}")
-    await manager.switch_to(AppSG.dip)
-
-
-async def on_dip_base_input(msg: Message, widget, manager: DialogManager):
-    px, err = _parse_float(msg.text or "")
-    if err:
-        await msg.answer(err)
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.base_px = px
-        dip.buy_px = px * dip.params["buyPct"]
-        dip.sell_px = px * dip.params["sellPct"]
-        await msg.answer(f"基准价已修改为 {px}")
-    await manager.switch_to(AppSG.dip)
-
-
 dip_panel_window = Window(
     Format(
-        "{inst_id} 低吸高卖\n"
+        "{inst_id} 全自动低吸高卖\n"
         "状态: {status}\n"
-        "模式: {mode}\n"
-        "基准价: {base_px}\n"
-        "买入线: <= {buy_px}\n"
-        "卖出线: >= {sell_px}\n"
         "当前价: {lastPx}\n"
         "持仓: {position}\n"
+        "平均买入价: {avg_buy_price}\n"
+        "止盈: +{tp}%\n"
+        "止损: -{sl}%\n"
+        "最近动作: {last_action}\n"
         "已实现盈亏: {profit} USDT\n"
-        "累计手续费: {fee} USDT"
+        "累计手续费: {fee} USDT\n"
+        "\n买卖完全由信号驱动，无需手动设价格。"
     ),
     Column(
         Button(Const("启动监控"), id="dip_start", on_click=on_start_dip),
         Button(Const("暂停"), id="dip_stop", on_click=on_stop_dip),
-        Button(Const("切换信号模式"), id="toggle_signal", on_click=on_toggle_signal),
-        Button(Const("切换趋势过滤"), id="toggle_trend", on_click=on_toggle_trend),
-        Button(Const("切换成交量确认"), id="toggle_volume", on_click=on_toggle_volume),
-        Button(Const("修改买入线"), id="dip_edit_buy", on_click=on_edit_dip_buy),
-        Button(Const("修改卖出线"), id="dip_edit_sell", on_click=on_edit_dip_sell),
-        Button(Const("修改基准价"), id="dip_edit_base", on_click=on_edit_dip_base),
         Back(Const("返回币种面板")),
     ),
     state=AppSG.dip,
     getter=dip_getter,
-)
-
-dip_edit_buy_window = Window(
-    Const("修改买入线\n\n请输入绝对价格，例如 58000："),
-    MessageInput(on_dip_buy_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_buy,
-)
-
-dip_edit_sell_window = Window(
-    Const("修改卖出线\n\n请输入绝对价格，例如 62000："),
-    MessageInput(on_dip_sell_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_sell,
-)
-
-dip_edit_base_window = Window(
-    Const("修改基准价\n\n请输入新的基准价，例如 60000："),
-    MessageInput(on_dip_base_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_base,
 )
 
 
@@ -603,12 +340,7 @@ main_dialog = Dialog(
     add_coin_window,
     coin_panel_window,
     grid_panel_window,
-    grid_edit_range_window,
-    grid_edit_num_window,
     dip_panel_window,
-    dip_edit_buy_window,
-    dip_edit_sell_window,
-    dip_edit_base_window,
 )
 
 
