@@ -7,6 +7,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, MenuButtonCommands, BotCommand
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -51,23 +52,26 @@ def _allowed(user_id: int) -> bool:
 
 
 @dp.message(CommandStart())
-async def cmd_start(msg: Message, dialog_manager: DialogManager):
+async def cmd_start(msg: Message, dialog_manager: DialogManager, state: FSMContext):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
+    await state.clear()
     await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
 
 @dp.message(Command("menu"))
-async def cmd_menu(msg: Message, dialog_manager: DialogManager):
+async def cmd_menu(msg: Message, dialog_manager: DialogManager, state: FSMContext):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
+    await state.clear()
     await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
 
 
 @dp.message(Command("list"))
-async def cmd_list(msg: Message):
+async def cmd_list(msg: Message, state: FSMContext):
+    await state.clear()
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -79,7 +83,8 @@ async def cmd_list(msg: Message):
 
 
 @dp.message(Command("add"))
-async def cmd_add(msg: Message):
+async def cmd_add(msg: Message, state: FSMContext):
+    await state.clear()
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -88,6 +93,9 @@ async def cmd_add(msg: Message):
         await msg.answer("用法: /add BTC-USDT")
         return
     inst_id = parts[1].strip().upper()
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
     ok, text = await dlg.MANAGER.add_inst(inst_id)
     if ok and dlg.PUB_WS:
         await dlg.PUB_WS.subscribe(inst_id)
@@ -95,7 +103,8 @@ async def cmd_add(msg: Message):
 
 
 @dp.message(Command("remove"))
-async def cmd_remove(msg: Message):
+async def cmd_remove(msg: Message, state: FSMContext):
+    await state.clear()
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -104,6 +113,9 @@ async def cmd_remove(msg: Message):
         await msg.answer("用法: /remove BTC-USDT")
         return
     inst_id = parts[1].strip().upper()
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
     ok, text = await dlg.MANAGER.remove_inst(inst_id)
     if ok and dlg.PUB_WS:
         await dlg.PUB_WS.unsubscribe(inst_id)
@@ -111,7 +123,8 @@ async def cmd_remove(msg: Message):
 
 
 @dp.message(Command("status"))
-async def cmd_status(msg: Message):
+async def cmd_status(msg: Message, state: FSMContext):
+    await state.clear()
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -129,7 +142,8 @@ async def cmd_status(msg: Message):
 
 
 @dp.message(Command("balance"))
-async def cmd_balance(msg: Message):
+async def cmd_balance(msg: Message, state: FSMContext):
+    await state.clear()
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
@@ -156,7 +170,8 @@ async def cmd_balance(msg: Message):
 
 
 @dp.message(Command("profit"))
-async def cmd_profit(msg: Message):
+async def cmd_profit(msg: Message, state: FSMContext):
+    await state.clear()
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
