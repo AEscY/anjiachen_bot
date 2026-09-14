@@ -2,6 +2,7 @@ import okx.Grid as Grid
 import okx.Trade as Trade
 import okx.Account as Account
 import okx.MarketData as MarketData
+import okx.PublicData as PublicData
 from config import OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, OKX_DEMO
 
 FLAG = "1" if OKX_DEMO else "0"
@@ -13,14 +14,22 @@ class OKXRest:
         self.trade = Trade.TradeAPI(OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, False, FLAG)
         self.account = Account.AccountAPI(OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, False, FLAG)
         self.market = MarketData.MarketAPI(flag=FLAG)
+        self.public = PublicData.PublicAPI(flag=FLAG)
 
     # ==================== 行情 ====================
     def get_ticker(self, inst_id):
         return self.market.get_ticker(instId=inst_id)
 
     def get_candles(self, inst_id, bar="1H", limit=20):
-        """获取K线数据，用于计算ATR"""
         return self.market.get_candlesticks(instId=inst_id, bar=bar, limit=str(limit))
+
+    # ==================== 交易产品规格 ====================
+    def get_instruments(self, inst_type="SPOT", inst_id=None):
+        """获取交易产品规格（含 minSz, lotSz, tickSz 等）"""
+        kwargs = {"instType": inst_type}
+        if inst_id:
+            kwargs["instId"] = inst_id
+        return self.public.get_instruments(**kwargs)
 
     # ==================== 网格 ====================
     def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
