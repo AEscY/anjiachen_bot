@@ -48,6 +48,7 @@ def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
 
+# ==================== 命令处理 ====================
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
@@ -132,6 +133,106 @@ async def cmd_status(msg: Message):
     await msg.answer("状态总览:\n" + "\n".join(lines))
 
 
+@dp.message(Command("positions"))
+async def cmd_positions(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    lines = ["建仓与挂单总览"]
+    has_any = False
+
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        s = dip.snapshot()
+        pos = s.get("position", 0)
+        pending_buy = s.get("pending_buy")
+        pending_sell = s.get("pending_sell")
+        last_action = s.get("last_action")
+        profit = s.get("total_profit", 0)
+        fee = s.get("total_fee", 0)
+        price = _last_price.get(iid, 0)
+
+        # 无持仓、无挂单、无历史动作，跳过（避免刷屏）
+        if pos <= 0 and not pending_buy and not pending_sell and not last_action:
+            continue
+
+        has_any = True
+        lines.append(f"\n{iid}")
+        lines.append(f"  当前价: {price}")
+        lines.append(f"  持仓: {pos:.6f}")
+        if s.get("avg_buy_price", 0) > 0:
+            lines.append(f"  平均买入价: {s['avg_buy_price']:.6f}")
+        if s.get("peak_price", 0) > 0:
+            lines.append(f"  持仓最高价: {s['peak_price']:.6f}")
+        if pending_buy:
+            lines.append(f"  ⏳ 挂单买入: {pending_buy}")
+        if pending_sell:
+            lines.append(f"  ⏳ 挂单卖出: {pending_sell}")
+        if last_action:
+            lines.append(f"  最近动作: {last_action[0]} @ {last_action[1]:.2f}")
+        lines.append(f"  已实现盈亏: {profit:.4f} USDT")
+        lines.append(f"  累计手续费: {fee:.4f} USDT")
+
+    if not has_any:
+        lines.append("\n暂无任何建仓、挂单或交易记录。")
+        lines.append("低吸高卖使用信号模式，需要 RSI 超卖 + 布林带下轨 + MACD 金叉同时满足。")
+        lines.append("发送 /signals 查看当前信号状态。")
+
+    await msg.answer("\n".join(lines))
+
+
+@dp.message(Command("signals"))
+async def cmd_signals(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    lines = ["信号诊断（1小时 K线）"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        try:
+            status = await dip.get_signal_status()
+        except Exception as e:
+            lines.append(f"\n{iid}: 获取失败 {e}")
+            continue
+
+        if "error" in status:
+            lines.append(f"\n{iid}: {status['error']}")
+            continue
+
+        rsi = status["rsi"]
+        bb_lower = status["bb_lower"]
+        price = status["price"]
+        rsi_ok = status["rsi_ok"]
+        bb_ok = status["bb_ok"]
+        macd_ok = status["macd_ok"]
+
+        lines.append(f"\n{iid}")
+        lines.append(f"  当前价: {price:.4f}")
+        lines.append(f"  RSI(14): {rsi:.1f} {'✅超卖' if rsi_ok else '❌需<30'}")
+        lines.append(f"  BB下轨: {bb_lower:.4f}  {'✅已触及' if bb_ok else '❌未触及'}")
+        lines.append(f"  MACD: {'✅金叉/转正' if macd_ok else '❌未金叉'}")
+        if status["buy_ready"]:
+            lines.append(f"  🎯 买入条件已满足")
+        else:
+            lines.append(f"  ⏳ 等待条件满足")
+
+    lines.append("\n提示：三个条件同时满足才会触发买入。")
+    lines.append("限价单挂单还需价格回调到买入价才能成交。")
+    await msg.answer("\n".join(lines))
+
+
 @dp.message(Command("balance"))
 async def cmd_balance(msg: Message):
     if not _allowed(msg.from_user.id):
@@ -194,32 +295,6 @@ async def cmd_profit(msg: Message):
     await msg.answer("\n".join(lines))
 
 
-@dp.message(Command("recommend"))
-async def cmd_recommend(msg: Message):
-    if not _allowed(msg.from_user.id):
-        await msg.answer("无权访问")
-        return
-    if not dlg.MANAGER:
-        await msg.answer("未初始化")
-        return
-    lines = ["实时推荐参数"]
-    for iid in dlg.MANAGER.all_inst_ids():
-        r = await dlg.MANAGER.get_recommend_params(iid)
-        if not r:
-            lines.append(f"\n{iid}: 获取失败")
-            continue
-        lines.append(
-            f"\n{iid}\n"
-            f"  当前价: {r['price']:.6f}\n"
-            f"  ATR(14): {r['atr']:.6f}\n"
-            f"  网格区间: {r['grid']['minPx']} - {r['grid']['maxPx']}\n"
-            f"  网格数: {r['grid']['gridNum']}\n"
-            f"  买入线: {r['dip']['buyPx']}\n"
-            f"  卖出线: {r['dip']['sellPx']}"
-        )
-    await msg.answer("\n".join(lines))
-
-
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -229,9 +304,10 @@ async def setup_menu():
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
         BotCommand(command="status", description="状态"),
+        BotCommand(command="positions", description="建仓与挂单"),
+        BotCommand(command="signals", description="信号诊断"),
         BotCommand(command="balance", description="查询余额"),
         BotCommand(command="profit", description="获利与手续费"),
-        BotCommand(command="recommend", description="推荐参数"),
     ])
 
 
