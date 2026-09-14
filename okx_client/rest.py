@@ -18,9 +18,12 @@ class OKXRest:
     def get_ticker(self, inst_id):
         return self.market.get_ticker(instId=inst_id)
 
+    def get_candles(self, inst_id, bar="1H", limit=20):
+        """获取K线数据，用于计算ATR"""
+        return self.market.get_candlesticks(instId=inst_id, bar=bar, limit=str(limit))
+
     # ==================== 网格 ====================
     def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
-        # 修复: 删除了 SDK 不支持的 triggerType 参数
         return self.grid.grid_order_algo(
             instId=inst_id,
             algoOrdType="grid",
