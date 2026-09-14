@@ -33,6 +33,8 @@ WEB_SERVER_PORT = int(os.environ.get("PORT", 10000))
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
+
 
 async def on_ticker(inst_id: str, price: float, raw: dict):
     _last_price[inst_id] = price
@@ -110,8 +112,7 @@ async def cmd_remove(msg: Message):
         await msg.answer("未初始化")
         return
     ok, text = await dlg.MANAGER.remove_inst(inst_id)
-    if ok and dlg.PUB_WS:
-        await dlg.PUB_WS.unsubscribe(inst_id)
+    if ok and dlg.P dlg.PUB_WS.unsubscribe(inst_id)
     await msg.answer(("成功: " if ok else "失败: ") + text)
 
 
@@ -129,8 +130,65 @@ async def cmd_status(msg: Message):
         d = dlg.MANAGER.dips.get(iid)
         gs = "运行" if (g and g.running) else "停止"
         ds = "运行" if (d and d.running) else "暂停"
-        lines.append(f"{iid} 网格{gs} 低吸高卖{ds} {_last_price.get(iid, '-')}")
+        bar = d.params.get("bar", "15m") if d else "-"
+        lines.append(f"{iid} 网格{gs} 低吸{ds} [{bar}] {_last_price.get(iid, '-')}")
     await msg.answer("状态总览:\n" + "\n".join(lines))
+
+
+@dp.message(Command("bar"))
+async def cmd_bar(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 3:
+        await msg.answer(
+            "用法: /bar <币种> <周期>\n"
+            f"可用周期: {', '.join(VALID_BARS)}\n"
+            "示例: /bar BTC-USDT 15m"
+        )
+        return
+    inst_id = parts[1].upper()
+    bar = parts[2]
+    if bar not in VALID_BARS:
+        await msg.answer(f"周期 {bar} 不支持。可用: {', '.join(VALID_BARS)}")
+        return
+    dip = dlg.MANAGER.dips.get(inst_id) if dlg.MANAGER else None
+    if not dip:
+        await msg.answer(f"{inst_id} 不在监控中")
+        return
+    await dip.set_param("bar", bar)
+    await msg.answer(f"{inst_id} K线周期已改为 {bar}，下次取K线生效。")
+
+
+@dp.message(Command("signal_params"))
+async def cmd_signal_params(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    lines = ["当前信号参数"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        p = dip.params
+        lines.append(
+            f"\n{iid}\n"
+            f"  K线周期: {p.get('bar', '15m')}\n"
+            f"  RSI: 周期{p.get('rsi_period', 14)} 超卖<{p.get('rsi_oversold', 30)} 超买>{p.get('rsi_overbought', 70)}\n"
+            f"  BB: 周期{p.get('bb_period', 20)} 标准差{p.get('bb_std', 2.0)}\n"
+            f"  MACD: {p.get('macd_fast', 12)}/{p.get('macd_slow', 26)}/{p.get('macd_signal', 9)}\n"
+            f"  EMA趋势: {p.get('ema_period', 200)}\n"
+            f"  成交量倍数: {p.get('vol_multiplier', 1.5)}\n"
+            f"  趋势过滤: {'开' if p.get('trend_filter', True) else '关'}\n"
+            f"  成交量确认: {'开' if p.get('volume_confirm', True) else '关'}"
+        )
+    lines.append("\n修改周期用 /bar <币种> <周期>")
+    lines.append("修改其他参数可扩展，需要时告诉我。")
+    await msg.answer("\n".join(lines))
 
 
 @dp.message(Command("positions"))
@@ -158,12 +216,11 @@ async def cmd_positions(msg: Message):
         fee = s.get("total_fee", 0)
         price = _last_price.get(iid, 0)
 
-        # 无持仓、无挂单、无历史动作，跳过（避免刷屏）
         if pos <= 0 and not pending_buy and not pending_sell and not last_action:
             continue
 
         has_any = True
-        lines.append(f"\n{iid}")
+        lines.append(f"\n{iid}  [{s.get('bar', '15m')}]")
         lines.append(f"  当前价: {price}")
         lines.append(f"  持仓: {pos:.6f}")
         if s.get("avg_buy_price", 0) > 0:
@@ -181,7 +238,6 @@ async def cmd_positions(msg: Message):
 
     if not has_any:
         lines.append("\n暂无任何建仓、挂单或交易记录。")
-        lines.append("低吸高卖使用信号模式，需要 RSI 超卖 + 布林带下轨 + MACD 金叉同时满足。")
         lines.append("发送 /signals 查看当前信号状态。")
 
     await msg.answer("\n".join(lines))
@@ -196,7 +252,7 @@ async def cmd_signals(msg: Message):
         await msg.answer("未初始化")
         return
 
-    lines = ["信号诊断（1小时 K线）"]
+    lines = ["信号诊断"]
     for iid in dlg.MANAGER.all_inst_ids():
         dip = dlg.MANAGER.dips.get(iid)
         if not dip:
@@ -217,10 +273,11 @@ async def cmd_signals(msg: Message):
         rsi_ok = status["rsi_ok"]
         bb_ok = status["bb_ok"]
         macd_ok = status["macd_ok"]
+        bar = status.get("bar", "15m")
 
-        lines.append(f"\n{iid}")
+        lines.append(f"\n{iid}  [{bar}]")
         lines.append(f"  当前价: {price:.4f}")
-        lines.append(f"  RSI(14): {rsi:.1f} {'✅超卖' if rsi_ok else '❌需<30'}")
+        lines.append(f"  RSI(14): {rsi:.1f} {'✅超卖' if rsi_ok else '❌需<' + str(status['rsi_oversold'])}")
         lines.append(f"  BB下轨: {bb_lower:.4f}  {'✅已触及' if bb_ok else '❌未触及'}")
         lines.append(f"  MACD: {'✅金叉/转正' if macd_ok else '❌未金叉'}")
         if status["buy_ready"]:
@@ -229,7 +286,8 @@ async def cmd_signals(msg: Message):
             lines.append(f"  ⏳ 等待条件满足")
 
     lines.append("\n提示：三个条件同时满足才会触发买入。")
-    lines.append("限价单挂单还需价格回调到买入价才能成交。")
+    lines.append("调整K线周期: /bar <币种> <周期>")
+    lines.append("查看参数: /signal_params")
     await msg.answer("\n".join(lines))
 
 
@@ -304,6 +362,8 @@ async def setup_menu():
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
         BotCommand(command="status", description="状态"),
+        BotCommand(command="bar", description="设置K线周期"),
+        BotCommand(command="signal_params", description="信号参数"),
         BotCommand(command="positions", description="建仓与挂单"),
         BotCommand(command="signals", description="信号诊断"),
         BotCommand(command="balance", description="查询余额"),
