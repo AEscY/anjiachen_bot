@@ -1,4 +1,3 @@
-# strategies/grid.py
 import asyncio
 import logging
 from strategies.base import BaseStrategy
@@ -8,24 +7,79 @@ logger = logging.getLogger(__name__)
 
 
 class GridStrategy(BaseStrategy):
-    def __init__(self, inst_id: str, params: dict | None = None):
-        # 默认参数（只在未传时使用）
+    def __init__(self, inst_id, params=None):
         default = {
             "minPx": 0,
             "maxPx": 0,
             "gridNum": 20,
             "quoteSz": 100,
+            "auto_mode": True,
+            "rebuild_threshold": 0.03,
         }
         merged = {**default, **(params or {})}
         super().__init__(inst_id, merged)
         self.rest = OKXRest()
         self.algo_id = None
         self._monitor_task = None
+        self._last_price = 0.0
+        self.rebuild_count = 0
 
     async def start(self):
         if self.running:
             return
-        r = self.rest.create_spot_grid(
+        if self.params.get("auto_mode", True):
+            await self._calc_auto_params()
+        await self._create_grid()
+
+    async def _calc_auto_params(self):
+        resp = await asyncio.to_thread(self.rest.get_ticker, self.inst_id)
+        if resp.get("code") != "0" or not resp.get("data"):
+            raise RuntimeError("获取行情失败")
+        price = float(resp["data"][0]["last"])
+
+        atr = await self._calc_atr()
+        if atr is None:
+            atr = price * 0.015
+
+        # 区间：当前价 ± max(15%, 2.5倍ATR)
+        range_pct = max(0.15, 2.5 * atr / price)
+        self.params["minPx"] = round(price * (1 - range_pct), 6)
+        self.params["maxPx"] = round(price * (1 + range_pct), 6)
+
+        # 网格数：确保间距 0.5%~1%
+        span = self.params["maxPx"] - self.params["minPx"]
+        grid_num = int(span / price / 0.008)
+        grid_num = max(10, min(60, grid_num))
+        self.params["gridNum"] = grid_num
+
+        logger.info(
+            f"{self.inst_id} 自动参数: 区间 {self.params['minPx']}-{self.params['maxPx']}, "
+            f"网格数 {grid_num}, ATR {atr:.2f}"
+        )
+
+    async def _calc_atr(self, period=14):
+        try:
+            resp = await asyncio.to_thread(self.rest.get_candles, self.inst_id, "1H", period + 1)
+            if resp.get("code") != "0" or not resp.get("data"):
+                return None
+            candles = list(reversed(resp["data"]))
+            if len(candles) < 2:
+                return None
+            trs = []
+            for i in range(1, len(candles)):
+                high = float(candles[i][2])
+                low = float(candles[i][3])
+                prev_close = float(candles[i - 1][4])
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                trs.append(tr)
+            return sum(trs) / len(trs) if trs else None
+        except Exception as e:
+            logger.error(f"{self.inst_id} 计算ATR失败: {e}")
+            return None
+
+    async def _create_grid(self):
+        r = await asyncio.to_thread(
+            self.rest.create_spot_grid,
             self.inst_id,
             self.params["minPx"],
             self.params["maxPx"],
@@ -37,17 +91,48 @@ class GridStrategy(BaseStrategy):
             raise RuntimeError(f"网格创建失败: {r}")
         self.algo_id = data[0]["algoId"]
         self.running = True
-        self._monitor_task = asyncio.create_task(self._monitor())
         logger.info(f"{self.inst_id} 网格已启动: {self.algo_id}")
+
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor())
 
     async def _monitor(self):
         while self.running:
-            await asyncio.sleep(60)
-            # 后续可加边界重建逻辑
+            await asyncio.sleep(300)
+            if not self.running:
+                break
+            try:
+                price = self._last_price
+                if price <= 0:
+                    continue
+                threshold = self.params.get("rebuild_threshold", 0.03)
+                min_px = self.params["minPx"]
+                max_px = self.params["maxPx"]
+                if price < min_px * (1 + threshold) or price > max_px * (1 - threshold):
+                    logger.info(f"{self.inst_id} 价格 {price} 接近边界，自动重建网格")
+                    await self._rebuild()
+            except Exception as e:
+                logger.error(f"{self.inst_id} 监控失败: {e}")
 
-    async def on_ticker(self, price: float, raw: dict):
-        # 网格由 OKX 服务端执行，此处留空给未来扩展
-        pass
+    async def _rebuild(self):
+        old_algo = self.algo_id
+        try:
+            if old_algo:
+                await asyncio.to_thread(self.rest.stop_grid, old_algo, self.inst_id)
+        except Exception as e:
+            logger.error(f"停止旧网格失败: {e}")
+        self.running = False
+        await asyncio.sleep(3)
+        try:
+            await self._calc_auto_params()
+            await self._create_grid()
+            self.rebuild_count += 1
+            logger.info(f"{self.inst_id} 网格已自动重建 #{self.rebuild_count}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 网格重建失败: {e}")
+
+    async def on_ticker(self, price, raw):
+        self._last_price = price
 
     async def stop(self):
         self.running = False
@@ -56,12 +141,15 @@ class GridStrategy(BaseStrategy):
             self._monitor_task = None
         if self.algo_id:
             try:
-                self.rest.stop_grid(self.algo_id, self.inst_id)
+                await asyncio.to_thread(self.rest.stop_grid, self.algo_id, self.inst_id)
             except Exception as e:
                 logger.error(f"停止网格失败: {e}")
             self.algo_id = None
 
     def snapshot(self):
         s = super().snapshot()
-        s["algo_id"] = self.algo_id
+        s.update({
+            "algo_id": self.algo_id,
+            "rebuild_count": self.rebuild_count,
+        })
         return s
