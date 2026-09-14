@@ -18,7 +18,7 @@ class DipSellStrategy(BaseStrategy):
             "trailing_pct": 0.02,
             "trend_filter": True,
             "volume_confirm": True,
-            "limit_offset_pct": 0.002,   # 限价单挂单偏移
+            "limit_offset_pct": 0.002,
         }
         merged = {**default, **(params or {})}
         super().__init__(inst_id, merged)
@@ -33,7 +33,6 @@ class DipSellStrategy(BaseStrategy):
         self.trade_count = 0
         self._last_action = None
 
-        # 挂单状态
         self._pending_buy_ord_id = None
         self._pending_sell_ord_id = None
 
@@ -57,7 +56,6 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 加载规格失败: {e}")
 
     async def _restore_pending_orders(self):
-        """启动时从 OKX 恢复未成交挂单状态"""
         try:
             resp = await asyncio.to_thread(self.rest.get_pending_orders, self.inst_id)
             if resp.get("code") != "0":
@@ -131,16 +129,14 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
     async def _do_limit_buy(self, price):
-        """限价买入（Maker）"""
         offset = self.params.get("limit_offset_pct", 0.002)
         buy_price = round(price * (1 - offset), 6)
 
         spend = self.params.get("maxSpend", 100)
         size = spend / buy_price
-        # 对齐 lotSz
         if self._lot_sz > 0:
             size = round(size / self._lot_sz) * self._lot_sz
-        if size < self._min_sz:
+        if self._min_sz > 0 and size < self._min_sz:
             logger.warning(f"{self.inst_id} 买入数量 {size} < 最小 {self._min_sz}")
             return
 
@@ -154,7 +150,6 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 限价买入失败: {e}")
 
     async def _do_limit_sell(self, price):
-        """限价卖出（Maker）"""
         sell_size = self.position
         if sell_size <= 0:
             return
@@ -216,18 +211,16 @@ class DipSellStrategy(BaseStrategy):
             return
         self._last_price = price
 
-        # 持仓时检查卖出
         if self.position > 0:
             if self._pending_sell_ord_id:
-                return  # 已有挂单，等待成交
+                return
             reason = await self._check_sell(price)
             if reason:
                 await self._do_limit_sell(price)
             return
 
-        # 空仓时检查买入
         if self._pending_buy_ord_id:
-            return  # 已有挂单，等待成交
+            return
 
         if time.time() < self._buy_disabled_until:
             return
@@ -252,7 +245,6 @@ class DipSellStrategy(BaseStrategy):
 
     async def stop(self):
         self.running = False
-        # 撤销未成交挂单
         for ord_id in [self._pending_buy_ord_id, self._pending_sell_ord_id]:
             if ord_id:
                 try:
@@ -261,6 +253,45 @@ class DipSellStrategy(BaseStrategy):
                     logger.error(f"撤单失败: {e}")
         self._pending_buy_ord_id = None
         self._pending_sell_ord_id = None
+
+    async def get_signal_status(self):
+        """返回信号诊断信息，用于 /signals 命令"""
+        ind = await self._get_indicators()
+        if not ind:
+            return {"inst_id": self.inst_id, "error": "K线数据不足（需要约50根以上）"}
+
+        rsi = ind["rsi"]
+        close = ind["close"]
+        bb_lower = ind["bb_lower"]
+        bb_upper = ind["bb_upper"]
+        macd = ind["macd"]
+        macd_sig = ind["macd_signal"]
+        macd_hist = ind["macd_hist"]
+        macd_prev = ind["macd_hist_prev"]
+
+        rsi_ok = rsi is not None and rsi < self.signal_engine.rsi_oversold
+        bb_ok = bb_lower is not None and close <= bb_lower
+        macd_ok = False
+        if macd is not None and macd_sig is not None and macd > macd_sig:
+            macd_ok = True
+        if macd_hist is not None and macd_prev is not None and macd_hist > 0 and macd_prev <= 0:
+            macd_ok = True
+
+        return {
+            "inst_id": self.inst_id,
+            "price": close,
+            "rsi": rsi,
+            "rsi_oversold": self.signal_engine.rsi_oversold,
+            "rsi_ok": rsi_ok,
+            "bb_lower": bb_lower,
+            "bb_upper": bb_upper,
+            "bb_ok": bb_ok,
+            "macd_ok": macd_ok,
+            "macd_hist": macd_hist,
+            "buy_ready": rsi_ok and bb_ok and macd_ok,
+            "trend_filter": self.params.get("trend_filter", True),
+            "volume_confirm": self.params.get("volume_confirm", True),
+        }
 
     def snapshot(self):
         s = super().snapshot()
