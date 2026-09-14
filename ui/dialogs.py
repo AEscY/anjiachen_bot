@@ -326,8 +326,14 @@ grid_panel_window = Window(
     getter=grid_getter,
 )
 
+# 优化后的提示文本，明确格式和示例
 grid_edit_range_window = Window(
-    Const("修改价格区间\n\n请输入最低价和最高价，用空格或逗号分隔。\n例如：55000 60000"),
+    Const(
+        "修改价格区间\n\n"
+        "请输入两个价格，用空格或逗号分隔：\n"
+        "格式：最低价 最高价\n"
+        "示例：55000 60000"
+    ),
     MessageInput(on_grid_range_input),
     Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.grid)),
     state=AppSG.grid_edit_range,
