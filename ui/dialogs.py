@@ -97,11 +97,19 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
+
+    active = "无"
+    if grid and grid.running:
+        active = "网格"
+    elif dip and dip.running:
+        active = "低吸高卖"
+
     return {
         "inst_id": inst_id,
         "grid_status": "运行中" if (grid and grid.running) else "已停止",
         "dip_status": "监控中" if (dip and dip.running) else "已暂停",
         "lastPx": _last_price.get(inst_id, "-"),
+        "active_mode": active,
     }
 
 
@@ -114,6 +122,7 @@ async def on_toggle_grid(cb: CallbackQuery, button, manager: DialogManager):
     if not grid:
         await cb.answer("未初始化", show_alert=True)
         return
+
     if grid.running:
         try:
             await grid.stop()
@@ -121,11 +130,8 @@ async def on_toggle_grid(cb: CallbackQuery, button, manager: DialogManager):
         except Exception as e:
             await cb.answer(f"停止失败: {e}", show_alert=True)
     else:
-        try:
-            await grid.start()
-            await cb.answer("网格已启动")
-        except Exception as e:
-            await cb.answer(f"启动失败: {e}", show_alert=True)
+        ok, msg = await MANAGER.activate_grid_only(inst_id)
+        await cb.answer(msg, show_alert=True)
     await manager.update()
 
 
@@ -138,36 +144,13 @@ async def on_toggle_dip(cb: CallbackQuery, button, manager: DialogManager):
     if not dip:
         await cb.answer("未初始化", show_alert=True)
         return
+
     if dip.running:
         await dip.stop()
         await cb.answer("低吸高卖已暂停")
     else:
-        await dip.start()
-        await cb.answer("低吸高卖已启动")
-    await manager.update()
-
-
-async def on_start_all(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id or not MANAGER:
-        await _handle_expired(cb, manager)
-        return
-    grid = MANAGER.grids.get(inst_id)
-    dip = MANAGER.dips.get(inst_id)
-    messages = []
-    if grid and not grid.running:
-        try:
-            await grid.start()
-            messages.append("网格已启动")
-        except Exception as e:
-            messages.append(f"网格失败: {e}")
-    if dip and not dip.running:
-        try:
-            await dip.start()
-            messages.append("低吸高卖已启动")
-        except Exception as e:
-            messages.append(f"低吸高卖失败: {e}")
-    await cb.answer(" / ".join(messages) if messages else "已在运行", show_alert=True)
+        ok, msg = await MANAGER.activate_dip_only(inst_id)
+        await cb.answer(msg, show_alert=True)
     await manager.update()
 
 
@@ -176,19 +159,8 @@ async def on_stop_all(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id or not MANAGER:
         await _handle_expired(cb, manager)
         return
-    grid = MANAGER.grids.get(inst_id)
-    dip = MANAGER.dips.get(inst_id)
-    if grid and grid.running:
-        try:
-            await grid.stop()
-        except Exception as e:
-            logger.error(f"停止网格失败: {e}")
-    if dip and dip.running:
-        try:
-            await dip.stop()
-        except Exception as e:
-            logger.error(f"停止低吸高卖失败: {e}")
-    await cb.answer("已停止全部策略", show_alert=True)
+    ok, msg = await MANAGER.stop_all_strategies(inst_id)
+    await cb.answer(msg, show_alert=True)
     await manager.update()
 
 
@@ -233,14 +205,14 @@ coin_panel_window = Window(
     Format(
         "{inst_id}\n"
         "当前价: {lastPx}\n"
+        "当前模式: {active_mode}\n"
         "网格: {grid_status}\n"
         "低吸高卖: {dip_status}\n"
-        "\n两个策略可以独立开关。"
+        "\n注意: 两个模式互斥，启用一个会自动停止另一个。"
     ),
     Column(
-        Button(Const("切换网格开关"), id="toggle_grid", on_click=on_toggle_grid),
-        Button(Const("切换低吸高卖开关"), id="toggle_dip", on_click=on_toggle_dip),
-        Button(Const("启动全部"), id="start_all", on_click=on_start_all),
+        Button(Const("启用网格 (自动停低吸)"), id="toggle_grid", on_click=on_toggle_grid),
+        Button(Const("启用低吸 (自动停网格)"), id="toggle_dip", on_click=on_toggle_dip),
         Button(Const("停止全部"), id="stop_all", on_click=on_stop_all),
         Button(Const("网格详情"), id="to_grid", on_click=on_enter_grid),
         Button(Const("低吸高卖详情"), id="to_dip", on_click=on_enter_dip),
@@ -258,7 +230,8 @@ async def grid_getter(dialog_manager: DialogManager, **kwargs):
     grid = MANAGER.grids.get(inst_id) if MANAGER else None
     if not grid:
         return {"inst_id": inst_id, "status": "未初始化", "minPx": "-", "maxPx": "-",
-                "gridNum": "-", "lastPx": "-", "algo_id": "-", "rebuilds": "0"}
+                "gridNum": "-", "lastPx": "-", "algo_id": "-",
+                "tp_px": "-", "sl_px": "-", "quoteSz": "-"}
     s = grid.snapshot()
     return {
         "inst_id": inst_id,
@@ -268,7 +241,9 @@ async def grid_getter(dialog_manager: DialogManager, **kwargs):
         "gridNum": s["params"].get("gridNum", "-"),
         "lastPx": _last_price.get(inst_id, "-"),
         "algo_id": s.get("algo_id") or "-",
-        "rebuilds": s.get("rebuild_count", 0),
+        "tp_px": s.get("tp_px") or "-",
+        "sl_px": s.get("sl_px") or "-",
+        "quoteSz": s["params"].get("quoteSz", "-"),
     }
 
 
@@ -278,9 +253,12 @@ grid_panel_window = Window(
         "状态: {status}\n"
         "自动区间: {minPx} - {maxPx}\n"
         "网格数: {gridNum}\n"
+        "投入金额: {quoteSz} USDT\n"
+        "止盈价: {tp_px}\n"
+        "止损价: {sl_px}\n"
         "当前价: {lastPx}\n"
-        "自动重建次数: {rebuilds}\n"
-        "Algo ID: {algo_id}"
+        "Algo ID: {algo_id}\n"
+        "\n止盈止损由 OKX 服务端自动执行。"
     ),
     Column(
         Back(Const("返回币种面板")),
@@ -299,7 +277,8 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
                 "avg_buy_price": "-", "peak_price": "-", "position": "-",
                 "profit": "0", "fee": "0", "sl": "5", "tp": "3",
                 "trailing_state": "开启", "trailing_pct": "2",
-                "spend": "100", "last_action": "-"}
+                "spend": "100", "last_action": "-",
+                "pending_buy": "-", "pending_sell": "-"}
     s = dip.snapshot()
     avg = s.get("avg_buy_price", 0)
     peak = s.get("peak_price", 0)
@@ -320,17 +299,18 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
         "trailing_pct": f"{dip.params.get('trailing_pct', 0.02) * 100:.1f}",
         "spend": f"{dip.params.get('maxSpend', 100):.0f}",
         "last_action": la_text,
+        "pending_buy": s.get("pending_buy") or "-",
+        "pending_sell": s.get("pending_sell") or "-",
     }
 
 
 async def on_start_dip(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
+    if not inst_id or not MANAGER:
         await _handle_expired(cb, manager)
         return
-    await dip.start()
-    await cb.answer("已启动")
+    ok, msg = await MANAGER.activate_dip_only(inst_id)
+    await cb.answer(msg, show_alert=True)
     await manager.update()
 
 
@@ -454,6 +434,8 @@ dip_panel_window = Window(
         "移动止盈: {trailing_state} (回撤 {trailing_pct}%)\n"
         "单次金额: {spend} USDT\n"
         "最近动作: {last_action}\n"
+        "挂单买入: {pending_buy}\n"
+        "挂单卖出: {pending_sell}\n"
         "已实现盈亏: {profit} USDT\n"
         "累计手续费: {fee} USDT"
     ),
