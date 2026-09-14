@@ -6,7 +6,7 @@ from aiogram_dialog.widgets.input import MessageInput
 from aiogram_dialog.widgets.kbd import Button, Back, Column, Select, ScrollingGroup
 from aiogram_dialog.widgets.text import Const, Format
 
-from ui.states import MainSG, CoinSG
+from ui.states import AppSG
 from strategies.manager import StrategyManager
 from okx_client.rest import OKXRest
 
@@ -44,24 +44,23 @@ def _parse_range(text: str):
 
 async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
     await cb.answer("页面已过期，请重新选择币种", show_alert=True)
-    await manager.start(MainSG.menu)
+    await manager.start(AppSG.menu)
 
 
 # ==================== 主菜单 ====================
 async def on_coin_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
     manager.dialog_data["inst_id"] = item_id
-    await manager.switch_to(CoinSG.panel)
+    await manager.switch_to(AppSG.coin_panel)
 
 
 async def on_add_coin_click(cb: CallbackQuery, button, manager: DialogManager):
-    await manager.switch_to(MainSG.add_coin)
+    await manager.switch_to(AppSG.add_coin)
 
 
 async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
     if not MANAGER:
         return
     text = (msg.text or "").strip()
-    # 关键：输入命令时直接放行，交给命令处理器
     if text.startswith("/"):
         return
     if not text:
@@ -75,7 +74,7 @@ async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
             await PUB_WS.subscribe(inst_id)
     else:
         await msg.answer(result)
-    await manager.switch_to(MainSG.menu)
+    await manager.switch_to(AppSG.menu)
 
 
 async def main_getter(dialog_manager: DialogManager, **kwargs):
@@ -100,15 +99,15 @@ main_menu_window = Window(
         height=8,
     ),
     Button(Const("添加币种"), id="add_coin", on_click=on_add_coin_click),
-    state=MainSG.menu,
+    state=AppSG.menu,
     getter=main_getter,
 )
 
 add_coin_window = Window(
     Const("添加币种\n\n请输入币种名称，例如 BTC-USDT："),
     MessageInput(on_add_coin_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(MainSG.menu)),
-    state=MainSG.add_coin,
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.menu)),
+    state=AppSG.add_coin,
 )
 
 
@@ -130,7 +129,7 @@ async def on_enter_grid(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.grid)
+    await manager.switch_to(AppSG.grid)
 
 
 async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
@@ -138,7 +137,7 @@ async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.dip)
+    await manager.switch_to(AppSG.dip)
 
 
 async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
@@ -150,7 +149,7 @@ async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
                 inst_id = current_coins[0]
             else:
                 await cb.answer("页面已过期，请重新点击菜单选择要删除的币种", show_alert=True)
-                await manager.start(MainSG.menu)
+                await manager.start(AppSG.menu)
                 return
         else:
             await cb.answer("策略管理器未初始化", show_alert=True)
@@ -160,7 +159,7 @@ async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     if ok and PUB_WS:
         await PUB_WS.unsubscribe(inst_id)
     await cb.answer(text, show_alert=True)
-    await manager.start(MainSG.menu)
+    await manager.start(AppSG.menu)
 
 
 async def on_query_balance(cb: CallbackQuery, button, manager: DialogManager):
@@ -198,9 +197,9 @@ coin_panel_window = Window(
         Button(Const("低吸高卖"), id="to_dip", on_click=on_enter_dip),
         Button(Const("查询余额"), id="query_balance", on_click=on_query_balance),
         Button(Const("删除此币种"), id="del_coin", on_click=on_delete_coin),
-        Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(MainSG.menu)),
+        Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(AppSG.menu)),
     ),
-    state=CoinSG.panel,
+    state=AppSG.coin_panel,
     getter=coin_getter,
 )
 
@@ -263,7 +262,7 @@ async def on_edit_grid_range(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.grid_edit_range)
+    await manager.switch_to(AppSG.grid_edit_range)
 
 
 async def on_edit_grid_num(cb: CallbackQuery, button, manager: DialogManager):
@@ -271,7 +270,7 @@ async def on_edit_grid_num(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.grid_edit_num)
+    await manager.switch_to(AppSG.grid_edit_num)
 
 
 async def on_grid_range_input(msg: Message, widget, manager: DialogManager):
@@ -288,7 +287,7 @@ async def on_grid_range_input(msg: Message, widget, manager: DialogManager):
         grid.params["minPx"] = min_px
         grid.params["maxPx"] = max_px
         await msg.answer(f"区间已修改为 {min_px} - {max_px}")
-    await manager.switch_to(CoinSG.grid)
+    await manager.switch_to(AppSG.grid)
 
 
 async def on_grid_num_input(msg: Message, widget, manager: DialogManager):
@@ -304,7 +303,7 @@ async def on_grid_num_input(msg: Message, widget, manager: DialogManager):
     if grid:
         grid.params["gridNum"] = num
         await msg.answer(f"网格数已修改为 {num}")
-    await manager.switch_to(CoinSG.grid)
+    await manager.switch_to(AppSG.grid)
 
 
 grid_panel_window = Window(
@@ -323,22 +322,22 @@ grid_panel_window = Window(
         Button(Const("修改网格数"), id="grid_edit_num", on_click=on_edit_grid_num),
         Back(Const("返回币种面板")),
     ),
-    state=CoinSG.grid,
+    state=AppSG.grid,
     getter=grid_getter,
 )
 
 grid_edit_range_window = Window(
     Const("修改价格区间\n\n请输入最低价和最高价，用空格或逗号分隔。\n例如：55000 60000"),
     MessageInput(on_grid_range_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.grid)),
-    state=CoinSG.grid_edit_range,
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.grid)),
+    state=AppSG.grid_edit_range,
 )
 
 grid_edit_num_window = Window(
     Const("修改网格数量\n\n请输入整数，建议 10-100："),
     MessageInput(on_grid_num_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.grid)),
-    state=CoinSG.grid_edit_num,
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.grid)),
+    state=AppSG.grid_edit_num,
 )
 
 
@@ -391,7 +390,7 @@ async def on_edit_dip_buy(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.dip_edit_buy)
+    await manager.switch_to(AppSG.dip_edit_buy)
 
 
 async def on_edit_dip_sell(cb: CallbackQuery, button, manager: DialogManager):
@@ -399,7 +398,7 @@ async def on_edit_dip_sell(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.dip_edit_sell)
+    await manager.switch_to(AppSG.dip_edit_sell)
 
 
 async def on_edit_dip_base(cb: CallbackQuery, button, manager: DialogManager):
@@ -407,7 +406,7 @@ async def on_edit_dip_base(cb: CallbackQuery, button, manager: DialogManager):
     if not inst_id:
         await _handle_expired(cb, manager)
         return
-    await manager.switch_to(CoinSG.dip_edit_base)
+    await manager.switch_to(AppSG.dip_edit_base)
 
 
 async def on_dip_buy_input(msg: Message, widget, manager: DialogManager):
@@ -422,7 +421,7 @@ async def on_dip_buy_input(msg: Message, widget, manager: DialogManager):
         if dip.base_px > 0:
             dip.params["buyPct"] = round(px / dip.base_px, 6)
         await msg.answer(f"买入线已修改为 {px}")
-    await manager.switch_to(CoinSG.dip)
+    await manager.switch_to(AppSG.dip)
 
 
 async def on_dip_sell_input(msg: Message, widget, manager: DialogManager):
@@ -437,7 +436,7 @@ async def on_dip_sell_input(msg: Message, widget, manager: DialogManager):
         if dip.base_px > 0:
             dip.params["sellPct"] = round(px / dip.base_px, 6)
         await msg.answer(f"卖出线已修改为 {px}")
-    await manager.switch_to(CoinSG.dip)
+    await manager.switch_to(AppSG.dip)
 
 
 async def on_dip_base_input(msg: Message, widget, manager: DialogManager):
@@ -452,7 +451,7 @@ async def on_dip_base_input(msg: Message, widget, manager: DialogManager):
         dip.buy_px = px * dip.params["buyPct"]
         dip.sell_px = px * dip.params["sellPct"]
         await msg.answer(f"基准价已修改为 {px}")
-    await manager.switch_to(CoinSG.dip)
+    await manager.switch_to(AppSG.dip)
 
 
 dip_panel_window = Window(
@@ -475,33 +474,33 @@ dip_panel_window = Window(
         Button(Const("修改基准价"), id="dip_edit_base", on_click=on_edit_dip_base),
         Back(Const("返回币种面板")),
     ),
-    state=CoinSG.dip,
+    state=AppSG.dip,
     getter=dip_getter,
 )
 
 dip_edit_buy_window = Window(
     Const("修改买入线\n\n请输入绝对价格，例如 58000："),
     MessageInput(on_dip_buy_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.dip)),
-    state=CoinSG.dip_edit_buy,
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
+    state=AppSG.dip_edit_buy,
 )
 
 dip_edit_sell_window = Window(
     Const("修改卖出线\n\n请输入绝对价格，例如 62000："),
     MessageInput(on_dip_sell_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.dip)),
-    state=CoinSG.dip_edit_sell,
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
+    state=AppSG.dip_edit_sell,
 )
 
 dip_edit_base_window = Window(
     Const("修改基准价\n\n请输入新的基准价，例如 60000："),
     MessageInput(on_dip_base_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.dip)),
-    state=CoinSG.dip_edit_base,
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
+    state=AppSG.dip_edit_base,
 )
 
 
-# ==================== Dialog 组装（合并为一个，解决跨 Dialog 丢失 inst_id 的问题） ====================
+# ==================== Dialog 组装 ====================
 main_dialog = Dialog(
     main_menu_window,
     add_coin_window,
