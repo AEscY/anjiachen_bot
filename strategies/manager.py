@@ -14,15 +14,14 @@ logger = logging.getLogger(__name__)
 class StrategyManager:
     def __init__(self):
         self.rest = OKXRest()
-        self.grids: dict = {}
-        self.dips: dict = {}
-        self._inst_ids: list = []
+        self.grids = {}
+        self.dips = {}
+        self._inst_ids = []
 
-    # ==================== 币种管理 ====================
-    def all_inst_ids(self) -> list:
+    def all_inst_ids(self):
         return list(self._inst_ids)
 
-    async def add_inst(self, inst_id: str):
+    async def add_inst(self, inst_id):
         inst_id = inst_id.upper().strip()
         if not inst_id or "-" not in inst_id:
             return False, "格式错误，示例: BTC-USDT"
@@ -56,7 +55,7 @@ class StrategyManager:
         logger.info(f"已添加 {inst_id} @ {price}")
         return True, f"已添加 {inst_id}，当前价 {price}"
 
-    async def remove_inst(self, inst_id: str):
+    async def remove_inst(self, inst_id):
         inst_id = inst_id.upper().strip()
         if inst_id not in self.grids:
             return False, f"{inst_id} 不在监控中"
@@ -77,14 +76,12 @@ class StrategyManager:
         self._inst_ids.remove(inst_id)
         return True, f"已删除 {inst_id}"
 
-    # ==================== 行情分发 ====================
-    async def on_ticker(self, inst_id: str, price: float, raw: dict):
+    async def on_ticker(self, inst_id, price, raw):
         if inst_id in self.grids:
             await self.grids[inst_id].on_ticker(price, raw)
         if inst_id in self.dips:
             await self.dips[inst_id].on_ticker(price, raw)
 
-    # ==================== 状态恢复 ====================
     async def restore_all(self):
         for inst_id in self.all_inst_ids():
             try:
@@ -101,7 +98,6 @@ class StrategyManager:
             except Exception as e:
                 logger.error(f"{inst_id} 网格恢复失败: {e}")
 
-    # ==================== ATR 与推荐参数 ====================
     async def _calc_atr(self, inst_id, period=14):
         try:
             resp = await asyncio.to_thread(self.rest.get_candles, inst_id, "1H", period + 1)
@@ -114,7 +110,7 @@ class StrategyManager:
             for i in range(1, len(candles)):
                 high = float(candles[i][2])
                 low = float(candles[i][3])
-                prev_close = float(candles[i-1][4])
+                prev_close = float(candles[i - 1][4])
                 tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
                 trs.append(tr)
             if not trs:
@@ -128,15 +124,15 @@ class StrategyManager:
         try:
             resp = await asyncio.to_thread(self.rest.get_ticker, inst_id)
             if resp.get("code") != "0" or not resp.get("data"):
-                return None _
+                return None
             price = float(resp["data"][0]["last"])
-        except Exceptionparse as e:
-            logger.error(f"获取 {inst_id} 价格失败: {e_}")
+        except Exception as e:
+            logger.error(f"获取 {inst_id} 价格失败: {e}")
             return None
 
-        atr = await self._calc_atr(instfloat_id)
+        atr = await self._calc_atr(inst_id)
         if atr is None:
-            atr = price * 0.015(text
+            atr = price * 0.015
 
         range_pct = 0.15
         grid_num = 20
