@@ -33,7 +33,6 @@ class OKXRest:
     def get_min_investment(self, inst_id, algo_ord_type="grid",
                            min_px=None, max_px=None, grid_num=None,
                            investment_type="quote"):
-        """获取网格最小投资金额"""
         kwargs = {
             "instId": inst_id,
             "algoOrdType": algo_ord_type,
@@ -48,16 +47,22 @@ class OKXRest:
         return self.grid.grid_min_investment(**kwargs)
 
     # ==================== 网格 ====================
-    def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
-        return self.grid.grid_order_algo(
-            instId=inst_id,
-            algoOrdType="grid",
-            maxPx=str(max_px),
-            minPx=str(min_px),
-            gridNum=str(grid_num),
-            quoteSz=str(quote_sz),
-            runType="1",
-        )
+    def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz,
+                         tp_px=None, sl_px=None):
+        kwargs = {
+            "instId": inst_id,
+            "algoOrdType": "grid",
+            "maxPx": str(max_px),
+            "minPx": str(min_px),
+            "gridNum": str(grid_num),
+            "quoteSz": str(quote_sz),
+            "runType": "1",
+        }
+        if tp_px is not None:
+            kwargs["tpTriggerPx"] = str(tp_px)
+        if sl_px is not None:
+            kwargs["slTriggerPx"] = str(sl_px)
+        return self.grid.grid_order_algo(**kwargs)
 
     def stop_grid(self, algo_id, inst_id):
         return self.grid.grid_stop_algo(
@@ -75,6 +80,20 @@ class OKXRest:
         return self.grid.grid_orders_algo_details(algoId=algo_id, instId=inst_id)
 
     # ==================== 现货交易 ====================
+    def limit_buy(self, inst_id, price, size):
+        """限价买入（Maker 订单）"""
+        return self.trade.place_order(
+            instId=inst_id, tdMode="cash", side="buy",
+            ordType="limit", px=str(price), sz=str(size),
+        )
+
+    def limit_sell(self, inst_id, price, size):
+        """限价卖出（Maker 订单）"""
+        return self.trade.place_order(
+            instId=inst_id, tdMode="cash", side="sell",
+            ordType="limit", px=str(price), sz=str(size),
+        )
+
     def market_buy(self, inst_id, quote_sz):
         return self.trade.place_order(
             instId=inst_id, tdMode="cash", side="buy",
@@ -86,6 +105,23 @@ class OKXRest:
             instId=inst_id, tdMode="cash", side="sell",
             ordType="market", sz=str(base_sz),
         )
+
+    def cancel_order(self, inst_id, ord_id):
+        """撤销指定订单"""
+        return self.trade.cancel_order(instId=inst_id, ordId=ord_id)
+
+    # ==================== 订单查询 ====================
+    def get_pending_orders(self, inst_id=None, ord_type=None):
+        """获取未成交订单列表（用于启动恢复）"""
+        kwargs = {}
+        if inst_id:
+            kwargs["instId"] = inst_id
+        if ord_type:
+            kwargs["ordType"] = ord_type
+        return self.trade.get_orders_pending(**kwargs)
+
+    def get_order_detail(self, inst_id, ord_id):
+        return self.trade.get_order(instId=inst_id, ordId=ord_id)
 
     # ==================== 账户 ====================
     def get_balance(self, ccy="USDT"):
