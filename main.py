@@ -19,6 +19,7 @@ from okx_client.ws_public import PublicWS
 from okx_client.ws_private import PrivateWS
 from okx_client.rest import OKXRest
 from strategies.manager import StrategyManager
+from strategies.dip_sell import DEFAULT_PARAMS
 from notifier import alert
 
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +35,30 @@ bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
+
+# 参数类型映射：用于 /set 命令的校验
+PARAM_TYPES = {
+    "bar": "bar",
+    "rsi_period": "int",
+    "rsi_oversold": "float",
+    "rsi_overbought": "float",
+    "bb_period": "int",
+    "bb_std": "float",
+    "macd_fast": "int",
+    "macd_slow": "int",
+    "macd_signal": "int",
+    "ema_period": "int",
+    "vol_ma_period": "int",
+    "vol_multiplier": "float",
+    "trend_filter": "bool",
+    "volume_confirm": "bool",
+    "limit_offset_pct": "pct",
+    "maxSpend": "float",
+    "take_profit_pct": "pct",
+    "stop_loss_pct": "pct",
+    "trailing_pct": "pct",
+    "use_trailing": "bool",
+}
 
 
 async def on_ticker(inst_id: str, price: float, raw: dict):
@@ -112,7 +137,8 @@ async def cmd_remove(msg: Message):
         await msg.answer("未初始化")
         return
     ok, text = await dlg.MANAGER.remove_inst(inst_id)
-    if ok and dlg.P dlg.PUB_WS.unsubscribe(inst_id)
+    if ok and dlg.PUB_WS:
+        await dlg.PUB_WS.unsubscribe(inst_id)
     await msg.answer(("成功: " if ok else "失败: ") + text)
 
 
@@ -158,7 +184,134 @@ async def cmd_bar(msg: Message):
         await msg.answer(f"{inst_id} 不在监控中")
         return
     await dip.set_param("bar", bar)
-    await msg.answer(f"{inst_id} K线周期已改为 {bar}，下次取K线生效。")
+    await msg.answer(f"{inst_id} K线周期已改为 {bar}")
+
+
+@dp.message(Command("set"))
+async def cmd_set(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) < 4:
+        lines = ["用法: /set <币种> <参数名> <值>", "示例: /set BTC-USDT rsi_oversold 35", "", "可用参数:"]
+        for k, t in PARAM_TYPES.items():
+            default = DEFAULT_PARAMS.get(k, "-")
+            if t == "bool":
+                lines.append(f"  {k}: true/false (默认 {default})")
+            elif t == "pct":
+                lines.append(f"  {k}: 百分比数字 (默认 {default})")
+            elif t == "bar":
+                lines.append(f"  {k}: {'/'.join(VALID_BARS)} (默认 {default})")
+            else:
+                lines.append(f"  {k}: {t} (默认 {default})")
+        await msg.answer("\n".join(lines))
+        return
+
+    inst_id = parts[1].upper()
+    key = parts[2]
+    raw_val = parts[3]
+
+    if key not in PARAM_TYPES:
+        await msg.answer(f"未知参数: {key}。发送 /set 查看所有参数。")
+        return
+
+    dip = dlg.MANAGER.dips.get(inst_id)
+    if not dip:
+        await msg.answer(f"{inst_id} 不在监控中")
+        return
+
+    ptype = PARAM_TYPES[key]
+    try:
+        if ptype == "bar":
+            if raw_val not in VALID_BARS:
+                await msg.answer(f"周期 {raw_val} 不支持。可用: {', '.join(VALID_BARS)}")
+                return
+            value = raw_val
+        elif ptype == "bool":
+            value = raw_val.lower() in ("1", "true", "on", "yes", "开")
+        elif ptype == "int":
+            value = int(raw_val)
+        elif ptype == "float":
+            value = float(raw_val)
+        elif ptype == "pct":
+            # 用户输入 3 表示 3%
+            value = float(raw_val) / 100.0
+    except ValueError:
+        await msg.answer(f"参数值 {raw_val} 格式不正确")
+        return
+
+    # 参数合理性校验
+    if key == "rsi_period" and not (2 <= value <= 100):
+        await msg.answer("rsi_period 范围 2-100")
+        return
+    if key == "rsi_oversold" and not (5 <= value <= 50):
+        await msg.answer("rsi_oversold 范围 5-50")
+        return
+    if key == "rsi_overbought" and not (50 <= value <= 95):
+        await msg.answer("rsi_overbought 范围 50-95")
+        return
+    if key == "bb_period" and not (5 <= value <= 100):
+        await msg.answer("bb_period 范围 5-100")
+        return
+    if key == "bb_std" and not (0.5 <= value <= 5):
+        await msg.answer("bb_std 范围 0.5-5")
+        return
+    if key == "macd_fast" and not (2 <= value <= 50):
+        await msg.answer("macd_fast 范围 2-50")
+        return
+    if key == "macd_slow" and not (5 <= value <= 100):
+        await msg.answer("macd_slow 范围 5-100")
+        return
+    if key == "ema_period" and not (20 <= value <= 500):
+        await msg.answer("ema_period 范围 20-500")
+        return
+    if key == "vol_multiplier" and not (1.0 <= value <= 5.0):
+        await msg.answer("vol_multiplier 范围 1-5")
+        return
+    if key in ("take_profit_pct", "stop_loss_pct", "trailing_pct", "limit_offset_pct"):
+        if not (0.001 <= value <= 0.5):
+            await msg.answer(f"{key} 范围 0.1%-50%")
+            return
+    if key == "maxSpend" and value <= 0:
+        await msg.answer("maxSpend 必须大于 0")
+        return
+
+    await dip.set_param(key, value)
+
+    # 用户友好回显
+    if ptype == "pct":
+        shown = f"{value * 100:.2f}%"
+    elif ptype == "bool":
+        shown = "true" if value else "false"
+    else:
+        shown = str(value)
+    await msg.answer(f"{inst_id} 的 {key} 已设置为 {shown}")
+
+
+@dp.message(Command("reset"))
+async def cmd_reset(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("用法: /reset <币种>\n示例: /reset BTC-USDT")
+        return
+    inst_id = parts[1].strip().upper()
+    dip = dlg.MANAGER.dips.get(inst_id)
+    if not dip:
+        await msg.answer(f"{inst_id} 不在监控中")
+        return
+    await dip.reset_params()
+    await msg.answer(f"{inst_id} 所有参数已恢复默认值")
 
 
 @dp.message(Command("signal_params"))
@@ -178,16 +331,19 @@ async def cmd_signal_params(msg: Message):
         lines.append(
             f"\n{iid}\n"
             f"  K线周期: {p.get('bar', '15m')}\n"
-            f"  RSI: 周期{p.get('rsi_period', 14)} 超卖<{p.get('rsi_oversold', 30)} 超买>{p.get('rsi_overbought', 70)}\n"
-            f"  BB: 周期{p.get('bb_period', 20)} 标准差{p.get('bb_std', 2.0)}\n"
+            f"  RSI: {p.get('rsi_period', 14)}周期, 超卖<{p.get('rsi_oversold', 30)}, 超买>{p.get('rsi_overbought', 70)}\n"
+            f"  BB: {p.get('bb_period', 20)}周期, {p.get('bb_std', 2.0)}标准差\n"
             f"  MACD: {p.get('macd_fast', 12)}/{p.get('macd_slow', 26)}/{p.get('macd_signal', 9)}\n"
             f"  EMA趋势: {p.get('ema_period', 200)}\n"
             f"  成交量倍数: {p.get('vol_multiplier', 1.5)}\n"
-            f"  趋势过滤: {'开' if p.get('trend_filter', True) else '关'}\n"
-            f"  成交量确认: {'开' if p.get('volume_confirm', True) else '关'}"
+            f"  止盈: +{p.get('take_profit_pct', 0.03)*100:.2f}% | 止损: -{p.get('stop_loss_pct', 0.05)*100:.2f}%\n"
+            f"  移动止盈: {'开' if p.get('use_trailing', True) else '关'} 回撤{p.get('trailing_pct', 0.02)*100:.2f}%\n"
+            f"  单次金额: {p.get('maxSpend', 100)} USDT\n"
+            f"  趋势过滤: {'开' if p.get('trend_filter', True) else '关'} | "
+            f"成交量确认: {'开' if p.get('volume_confirm', True) else '关'}"
         )
-    lines.append("\n修改周期用 /bar <币种> <周期>")
-    lines.append("修改其他参数可扩展，需要时告诉我。")
+    lines.append("\n修改参数: /set <币种> <参数名> <值>")
+    lines.append("恢复默认: /reset <币种>")
     await msg.answer("\n".join(lines))
 
 
@@ -285,9 +441,7 @@ async def cmd_signals(msg: Message):
         else:
             lines.append(f"  ⏳ 等待条件满足")
 
-    lines.append("\n提示：三个条件同时满足才会触发买入。")
-    lines.append("调整K线周期: /bar <币种> <周期>")
-    lines.append("查看参数: /signal_params")
+    lines.append("\n调整参数: /set <币种> <参数名> <值>")
     await msg.answer("\n".join(lines))
 
 
@@ -362,8 +516,9 @@ async def setup_menu():
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
         BotCommand(command="status", description="状态"),
-        BotCommand(command="bar", description="设置K线周期"),
-        BotCommand(command="signal_params", description="信号参数"),
+        BotCommand(command="set", description="设置参数"),
+        BotCommand(command="reset", description="恢复默认参数"),
+        BotCommand(command="signal_params", description="查看参数"),
         BotCommand(command="positions", description="建仓与挂单"),
         BotCommand(command="signals", description="信号诊断"),
         BotCommand(command="balance", description="查询余额"),
