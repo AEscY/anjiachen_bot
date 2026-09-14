@@ -34,7 +34,6 @@ bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# ==================== 行情 / 订单回调 ====================
 async def on_ticker(inst_id: str, price: float, raw: dict):
     _last_price[inst_id] = price
     if dlg.MANAGER:
@@ -45,7 +44,6 @@ async def on_order_update(order: dict):
     await alert(f"订单更新: {order.get('instId')} {order.get('side')} {order.get('state')} @ {order.get('px')}")
 
 
-# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -196,7 +194,32 @@ async def cmd_profit(msg: Message):
     await msg.answer("\n".join(lines))
 
 
-# ==================== 菜单按钮 ====================
+@dp.message(Command("recommend"))
+async def cmd_recommend(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    lines = ["实时推荐参数"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        r = await dlg.MANAGER.get_recommend_params(iid)
+        if not r:
+            lines.append(f"\n{iid}: 获取失败")
+            continue
+        lines.append(
+            f"\n{iid}\n"
+            f"  当前价: {r['price']:.6f}\n"
+            f"  ATR(14): {r['atr']:.6f}\n"
+            f"  网格区间: {r['grid']['minPx']} - {r['grid']['maxPx']}\n"
+            f"  网格数: {r['grid']['gridNum']}\n"
+            f"  买入线: {r['dip']['buyPx']}\n"
+            f"  卖出线: {r['dip']['sellPx']}"
+        )
+    await msg.answer("\n".join(lines))
+
+
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -208,15 +231,14 @@ async def setup_menu():
         BotCommand(command="status", description="状态"),
         BotCommand(command="balance", description="查询余额"),
         BotCommand(command="profit", description="获利与手续费"),
+        BotCommand(command="recommend", description="推荐参数"),
     ])
 
 
-# ==================== 健康检查 ====================
 async def health(request):
     return web.Response(text="OK")
 
 
-# ==================== 启动入口 ====================
 async def main():
     manager = StrategyManager()
     dlg.MANAGER = manager
