@@ -23,13 +23,70 @@ class GridStrategy(BaseStrategy):
         self._monitor_task = None
         self._last_price = 0.0
         self.rebuild_count = 0
+        self.min_investment = 0.0
 
     async def start(self):
         if self.running:
             return
         if self.params.get("auto_mode", True):
             await self._calc_auto_params()
+
+        # 校验最小投资
+        ok, msg = await self._check_min_investment()
+        if not ok:
+            raise RuntimeError(msg)
+
         await self._create_grid()
+
+    async def _check_min_investment(self):
+        """通过 OKX 接口查询最小投资额,不足时提示"""
+        try:
+            resp = await asyncio.to_thread(
+                self.rest.get_min_investment,
+                self.inst_id, "grid",
+                self.params["minPx"],
+                self.params["maxPx"],
+                self.params["gridNum"],
+            )
+            if resp.get("code") == "0" and resp.get("data"):
+                min_inv = float(resp["data"][0].get("minInvestment", 0))
+                self.min_investment = min_inv
+                quote_sz = float(self.params.get("quoteSz", 100))
+                if quote_sz < min_inv:
+                    # 自动提升到最小值
+                    self.params["quoteSz"] = min_inv
+                    logger.info(f"{self.inst_id} 网格投资额 {quote_sz} 不足,已自动提升至 {min_inv}")
+                return True, ""
+            else:
+                # 接口失败时降级校验
+                return await self._fallback_check()
+        except Exception as e:
+            logger.error(f"{self.inst_id} 查询最小投资失败: {e}")
+            return await self._fallback_check()
+
+    async def _fallback_check(self):
+        """降级校验:用交易产品规格估算"""
+        try:
+            resp = await asyncio.to_thread(self.rest.get_instruments, "SPOT", self.inst_id)
+            if resp.get("code") != "0" or not resp.get("data"):
+                return True, ""
+            inst = resp["data"][0]
+            min_sz = float(inst.get("minSz", 0))
+            ticker = await asyncio.to_thread(self.rest.get_ticker, self.inst_id)
+            price = float(ticker["data"][0]["last"])
+            min_notional = min_sz * price
+            # 网格一般要求单格金额 > 最小订单
+            grid_num = self.params["gridNum"]
+            quote_sz = float(self.params.get("quoteSz", 100))
+            per_grid = quote_sz / grid_num if grid_num > 0 else 0
+            if per_grid < min_notional:
+                needed = min_notional * grid_num * 1.5
+                self.params["quoteSz"] = round(needed, 2)
+                logger.info(f"{self.inst_id} 每格 {per_grid:.4f} < 最小 {min_notional:.4f},投资额提升至 {needed:.2f}")
+            return True, ""
+        except Exception as e:
+            logger.error(f"{self.inst_id} 降级校验失败: {e}")
+            return True, ""
 
     async def _calc_auto_params(self):
         resp = await asyncio.to_thread(self.rest.get_ticker, self.inst_id)
@@ -41,12 +98,10 @@ class GridStrategy(BaseStrategy):
         if atr is None:
             atr = price * 0.015
 
-        # 区间：当前价 ± max(15%, 2.5倍ATR)
         range_pct = max(0.15, 2.5 * atr / price)
         self.params["minPx"] = round(price * (1 - range_pct), 6)
         self.params["maxPx"] = round(price * (1 + range_pct), 6)
 
-        # 网格数：确保间距 0.5%~1%
         span = self.params["maxPx"] - self.params["minPx"]
         grid_num = int(span / price / 0.008)
         grid_num = max(10, min(60, grid_num))
@@ -109,7 +164,7 @@ class GridStrategy(BaseStrategy):
                 min_px = self.params["minPx"]
                 max_px = self.params["maxPx"]
                 if price < min_px * (1 + threshold) or price > max_px * (1 - threshold):
-                    logger.info(f"{self.inst_id} 价格 {price} 接近边界，自动重建网格")
+                    logger.info(f"{self.inst_id} 价格 {price} 接近边界,自动重建网格")
                     await self._rebuild()
             except Exception as e:
                 logger.error(f"{self.inst_id} 监控失败: {e}")
@@ -125,6 +180,10 @@ class GridStrategy(BaseStrategy):
         await asyncio.sleep(3)
         try:
             await self._calc_auto_params()
+            ok, msg = await self._check_min_investment()
+            if not ok:
+                logger.error(f"{self.inst_id} 重建失败: {msg}")
+                return
             await self._create_grid()
             self.rebuild_count += 1
             logger.info(f"{self.inst_id} 网格已自动重建 #{self.rebuild_count}")
@@ -151,5 +210,6 @@ class GridStrategy(BaseStrategy):
         s.update({
             "algo_id": self.algo_id,
             "rebuild_count": self.rebuild_count,
+            "min_investment": self.min_investment,
         })
         return s
