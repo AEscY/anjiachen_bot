@@ -1,4 +1,3 @@
-# okx_client/rest.py
 import okx.Grid as Grid
 import okx.Trade as Trade
 import okx.Account as Account
@@ -15,11 +14,11 @@ class OKXRest:
         self.account = Account.AccountAPI(OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, False, FLAG)
         self.market = MarketData.MarketAPI(flag=FLAG)
 
-    # ---- 行情 ----
+    # ==================== 行情 ====================
     def get_ticker(self, inst_id):
         return self.market.get_ticker(instId=inst_id)
 
-    # ---- 网格 ----
+    # ==================== 网格 ====================
     def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
         return self.grid.grid_order_algo(
             instId=inst_id, algoOrdType="grid",
@@ -40,7 +39,10 @@ class OKXRest:
             kwargs["instId"] = inst_id
         return self.grid.grid_orders_algo_pending(**kwargs)
 
-    # ---- 现货交易 ----
+    def get_grid_details(self, algo_id, inst_id):
+        return self.grid.grid_orders_algo_details(algoId=algo_id, instId=inst_id)
+
+    # ==================== 现货交易 ====================
     def market_buy(self, inst_id, quote_sz):
         return self.trade.place_order(
             instId=inst_id, tdMode="cash", side="buy",
@@ -53,6 +55,32 @@ class OKXRest:
             ordType="market", sz=str(base_sz),
         )
 
-    # ---- 账户 ----
+    # ==================== 账户 ====================
     def get_balance(self, ccy="USDT"):
         return self.account.get_account_balance(ccy=ccy)
+
+    def get_positions(self, inst_id=None):
+        kwargs = {"instType": "SPOT"}
+        if inst_id:
+            kwargs["instId"] = inst_id
+        return self.account.get_positions(**kwargs)
+
+    # ==================== 成交明细 ====================
+    def get_fills(self, inst_type="SPOT", inst_id=None, limit=100):
+        """获取成交明细（最近3天）"""
+        kwargs = {"instType": inst_type, "limit": str(limit)}
+        if inst_id:
+            kwargs["instId"] = inst_id
+        return self.trade.get_fills(**kwargs)
+
+    def get_fills_history(self, inst_type="SPOT", inst_id=None, limit=100):
+        """获取历史成交明细（最近3个月）"""
+        kwargs = {"instType": inst_type, "limit": str(limit)}
+        if inst_id:
+            kwargs["instId"] = inst_id
+        return self.trade.get_fills_history(**kwargs)
+
+    # ==================== 账户账单 ====================
+    def get_bills(self, inst_type="SPOT", limit=100):
+        """获取账户账单流水（含手续费记录）"""
+        return self.account.get_bills(instType=inst_type, limit=str(limit))
