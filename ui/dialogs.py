@@ -17,6 +17,7 @@ PUB_WS = None
 _last_price: dict = {}
 
 
+# ==================== 解析工具 ====================
 def _parse_float(text: str):
     try:
         return float(text.strip()), None
@@ -205,6 +206,35 @@ async def on_show_recommend(cb: CallbackQuery, button, manager: DialogManager):
     await cb.answer(text, show_alert=True)
 
 
+async def on_apply_recommend(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    if not inst_id or not MANAGER:
+        await cb.answer("请先选择币种", show_alert=True)
+        return
+
+    r = await MANAGER.get_recommend_params(inst_id)
+    if not r:
+        await cb.answer("获取推荐参数失败", show_alert=True)
+        return
+
+    grid = MANAGER.grids.get(inst_id)
+    if grid:
+        grid.params["minPx"] = r["grid"]["minPx"]
+        grid.params["maxPx"] = r["grid"]["maxPx"]
+        grid.params["gridNum"] = r["grid"]["gridNum"]
+
+    dip = MANAGER.dips.get(inst_id)
+    if dip:
+        dip.base_px = r["price"]
+        dip.buy_px = r["dip"]["buyPx"]
+        dip.sell_px = r["dip"]["sellPx"]
+        dip.params["buyPct"] = round(dip.buy_px / dip.base_px, 6)
+        dip.params["sellPct"] = round(dip.sell_px / dip.base_px, 6)
+
+    await cb.answer("已应用推荐参数，请检查面板确认", show_alert=True)
+    await manager.update()
+
+
 coin_panel_window = Window(
     Format(
         "{inst_id}\n"
@@ -216,6 +246,7 @@ coin_panel_window = Window(
         Button(Const("网格模式"), id="to_grid", on_click=on_enter_grid),
         Button(Const("低吸高卖"), id="to_dip", on_click=on_enter_dip),
         Button(Const("推荐参数"), id="show_recommend", on_click=on_show_recommend),
+        Button(Const("一键应用推荐参数"), id="apply_recommend", on_click=on_apply_recommend),
         Button(Const("查询余额"), id="query_balance", on_click=on_query_balance),
         Button(Const("删除此币种"), id="del_coin", on_click=on_delete_coin),
         Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(AppSG.menu)),
