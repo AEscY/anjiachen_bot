@@ -17,7 +17,6 @@ PUB_WS = None
 _last_price: dict = {}
 
 
-# ==================== 解析工具 ====================
 def _parse_float(text: str):
     try:
         return float(text.strip()), None
@@ -185,6 +184,27 @@ async def on_query_balance(cb: CallbackQuery, button, manager: DialogManager):
         await cb.answer(f"查询失败: {e}", show_alert=True)
 
 
+async def on_show_recommend(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    if not inst_id or not MANAGER:
+        await cb.answer("请先选择币种", show_alert=True)
+        return
+    recommend = await MANAGER.get_recommend_params(inst_id)
+    if not recommend:
+        await cb.answer("获取推荐参数失败", show_alert=True)
+        return
+    text = (
+        f"{inst_id} 推荐参数\n"
+        f"当前价: {recommend['price']:.6f}\n"
+        f"ATR(14): {recommend['atr']:.6f}\n"
+        f"网格区间: {recommend['grid']['minPx']} - {recommend['grid']['maxPx']}\n"
+        f"网格数: {recommend['grid']['gridNum']}\n"
+        f"买入线: {recommend['dip']['buyPx']}\n"
+        f"卖出线: {recommend['dip']['sellPx']}"
+    )
+    await cb.answer(text, show_alert=True)
+
+
 coin_panel_window = Window(
     Format(
         "{inst_id}\n"
@@ -195,6 +215,7 @@ coin_panel_window = Window(
     Column(
         Button(Const("网格模式"), id="to_grid", on_click=on_enter_grid),
         Button(Const("低吸高卖"), id="to_dip", on_click=on_enter_dip),
+        Button(Const("推荐参数"), id="show_recommend", on_click=on_show_recommend),
         Button(Const("查询余额"), id="query_balance", on_click=on_query_balance),
         Button(Const("删除此币种"), id="del_coin", on_click=on_delete_coin),
         Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(AppSG.menu)),
@@ -326,7 +347,6 @@ grid_panel_window = Window(
     getter=grid_getter,
 )
 
-# 优化后的提示文本，明确格式和示例
 grid_edit_range_window = Window(
     Const(
         "修改价格区间\n\n"
