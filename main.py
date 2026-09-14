@@ -14,7 +14,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from config import TG_BOT_TOKEN, TG_ALLOWED_IDS, WATCHLIST
 from ui.dialogs import get_dialogs, _last_price
 import ui.dialogs as dlg
-from ui.states import MainSG
+from ui.states import AppSG
 from okx_client.ws_public import PublicWS
 from okx_client.ws_private import PrivateWS
 from okx_client.rest import OKXRest
@@ -34,6 +34,7 @@ bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+# ==================== 行情 / 订单回调 ====================
 async def on_ticker(inst_id: str, price: float, raw: dict):
     _last_price[inst_id] = price
     if dlg.MANAGER:
@@ -44,19 +45,17 @@ async def on_order_update(order: dict):
     await alert(f"订单更新: {order.get('instId')} {order.get('side')} {order.get('state')} @ {order.get('px')}")
 
 
+# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
-
-# ==================== 命令处理 ====================
-# 注意：这里不再有 await state.clear()，由 aiogram_dialog 自己管理状态
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
-    await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
+    await dialog_manager.start(AppSG.menu, mode=StartMode.RESET_STACK)
 
 
 @dp.message(Command("menu"))
@@ -64,7 +63,7 @@ async def cmd_menu(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
-    await dialog_manager.start(MainSG.menu, mode=StartMode.RESET_STACK)
+    await dialog_manager.start(AppSG.menu, mode=StartMode.RESET_STACK)
 
 
 @dp.message(Command("list"))
@@ -197,6 +196,7 @@ async def cmd_profit(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+# ==================== 菜单按钮 ====================
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -211,10 +211,12 @@ async def setup_menu():
     ])
 
 
+# ==================== 健康检查 ====================
 async def health(request):
     return web.Response(text="OK")
 
 
+# ==================== 启动入口 ====================
 async def main():
     manager = StrategyManager()
     dlg.MANAGER = manager
