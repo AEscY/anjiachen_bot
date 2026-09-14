@@ -18,6 +18,7 @@ class DipSellStrategy(BaseStrategy):
             "trailing_pct": 0.02,
             "trend_filter": True,
             "volume_confirm": True,
+            "limit_offset_pct": 0.002,   # 限价单挂单偏移
         }
         merged = {**default, **(params or {})}
         super().__init__(inst_id, merged)
@@ -32,17 +33,19 @@ class DipSellStrategy(BaseStrategy):
         self.trade_count = 0
         self._last_action = None
 
+        # 挂单状态
+        self._pending_buy_ord_id = None
+        self._pending_sell_ord_id = None
+
         self.signal_engine = SignalEngine()
         self._kline_cache = []
         self._last_kline_ts = 0
         self._last_price = 0.0
         self._buy_disabled_until = 0.0
-        self._min_notional = 0.0
-        self._lot_sz = 0.0
         self._min_sz = 0.0
+        self._lot_sz = 0.0
 
     async def _load_instrument_rules(self):
-        """加载交易对的最小下单规格"""
         try:
             resp = await asyncio.to_thread(self.rest.get_instruments, "SPOT", self.inst_id)
             if resp.get("code") == "0" and resp.get("data"):
@@ -53,15 +56,25 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 加载规格失败: {e}")
 
-    async def _check_min_order(self, price):
-        """校验单次投入是否满足最小下单要求"""
-        if self._min_sz <= 0:
-            await self._load_instrument_rules()
-        spend = self.params.get("maxSpend", 100)
-        min_notional = self._min_sz * price
-        if spend < min_notional:
-            return False, f"投入 {spend} USDT < 最小 {min_notional:.2f} USDT"
-        return True, ""
+    async def _restore_pending_orders(self):
+        """启动时从 OKX 恢复未成交挂单状态"""
+        try:
+            resp = await asyncio.to_thread(self.rest.get_pending_orders, self.inst_id)
+            if resp.get("code") != "0":
+                return
+            for order in resp.get("data", []):
+                side = order.get("side")
+                ord_id = order.get("ordId")
+                px = float(order.get("px", 0))
+                sz = float(order.get("sz", 0))
+                if side == "buy":
+                    self._pending_buy_ord_id = ord_id
+                    logger.info(f"{self.inst_id} 恢复挂单买入 {ord_id} @ {px} x {sz}")
+                elif side == "sell":
+                    self._pending_sell_ord_id = ord_id
+                    logger.info(f"{self.inst_id} 恢复挂单卖出 {ord_id} @ {px} x {sz}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 恢复挂单失败: {e}")
 
     async def _fetch_klines(self):
         try:
@@ -117,49 +130,49 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
-    async def _do_buy(self, price, tag):
-        # 最小下单校验
-        ok, msg = await self._check_min_order(price)
-        if not ok:
-            logger.warning(f"{self.inst_id} 买入跳过: {msg}")
-            return
+    async def _do_limit_buy(self, price):
+        """限价买入（Maker）"""
+        offset = self.params.get("limit_offset_pct", 0.002)
+        buy_price = round(price * (1 - offset), 6)
 
         spend = self.params.get("maxSpend", 100)
-        try:
-            r = await asyncio.to_thread(self.rest.market_buy, self.inst_id, spend)
-            if r.get("code") == "0":
-                self._last_action = (tag, price)
-                logger.info(f"{self.inst_id} 买入 @ {price} ({tag})")
-                await self._record_fee()
-                await self._sync_position_from_okx()
-            else:
-                logger.error(f"{self.inst_id} 买入失败: {r}")
-        except Exception as e:
-            logger.error(f"{self.inst_id} 买入异常: {e}")
+        size = spend / buy_price
+        # 对齐 lotSz
+        if self._lot_sz > 0:
+            size = round(size / self._lot_sz) * self._lot_sz
+        if size < self._min_sz:
+            logger.warning(f"{self.inst_id} 买入数量 {size} < 最小 {self._min_sz}")
+            return
 
-    async def _do_sell(self, price, tag):
+        try:
+            r = await asyncio.to_thread(self.rest.limit_buy, self.inst_id, buy_price, size)
+            if r.get("code") == "0":
+                self._pending_buy_ord_id = r["data"][0]["ordId"]
+                self._last_action = ("限价买入挂单", buy_price)
+                logger.info(f"{self.inst_id} 限价买入挂单 @ {buy_price}, size={size}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 限价买入失败: {e}")
+
+    async def _do_limit_sell(self, price):
+        """限价卖出（Maker）"""
         sell_size = self.position
-        sell_cost = self.cost
         if sell_size <= 0:
             return
-        # 卖出数量必须 >= minSz
         if self._min_sz > 0 and sell_size < self._min_sz:
-            logger.warning(f"{self.inst_id} 持仓 {sell_size} < 最小 {self._min_sz},无法卖出")
+            logger.warning(f"{self.inst_id} 持仓 {sell_size} < 最小 {self._min_sz}")
             return
+
+        offset = self.params.get("limit_offset_pct", 0.002)
+        sell_price = round(price * (1 + offset), 6)
+
         try:
-            r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
+            r = await asyncio.to_thread(self.rest.limit_sell, self.inst_id, sell_price, sell_size)
             if r.get("code") == "0":
-                self._last_action = (tag, price)
-                profit = price * sell_size - sell_cost
-                self.total_profit += profit
-                logger.info(f"{self.inst_id} 卖出 @ {price} ({tag}), 获利 {profit:.4f}")
-                await self._record_fee()
-                await self._sync_position_from_okx()
-                self._buy_disabled_until = time.time() + 600
-            else:
-                logger.error(f"{self.inst_id} 卖出失败: {r}")
+                self._pending_sell_ord_id = r["data"][0]["ordId"]
+                self._last_action = ("限价卖出挂单", sell_price)
+                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={sell_size}")
         except Exception as e:
-            logger.error(f"{self.inst_id} 卖出异常: {e}")
+            logger.error(f"{self.inst_id} 限价卖出失败: {e}")
 
     async def _get_indicators(self):
         now = time.time()
@@ -203,11 +216,18 @@ class DipSellStrategy(BaseStrategy):
             return
         self._last_price = price
 
+        # 持仓时检查卖出
         if self.position > 0:
+            if self._pending_sell_ord_id:
+                return  # 已有挂单，等待成交
             reason = await self._check_sell(price)
             if reason:
-                await self._do_sell(price, reason)
+                await self._do_limit_sell(price)
             return
+
+        # 空仓时检查买入
+        if self._pending_buy_ord_id:
+            return  # 已有挂单，等待成交
 
         if time.time() < self._buy_disabled_until:
             return
@@ -221,16 +241,26 @@ class DipSellStrategy(BaseStrategy):
             use_trend_filter=self.params.get("trend_filter", True),
             use_volume=self.params.get("volume_confirm", True),
         ):
-            await self._do_buy(price, "信号")
+            await self._do_limit_buy(price)
 
     async def start(self):
         self.running = True
         await self._load_instrument_rules()
+        await self._restore_pending_orders()
         await self._sync_position_from_okx()
-        logger.info(f"{self.inst_id} 全自动低吸高卖已启动")
+        logger.info(f"{self.inst_id} 全自动低吸高卖已启动（限价单模式）")
 
     async def stop(self):
         self.running = False
+        # 撤销未成交挂单
+        for ord_id in [self._pending_buy_ord_id, self._pending_sell_ord_id]:
+            if ord_id:
+                try:
+                    await asyncio.to_thread(self.rest.cancel_order, self.inst_id, ord_id)
+                except Exception as e:
+                    logger.error(f"撤单失败: {e}")
+        self._pending_buy_ord_id = None
+        self._pending_sell_ord_id = None
 
     def snapshot(self):
         s = super().snapshot()
@@ -242,7 +272,7 @@ class DipSellStrategy(BaseStrategy):
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
             "trade_count": self.trade_count,
-            "min_sz": self._min_sz,
-            "lot_sz": self._lot_sz,
+            "pending_buy": self._pending_buy_ord_id,
+            "pending_sell": self._pending_sell_ord_id,
         })
         return s
