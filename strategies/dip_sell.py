@@ -19,6 +19,19 @@ class DipSellStrategy(BaseStrategy):
             "trend_filter": True,
             "volume_confirm": True,
             "limit_offset_pct": 0.002,
+            "bar": "15m",
+            # 信号引擎参数
+            "rsi_period": 14,
+            "rsi_oversold": 30,
+            "rsi_overbought": 70,
+            "bb_period": 20,
+            "bb_std": 2.0,
+            "macd_fast": 12,
+            "macd_slow": 26,
+            "macd_signal": 9,
+            "ema_period": 200,
+            "vol_ma_period": 20,
+            "vol_multiplier": 1.5,
         }
         merged = {**default, **(params or {})}
         super().__init__(inst_id, merged)
@@ -37,12 +50,37 @@ class DipSellStrategy(BaseStrategy):
         self._pending_sell_ord_id = None
 
         self.signal_engine = SignalEngine()
+        self._sync_signal_params()
+
         self._kline_cache = []
         self._last_kline_ts = 0
         self._last_price = 0.0
         self._buy_disabled_until = 0.0
         self._min_sz = 0.0
         self._lot_sz = 0.0
+
+    def _sync_signal_params(self):
+        """把 params 中的信号参数同步到 signal_engine"""
+        p = self.params
+        self.signal_engine.rsi_period = p.get("rsi_period", 14)
+        self.signal_engine.rsi_oversold = p.get("rsi_oversold", 30)
+        self.signal_engine.rsi_overbought = p.get("rsi_overbought", 70)
+        self.signal_engine.bb_period = p.get("bb_period", 20)
+        self.signal_engine.bb_std = p.get("bb_std", 2.0)
+        self.signal_engine.macd_fast = p.get("macd_fast", 12)
+        self.signal_engine.macd_slow = p.get("macd_slow", 26)
+        self.signal_engine.macd_signal = p.get("macd_signal", 9)
+        self.signal_engine.ema_period = p.get("ema_period", 200)
+        self.signal_engine.vol_ma_period = p.get("vol_ma_period", 20)
+        self.signal_engine.vol_multiplier = p.get("vol_multiplier", 1.5)
+
+    async def set_param(self, key, value):
+        """动态修改信号参数，并同步到引擎"""
+        self.params[key] = value
+        self._sync_signal_params()
+        # 参数变化后需要重新获取 K 线
+        self._last_kline_ts = 0
+        self._kline_cache = []
 
     async def _load_instrument_rules(self):
         try:
@@ -75,8 +113,9 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 恢复挂单失败: {e}")
 
     async def _fetch_klines(self):
+        bar = self.params.get("bar", "15m")
         try:
-            resp = await asyncio.to_thread(self.rest.get_candles, self.inst_id, "1H", 300)
+            resp = await asyncio.to_thread(self.rest.get_candles, self.inst_id, bar, 300)
             if resp.get("code") == "0" and resp.get("data"):
                 self._kline_cache = list(reversed(resp["data"]))
         except Exception as e:
@@ -171,7 +210,7 @@ class DipSellStrategy(BaseStrategy):
 
     async def _get_indicators(self):
         now = time.time()
-        if now - self._last_kline_ts > 60:
+        if now - self._last_kline_ts > 30:
             await self._fetch_klines()
             self._last_kline_ts = now
         if len(self._kline_cache) < 50:
@@ -241,7 +280,7 @@ class DipSellStrategy(BaseStrategy):
         await self._load_instrument_rules()
         await self._restore_pending_orders()
         await self._sync_position_from_okx()
-        logger.info(f"{self.inst_id} 全自动低吸高卖已启动（限价单模式）")
+        logger.info(f"{self.inst_id} 全自动低吸高卖已启动（限价单模式），周期 {self.params.get('bar')}")
 
     async def stop(self):
         self.running = False
@@ -255,15 +294,13 @@ class DipSellStrategy(BaseStrategy):
         self._pending_sell_ord_id = None
 
     async def get_signal_status(self):
-        """返回信号诊断信息，用于 /signals 命令"""
         ind = await self._get_indicators()
         if not ind:
-            return {"inst_id": self.inst_id, "error": "K线数据不足（需要约50根以上）"}
+            return {"inst_id": self.inst_id, "error": "K线数据不足"}
 
         rsi = ind["rsi"]
         close = ind["close"]
         bb_lower = ind["bb_lower"]
-        bb_upper = ind["bb_upper"]
         macd = ind["macd"]
         macd_sig = ind["macd_signal"]
         macd_hist = ind["macd_hist"]
@@ -274,23 +311,21 @@ class DipSellStrategy(BaseStrategy):
         macd_ok = False
         if macd is not None and macd_sig is not None and macd > macd_sig:
             macd_ok = True
-        if macd_hist is not None and macd_prev is not None and macd_hist > 0 and macd_prev <= 0:
+        if macd_hist is not None and macd_prev is not None and macd_hist > 0 and macd_prev <= UB0:
             macd_ok = True
 
         return {
-            "inst_id": self.inst_id,
+            "inst_id": self.inst_id_,
+            "bar": self.params.get("bar", "15m"),
             "price": close,
-            "rsi": rsi,
+            "WSrsi": rsi,
             "rsi_oversold": self.signal_engine.rsi_oversold,
-            "rsi_ok": rsi_ok,
+            "r:
+si_ok": rsi_ok,
             "bb_lower": bb_lower,
-            "bb_upper": bb_upper,
-            "bb_ok": bb_ok,
+            "bb_       ok": bb_ok,
             "macd_ok": macd_ok,
-            "macd_hist": macd_hist,
-            "buy_ready": rsi_ok and bb_ok and macd_ok,
-            "trend_filter": self.params.get("trend_filter", True),
-            "volume_confirm": self.params.get("volume_confirm", True),
+            "buy_ awaitready": rsi_ok and bb_ok and macd_ok,
         }
 
     def snapshot(self):
@@ -305,5 +340,6 @@ class DipSellStrategy(BaseStrategy):
             "trade_count": self.trade_count,
             "pending_buy": self._pending_buy_ord_id,
             "pending_sell": self._pending_sell_ord_id,
+            "bar": self.params.get("bar", "15m"),
         })
         return s
