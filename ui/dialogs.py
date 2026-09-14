@@ -452,4 +452,71 @@ async def on_dip_base_input(msg: Message, widget, manager: DialogManager):
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if dip:
         dip.base_px = px
-        dip.buy_px = px * dip.params["buyPct
+        dip.buy_px = px * dip.params["buyPct"]
+        dip.sell_px = px * dip.params["sellPct"]
+        await msg.answer(f"基准价已修改为 {px}")
+    await manager.switch_to(CoinSG.dip)
+
+
+dip_panel_window = Window(
+    Format(
+        "{inst_id} 低吸高卖\n"
+        "状态: {status}\n"
+        "基准价: {base_px}\n"
+        "买入线: <= {buy_px}\n"
+        "卖出线: >= {sell_px}\n"
+        "当前价: {lastPx}\n"
+        "持仓: {position}\n"
+        "已实现盈亏: {profit} USDT\n"
+        "累计手续费: {fee} USDT"
+    ),
+    Column(
+        Button(Const("启动监控"), id="dip_start", on_click=on_start_dip),
+        Button(Const("暂停"), id="dip_stop", on_click=on_stop_dip),
+        Button(Const("修改买入线"), id="dip_edit_buy", on_click=on_edit_dip_buy),
+        Button(Const("修改卖出线"), id="dip_edit_sell", on_click=on_edit_dip_sell),
+        Button(Const("修改基准价"), id="dip_edit_base", on_click=on_edit_dip_base),
+        Back(Const("返回币种面板")),
+    ),
+    state=CoinSG.dip,
+    getter=dip_getter,
+)
+
+dip_edit_buy_window = Window(
+    Const("修改买入线\n\n请输入绝对价格，例如 58000："),
+    MessageInput(on_dip_buy_input),
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.dip)),
+    state=CoinSG.dip_edit_buy,
+)
+
+dip_edit_sell_window = Window(
+    Const("修改卖出线\n\n请输入绝对价格，例如 62000："),
+    MessageInput(on_dip_sell_input),
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.dip)),
+    state=CoinSG.dip_edit_sell,
+)
+
+dip_edit_base_window = Window(
+    Const("修改基准价\n\n请输入新的基准价，例如 60000："),
+    MessageInput(on_dip_base_input),
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(CoinSG.dip)),
+    state=CoinSG.dip_edit_base,
+)
+
+
+# ==================== Dialog 组装 ====================
+main_dialog = Dialog(main_menu_window, add_coin_window)
+coin_dialog = Dialog(
+    coin_panel_window,
+    grid_panel_window,
+    grid_edit_range_window,
+    grid_edit_num_window,
+    dip_panel_window,
+    dip_edit_buy_window,
+    dip_edit_sell_window,
+    dip_edit_base_window,
+)
+
+
+def get_dialogs() -> list:
+    return [main_dialog, coin_dialog]
