@@ -37,6 +37,31 @@ class DipSellStrategy(BaseStrategy):
         self._last_kline_ts = 0
         self._last_price = 0.0
         self._buy_disabled_until = 0.0
+        self._min_notional = 0.0
+        self._lot_sz = 0.0
+        self._min_sz = 0.0
+
+    async def _load_instrument_rules(self):
+        """加载交易对的最小下单规格"""
+        try:
+            resp = await asyncio.to_thread(self.rest.get_instruments, "SPOT", self.inst_id)
+            if resp.get("code") == "0" and resp.get("data"):
+                inst = resp["data"][0]
+                self._min_sz = float(inst.get("minSz", 0))
+                self._lot_sz = float(inst.get("lotSz", 0.00000001))
+                logger.info(f"{self.inst_id} 规格: minSz={self._min_sz}, lotSz={self._lot_sz}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 加载规格失败: {e}")
+
+    async def _check_min_order(self, price):
+        """校验单次投入是否满足最小下单要求"""
+        if self._min_sz <= 0:
+            await self._load_instrument_rules()
+        spend = self.params.get("maxSpend", 100)
+        min_notional = self._min_sz * price
+        if spend < min_notional:
+            return False, f"投入 {spend} USDT < 最小 {min_notional:.2f} USDT"
+        return True, ""
 
     async def _fetch_klines(self):
         try:
@@ -93,6 +118,12 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
     async def _do_buy(self, price, tag):
+        # 最小下单校验
+        ok, msg = await self._check_min_order(price)
+        if not ok:
+            logger.warning(f"{self.inst_id} 买入跳过: {msg}")
+            return
+
         spend = self.params.get("maxSpend", 100)
         try:
             r = await asyncio.to_thread(self.rest.market_buy, self.inst_id, spend)
@@ -101,13 +132,19 @@ class DipSellStrategy(BaseStrategy):
                 logger.info(f"{self.inst_id} 买入 @ {price} ({tag})")
                 await self._record_fee()
                 await self._sync_position_from_okx()
+            else:
+                logger.error(f"{self.inst_id} 买入失败: {r}")
         except Exception as e:
-            logger.error(f"{self.inst_id} 买入失败: {e}")
+            logger.error(f"{self.inst_id} 买入异常: {e}")
 
     async def _do_sell(self, price, tag):
         sell_size = self.position
         sell_cost = self.cost
         if sell_size <= 0:
+            return
+        # 卖出数量必须 >= minSz
+        if self._min_sz > 0 and sell_size < self._min_sz:
+            logger.warning(f"{self.inst_id} 持仓 {sell_size} < 最小 {self._min_sz},无法卖出")
             return
         try:
             r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
@@ -119,8 +156,10 @@ class DipSellStrategy(BaseStrategy):
                 await self._record_fee()
                 await self._sync_position_from_okx()
                 self._buy_disabled_until = time.time() + 600
+            else:
+                logger.error(f"{self.inst_id} 卖出失败: {r}")
         except Exception as e:
-            logger.error(f"{self.inst_id} 卖出失败: {e}")
+            logger.error(f"{self.inst_id} 卖出异常: {e}")
 
     async def _get_indicators(self):
         now = time.time()
@@ -138,34 +177,25 @@ class DipSellStrategy(BaseStrategy):
     async def _check_sell(self, price):
         if self.position <= 0 or self.avg_buy_price <= 0:
             return None
-
-        # 更新峰值价
         if price > self.peak_price:
             self.peak_price = price
-
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
-        # 移动止盈：先看回撤
         if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
             drawdown = (self.peak_price - price) / self.peak_price
             trailing_pct = self.params.get("trailing_pct", 0.02)
-            # 至少盈利 0.5% 才启动移动止盈
             if profit_pct > 0.005 and drawdown >= trailing_pct:
                 return f"移动止盈(回撤{drawdown*100:.2f}%)"
 
-        # 固定止盈
         if profit_pct >= self.params.get("take_profit_pct", 0.03):
             return f"止盈({profit_pct*100:.2f}%)"
 
-        # 止损
         if profit_pct <= -self.params.get("stop_loss_pct", 0.05):
             return f"止损({profit_pct*100:.2f}%)"
 
-        # 信号卖出
         ind = await self._get_indicators()
         if ind and self.signal_engine.sell_signal(ind):
             return "信号"
-
         return None
 
     async def on_ticker(self, price, raw):
@@ -195,6 +225,7 @@ class DipSellStrategy(BaseStrategy):
 
     async def start(self):
         self.running = True
+        await self._load_instrument_rules()
         await self._sync_position_from_okx()
         logger.info(f"{self.inst_id} 全自动低吸高卖已启动")
 
@@ -211,5 +242,7 @@ class DipSellStrategy(BaseStrategy):
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
             "trade_count": self.trade_count,
+            "min_sz": self._min_sz,
+            "lot_sz": self._lot_sz,
         })
         return s
