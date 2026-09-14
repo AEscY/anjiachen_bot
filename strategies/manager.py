@@ -1,4 +1,4 @@
-# strategies/manager.py
+import asyncio
 import logging
 from okx_client.rest import OKXRest
 from strategies.grid import GridStrategy
@@ -12,12 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class StrategyManager:
-    """统一管理多币种、多策略实例"""
-
     def __init__(self):
         self.rest = OKXRest()
-        self.grids: dict = {}   # inst_id -> GridStrategy
-        self.dips: dict = {}    # inst_id -> DipSellStrategy
+        self.grids: dict = {}
+        self.dips: dict = {}
         self._inst_ids: list = []
 
     # ==================== 币种管理 ====================
@@ -25,7 +23,6 @@ class StrategyManager:
         return list(self._inst_ids)
 
     async def add_inst(self, inst_id: str):
-        """添加币种，自动从当前价生成默认参数"""
         inst_id = inst_id.upper().strip()
         if not inst_id or "-" not in inst_id:
             return False, "格式错误，示例: BTC-USDT"
@@ -33,14 +30,13 @@ class StrategyManager:
             return False, f"{inst_id} 已在监控中"
 
         try:
-            resp = self.rest.get_ticker(inst_id)
+            resp = await asyncio.to_thread(self.rest.get_ticker, inst_id)
             if resp.get("code") != "0" or not resp.get("data"):
                 return False, f"无法获取 {inst_id} 行情"
             price = float(resp["data"][0]["last"])
         except Exception as e:
             return False, f"获取行情失败: {e}"
 
-        # 使用 config.py 中的常量计算参数，避免硬编码
         grid_params = {
             "minPx": round(price * (1 - GRID_RANGE_PCT), 6),
             "maxPx": round(price * (1 + GRID_RANGE_PCT), 6),
@@ -61,7 +57,6 @@ class StrategyManager:
         return True, f"已添加 {inst_id}，当前价 {price}"
 
     async def remove_inst(self, inst_id: str):
-        """删除币种，先停止其所有策略"""
         inst_id = inst_id.upper().strip()
         if inst_id not in self.grids:
             return False, f"{inst_id} 不在监控中"
@@ -91,10 +86,9 @@ class StrategyManager:
 
     # ==================== 状态恢复 ====================
     async def restore_all(self):
-        """从 OKX 恢复所有币种的运行状态"""
         for inst_id in self.all_inst_ids():
             try:
-                resp = self.rest.get_pending_grids(inst_id)
+                resp = await asyncio.to_thread(self.rest.get_pending_grids, inst_id)
                 if resp.get("code") == "0" and resp.get("data"):
                     latest = resp["data"][0]
                     grid = self.grids[inst_id]
@@ -106,3 +100,55 @@ class StrategyManager:
                     logger.info(f"{inst_id} 网格已恢复: {latest['algoId']}")
             except Exception as e:
                 logger.error(f"{inst_id} 网格恢复失败: {e}")
+
+    # ==================== ATR 与推荐参数 ====================
+    async def _calc_atr(self, inst_id, period=14):
+        try:
+            resp = await asyncio.to_thread(self.rest.get_candles, inst_id, "1H", period + 1)
+            if resp.get("code") != "0" or not resp.get("data"):
+                return None
+            candles = list(reversed(resp["data"]))
+            if len(candles) < 2:
+                return None
+            trs = []
+            for i in range(1, len(candles)):
+                high = float(candles[i][2])
+                low = float(candles[i][3])
+                prev_close = float(candles[i-1][4])
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                trs.append(tr)
+            if not trs:
+                return None
+            return sum(trs) / len(trs)
+        except Exception as e:
+            logger.error(f"计算 {inst_id} ATR 失败: {e}")
+            return None
+
+    async def get_recommend_params(self, inst_id):
+        try:
+            resp = await asyncio.to_thread(self.rest.get_ticker, inst_id)
+            if resp.get("code") != "0" or not resp.get("data"):
+                return None _
+            price = float(resp["data"][0]["last"])
+        except Exceptionparse as e:
+            logger.error(f"获取 {inst_id} 价格失败: {e_}")
+            return None
+
+        atr = await self._calc_atr(instfloat_id)
+        if atr is None:
+            atr = price * 0.015(text
+
+        range_pct = 0.15
+        grid_num = 20
+        min_px = round(price * (1 - range_pct), 6)
+        max_px = round(price * (1 + range_pct), 6)
+        buy_px = round(price - 1.5 * atr, 6)
+        sell_px = round(price + 1.5 * atr, 6)
+
+        return {
+            "inst_id": inst_id,
+            "price": price,
+            "atr": atr,
+            "grid": {"minPx": min_px, "maxPx": max_px, "gridNum": grid_num},
+            "dip": {"buyPx": buy_px, "sellPx": sell_px},
+        }
