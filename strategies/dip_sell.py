@@ -14,6 +14,8 @@ class DipSellStrategy(BaseStrategy):
             "maxSpend": 100,
             "stop_loss_pct": 0.05,
             "take_profit_pct": 0.03,
+            "use_trailing": True,
+            "trailing_pct": 0.02,
             "trend_filter": True,
             "volume_confirm": True,
         }
@@ -24,6 +26,7 @@ class DipSellStrategy(BaseStrategy):
         self.position = 0.0
         self.cost = 0.0
         self.avg_buy_price = 0.0
+        self.peak_price = 0.0
         self.total_profit = 0.0
         self.total_fee = 0.0
         self.trade_count = 0
@@ -51,14 +54,21 @@ class DipSellStrategy(BaseStrategy):
                 details = bal_resp["data"][0].get("details", [])
                 for d in details:
                     if d.get("ccy") == base_ccy:
+                        prev_pos = self.position
                         self.position = float(d.get("eq", 0))
                         self.cost = float(d.get("eqUsd", 0))
                         if self.position > 0:
                             self.avg_buy_price = self.cost / self.position
+                            if prev_pos <= 0:
+                                self.peak_price = self.avg_buy_price
+                        else:
+                            self.avg_buy_price = 0.0
+                            self.peak_price = 0.0
                         return
             self.position = 0.0
             self.cost = 0.0
             self.avg_buy_price = 0.0
+            self.peak_price = 0.0
         except Exception as e:
             logger.error(f"{self.inst_id} 同步持仓失败: {e}")
 
@@ -108,7 +118,6 @@ class DipSellStrategy(BaseStrategy):
                 logger.info(f"{self.inst_id} 卖出 @ {price} ({tag}), 获利 {profit:.4f}")
                 await self._record_fee()
                 await self._sync_position_from_okx()
-                # 卖出后禁用买入 10 分钟，避免立即追进
                 self._buy_disabled_until = time.time() + 600
         except Exception as e:
             logger.error(f"{self.inst_id} 卖出失败: {e}")
@@ -129,16 +138,34 @@ class DipSellStrategy(BaseStrategy):
     async def _check_sell(self, price):
         if self.position <= 0 or self.avg_buy_price <= 0:
             return None
-        # 止盈
-        if price >= self.avg_buy_price * (1 + self.params.get("take_profit_pct", 0.03)):
-            return "止盈"
+
+        # 更新峰值价
+        if price > self.peak_price:
+            self.peak_price = price
+
+        profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
+
+        # 移动止盈：先看回撤
+        if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
+            drawdown = (self.peak_price - price) / self.peak_price
+            trailing_pct = self.params.get("trailing_pct", 0.02)
+            # 至少盈利 0.5% 才启动移动止盈
+            if profit_pct > 0.005 and drawdown >= trailing_pct:
+                return f"移动止盈(回撤{drawdown*100:.2f}%)"
+
+        # 固定止盈
+        if profit_pct >= self.params.get("take_profit_pct", 0.03):
+            return f"止盈({profit_pct*100:.2f}%)"
+
         # 止损
-        if price <= self.avg_buy_price * (1 - self.params.get("stop_loss_pct", 0.05)):
-            return "止损"
+        if profit_pct <= -self.params.get("stop_loss_pct", 0.05):
+            return f"止损({profit_pct*100:.2f}%)"
+
         # 信号卖出
         ind = await self._get_indicators()
         if ind and self.signal_engine.sell_signal(ind):
             return "信号"
+
         return None
 
     async def on_ticker(self, price, raw):
@@ -146,14 +173,12 @@ class DipSellStrategy(BaseStrategy):
             return
         self._last_price = price
 
-        # 卖出优先
         if self.position > 0:
             reason = await self._check_sell(price)
             if reason:
                 await self._do_sell(price, reason)
             return
 
-        # 买入冷却
         if time.time() < self._buy_disabled_until:
             return
 
@@ -181,6 +206,7 @@ class DipSellStrategy(BaseStrategy):
         s.update({
             "position": self.position,
             "avg_buy_price": self.avg_buy_price,
+            "peak_price": self.peak_price,
             "last_action": self._last_action,
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
