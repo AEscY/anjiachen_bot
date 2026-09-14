@@ -11,37 +11,33 @@ logger = logging.getLogger(__name__)
 class DipSellStrategy(BaseStrategy):
     def __init__(self, inst_id, params=None):
         default = {
-            "basePx": 0,
-            "buyPct": 0.98,
-            "sellPct": 1.03,
             "maxSpend": 100,
-            "use_signal": False,
-            "use_trend_filter": False,
-            "use_volume": False,
+            "stop_loss_pct": 0.05,
+            "take_profit_pct": 0.03,
+            "trend_filter": True,
+            "volume_confirm": True,
         }
         merged = {**default, **(params or {})}
         super().__init__(inst_id, merged)
 
         self.rest = OKXRest()
-        self.base_px = merged["basePx"]
-        self.buy_px = self.base_px * merged["buyPct"]
-        self.sell_px = self.base_px * merged["sellPct"]
         self.position = 0.0
         self.cost = 0.0
-        self._last_action = None
+        self.avg_buy_price = 0.0
         self.total_profit = 0.0
         self.total_fee = 0.0
         self.trade_count = 0
+        self._last_action = None
 
         self.signal_engine = SignalEngine()
         self._kline_cache = []
         self._last_kline_ts = 0
+        self._last_price = 0.0
+        self._buy_disabled_until = 0.0
 
     async def _fetch_klines(self):
         try:
-            resp = await asyncio.to_thread(
-                self.rest.get_candles, self.inst_id, "1H", 300
-            )
+            resp = await asyncio.to_thread(self.rest.get_candles, self.inst_id, "1H", 300)
             if resp.get("code") == "0" and resp.get("data"):
                 self._kline_cache = list(reversed(resp["data"]))
         except Exception as e:
@@ -57,9 +53,12 @@ class DipSellStrategy(BaseStrategy):
                     if d.get("ccy") == base_ccy:
                         self.position = float(d.get("eq", 0))
                         self.cost = float(d.get("eqUsd", 0))
+                        if self.position > 0:
+                            self.avg_buy_price = self.cost / self.position
                         return
             self.position = 0.0
             self.cost = 0.0
+            self.avg_buy_price = 0.0
         except Exception as e:
             logger.error(f"{self.inst_id} 同步持仓失败: {e}")
 
@@ -98,6 +97,8 @@ class DipSellStrategy(BaseStrategy):
     async def _do_sell(self, price, tag):
         sell_size = self.position
         sell_cost = self.cost
+        if sell_size <= 0:
+            return
         try:
             r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
             if r.get("code") == "0":
@@ -107,54 +108,70 @@ class DipSellStrategy(BaseStrategy):
                 logger.info(f"{self.inst_id} 卖出 @ {price} ({tag}), 获利 {profit:.4f}")
                 await self._record_fee()
                 await self._sync_position_from_okx()
+                # 卖出后禁用买入 10 分钟，避免立即追进
+                self._buy_disabled_until = time.time() + 600
         except Exception as e:
             logger.error(f"{self.inst_id} 卖出失败: {e}")
 
-    async def _on_ticker_signal(self, price):
+    async def _get_indicators(self):
         now = time.time()
         if now - self._last_kline_ts > 60:
             await self._fetch_klines()
             self._last_kline_ts = now
-
         if len(self._kline_cache) < 50:
-            return
-
+            return None
         closes = [float(k[4]) for k in self._kline_cache]
         highs = [float(k[2]) for k in self._kline_cache]
         lows = [float(k[3]) for k in self._kline_cache]
         volumes = [float(k[5]) for k in self._kline_cache]
+        return self.signal_engine.calculate(closes, highs, lows, volumes)
 
-        ind = self.signal_engine.calculate(closes, highs, lows, volumes)
-
-        if self.position <= 0:
-            if self.signal_engine.buy_signal(
-                ind,
-                use_trend_filter=self.params.get("use_trend_filter", False),
-                use_volume=self.params.get("use_volume", False),
-            ):
-                await self._do_buy(price, "buy_signal")
-
-        elif self.position > 0:
-            if self.signal_engine.sell_signal(ind):
-                await self._do_sell(price, "sell_signal")
-
-    async def _on_ticker_threshold(self, price):
-        if self.position <= 0 and price <= self.buy_px:
-            await self._do_buy(price, "buy")
-        elif self.position > 0 and price >= self.sell_px:
-            await self._do_sell(price, "sell")
+    async def _check_sell(self, price):
+        if self.position <= 0 or self.avg_buy_price <= 0:
+            return None
+        # 止盈
+        if price >= self.avg_buy_price * (1 + self.params.get("take_profit_pct", 0.03)):
+            return "止盈"
+        # 止损
+        if price <= self.avg_buy_price * (1 - self.params.get("stop_loss_pct", 0.05)):
+            return "止损"
+        # 信号卖出
+        ind = await self._get_indicators()
+        if ind and self.signal_engine.sell_signal(ind):
+            return "信号"
+        return None
 
     async def on_ticker(self, price, raw):
         if not self.running:
             return
-        if self.params.get("use_signal"):
-            await self._on_ticker_signal(price)
-        else:
-            await self._on_ticker_threshold(price)
+        self._last_price = price
+
+        # 卖出优先
+        if self.position > 0:
+            reason = await self._check_sell(price)
+            if reason:
+                await self._do_sell(price, reason)
+            return
+
+        # 买入冷却
+        if time.time() < self._buy_disabled_until:
+            return
+
+        ind = await self._get_indicators()
+        if not ind:
+            return
+
+        if self.signal_engine.buy_signal(
+            ind,
+            use_trend_filter=self.params.get("trend_filter", True),
+            use_volume=self.params.get("volume_confirm", True),
+        ):
+            await self._do_buy(price, "信号")
 
     async def start(self):
         self.running = True
-        logger.info(f"{self.inst_id} 低吸高卖已启动，模式={'信号' if self.params.get('use_signal') else '阈值'}")
+        await self._sync_position_from_okx()
+        logger.info(f"{self.inst_id} 全自动低吸高卖已启动")
 
     async def stop(self):
         self.running = False
@@ -162,10 +179,8 @@ class DipSellStrategy(BaseStrategy):
     def snapshot(self):
         s = super().snapshot()
         s.update({
-            "base_px": self.base_px,
-            "buy_px": self.buy_px,
-            "sell_px": self.sell_px,
             "position": self.position,
+            "avg_buy_price": self.avg_buy_price,
             "last_action": self._last_action,
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
