@@ -47,6 +47,9 @@ class StrategyManager:
             "buyPct": DIP_BUY_PCT,
             "sellPct": DIP_SELL_PCT,
             "maxSpend": DIP_MAX_SPEND,
+            "use_signal": False,
+            "use_trend_filter": False,
+            "use_volume": False,
         }
 
         self.grids[inst_id] = GridStrategy(inst_id, grid_params)
