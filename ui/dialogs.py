@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from aiogram.types import CallbackQuery, Message
 from aiogram_dialog import Dialog, DialogManager, Window
 from aiogram_dialog.widgets.input import MessageInput
@@ -7,6 +8,7 @@ from aiogram_dialog.widgets.text import Const, Format
 
 from ui.states import MainSG, CoinSG
 from strategies.manager import StrategyManager
+from okx_client.rest import OKXRest
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +17,6 @@ PUB_WS = None
 _last_price: dict = {}
 
 
-# ==================== 解析工具 ====================
 def _parse_float(text: str):
     try:
         return float(text.strip()), None
@@ -41,7 +42,6 @@ def _parse_range(text: str):
 
 
 async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
-    """通用会话过期处理：提示并返回主菜单"""
     await cb.answer("页面已过期，请重新选择币种", show_alert=True)
     await manager.start(MainSG.menu)
 
@@ -139,16 +139,13 @@ async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
 async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
 
-    # 如果上下文丢失（机器人重启导致的失忆），尝试自动恢复逻辑
     if not inst_id:
         if MANAGER:
             current_coins = MANAGER.all_inst_ids()
             if len(current_coins) == 1:
-                # 如果只剩下一个币种，直接锁定它进行删除，不用再麻烦用户
                 inst_id = current_coins[0]
                 logger.info(f"会话过期，自动锁定唯一币种 {inst_id} 执行删除")
             else:
-                # 如果有多个币种，无法猜测用户原本想删哪个，只能提示重选
                 await cb.answer("页面已过期，请重新点击菜单选择要删除的币种", show_alert=True)
                 await manager.start(MainSG.menu)
                 return
@@ -156,13 +153,35 @@ async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
             await cb.answer("策略管理器未初始化", show_alert=True)
             return
 
-    # 执行真正的删除
     ok, text = await MANAGER.remove_inst(inst_id)
     if ok and PUB_WS:
         await PUB_WS.unsubscribe(inst_id)
-
     await cb.answer(text, show_alert=True)
     await manager.start(MainSG.menu)
+
+
+async def on_query_balance(cb: CallbackQuery, button, manager: DialogManager):
+    """查询当前账户余额"""
+    try:
+        rest = OKXRest()
+        resp = await asyncio.to_thread(rest.get_balance, "USDT")
+        if resp.get("code") != "0" or not resp.get("data"):
+            await cb.answer("查询失败", show_alert=True)
+            return
+        details = resp["data"][0].get("details", [])
+        lines = []
+        for d in details:
+            try:
+                eq = float(d.get("eq", 0))
+                avail = float(d.get("availBal", 0))
+            except (ValueError, TypeError):
+                continue
+            if eq > 0:
+                lines.append(f"{d.get('ccy')}: {eq:.4f} (可用 {avail:.4f})")
+        text = "\n".join(lines) if lines else "账户无资产"
+        await cb.answer(text, show_alert=True)
+    except Exception as e:
+        await cb.answer(f"查询失败: {e}", show_alert=True)
 
 
 coin_panel_window = Window(
@@ -175,6 +194,7 @@ coin_panel_window = Window(
     Column(
         Button(Const("网格模式"), id="to_grid", on_click=on_enter_grid),
         Button(Const("低吸高卖"), id="to_dip", on_click=on_enter_dip),
+        Button(Const("查询余额"), id="query_balance", on_click=on_query_balance),
         Button(Const("删除此币种"), id="del_coin", on_click=on_delete_coin),
         Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(MainSG.menu)),
     ),
@@ -326,7 +346,8 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
         return {"inst_id": inst_id, "status": "未初始化", "base_px": "-",
-                "buy_px": "-", "sell_px": "-", "lastPx": "-", "position": "-"}
+                "buy_px": "-", "sell_px": "-", "lastPx": "-", "position": "-",
+                "profit": "0", "fee": "0"}
     s = dip.snapshot()
     return {
         "inst_id": inst_id,
@@ -336,6 +357,8 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
         "sell_px": round(s.get("sell_px", 0), 6),
         "lastPx": _last_price.get(inst_id, "-"),
         "position": f"{s.get('position', 0):.6f}",
+        "profit": f"{s.get('total_profit', 0):.4f}",
+        "fee": f"{s.get('total_fee', 0):.4f}",
     }
 
 
@@ -438,7 +461,9 @@ dip_panel_window = Window(
         "买入线: <= {buy_px}\n"
         "卖出线: >= {sell_px}\n"
         "当前价: {lastPx}\n"
-        "持仓: {position}"
+        "持仓: {position}\n"
+        "已实现盈亏: {profit} USDT\n"
+        "累计手续费: {fee} USDT"
     ),
     Column(
         Button(Const("启动监控"), id="dip_start", on_click=on_start_dip),
