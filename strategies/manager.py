@@ -33,7 +33,6 @@ class StrategyManager:
         except Exception as e:
             return False, f"获取行情失败: {e}"
 
-        # 获取产品规格
         min_sz = 0.0
         lot_sz = 0.0
         try:
@@ -102,3 +101,75 @@ class StrategyManager:
                     logger.info(f"{inst_id} 网格已恢复: {latest['algoId']}")
             except Exception as e:
                 logger.error(f"{inst_id} 网格恢复失败: {e}")
+
+    # ==================== 互斥启停 ====================
+    async def activate_grid_only(self, inst_id):
+        """启动网格，自动停止低吸高卖（两模式互斥）"""
+        inst_id = inst_id.upper().strip()
+        grid = self.grids.get(inst_id)
+        dip = self.dips.get(inst_id)
+        if not grid:
+            return False, "网格未初始化"
+
+        if dip and dip.running:
+            try:
+                await dip.stop()
+                logger.info(f"{inst_id} 低吸高卖已自动暂停")
+            except Exception as e:
+                logger.error(f"停止 {inst_id} 低吸高卖失败: {e}")
+
+        if not grid.running:
+            try:
+                await grid.start()
+            except Exception as e:
+                return False, f"网格启动失败: {e}"
+
+        return True, "网格已启动，低吸高卖已自动暂停"
+
+    async def activate_dip_only(self, inst_id):
+        """启动低吸高卖，自动停止网格（两模式互斥）"""
+        inst_id = inst_id.upper().strip()
+        grid = self.grids.get(inst_id)
+        dip = self.dips.get(inst_id)
+        if not dip:
+            return False, "低吸高卖未初始化"
+
+        if grid and grid.running:
+            try:
+                await grid.stop()
+                logger.info(f"{inst_id} 网格已自动停止")
+            except Exception as e:
+                logger.error(f"停止 {inst_id} 网格失败: {e}")
+
+        if not dip.running:
+            try:
+                await dip.start()
+            except Exception as e:
+                return False, f"低吸高卖启动失败: {e}"
+
+        return True, "低吸高卖已启动，网格已自动停止"
+
+    async def stop_all_strategies(self, inst_id):
+        """停止该币种的所有策略"""
+        inst_id = inst_id.upper().strip()
+        grid = self.grids.get(inst_id)
+        dip = self.dips.get(inst_id)
+        stopped = []
+
+        if grid and grid.running:
+            try:
+                await grid.stop()
+                stopped.append("网格")
+            except Exception as e:
+                logger.error(f"停止 {inst_id} 网格失败: {e}")
+
+        if dip and dip.running:
+            try:
+                await dip.stop()
+                stopped.append("低吸高卖")
+            except Exception as e:
+                logger.error(f"停止 {inst_id} 低吸高卖失败: {e}")
+
+        if stopped:
+            return True, f"已停止: {', '.join(stopped)}"
+        return True, "两个策略均未运行"
