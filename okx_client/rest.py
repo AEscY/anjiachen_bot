@@ -23,13 +23,29 @@ class OKXRest:
     def get_candles(self, inst_id, bar="1H", limit=20):
         return self.market.get_candlesticks(instId=inst_id, bar=bar, limit=str(limit))
 
-    # ==================== 交易产品规格 ====================
+    # ==================== 产品规格 ====================
     def get_instruments(self, inst_type="SPOT", inst_id=None):
-        """获取交易产品规格（含 minSz, lotSz, tickSz 等）"""
         kwargs = {"instType": inst_type}
         if inst_id:
             kwargs["instId"] = inst_id
         return self.public.get_instruments(**kwargs)
+
+    def get_min_investment(self, inst_id, algo_ord_type="grid",
+                           min_px=None, max_px=None, grid_num=None,
+                           investment_type="quote"):
+        """获取网格最小投资金额"""
+        kwargs = {
+            "instId": inst_id,
+            "algoOrdType": algo_ord_type,
+            "investmentType": investment_type,
+        }
+        if min_px is not None:
+            kwargs["minPx"] = str(min_px)
+        if max_px is not None:
+            kwargs["maxPx"] = str(max_px)
+        if grid_num is not None:
+            kwargs["gridNum"] = str(grid_num)
+        return self.grid.grid_min_investment(**kwargs)
 
     # ==================== 网格 ====================
     def create_spot_grid(self, inst_id, min_px, max_px, grid_num, quote_sz):
@@ -94,6 +110,5 @@ class OKXRest:
             kwargs["instId"] = inst_id
         return self.trade.get_fills_history(**kwargs)
 
-    # ==================== 账户账单 ====================
     def get_bills(self, inst_type="SPOT", limit=100):
         return self.account.get_bills(instType=inst_type, limit=str(limit))
