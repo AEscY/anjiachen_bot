@@ -1,6 +1,5 @@
 import logging
 import json
-import asyncio
 from aiohttp import web, WSMsgType
 
 logger = logging.getLogger(__name__)
@@ -34,12 +33,9 @@ class Dashboard:
             return web.json_response({"error": "not initialized"})
         data = []
         for iid in self._manager.all_inst_ids():
-            g = self._manager.grids.get(iid)
             d = self._manager.dips.get(iid)
             data.append({
                 "inst_id": iid,
-                "grid_running": bool(g and g.running),
-                "grid_algo_id": g.algo_id if g else None,
                 "dip_running": bool(d and d.running),
                 "position": d.position if d else 0,
                 "avg_buy_price": d.avg_buy_price if d else 0,
@@ -105,7 +101,6 @@ class Dashboard:
         return ws
 
     async def broadcast(self, data: dict):
-        """向所有WebSocket客户端广播"""
         if not self._ws_clients:
             return
         text = json.dumps(data, ensure_ascii=False)
