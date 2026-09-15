@@ -7,7 +7,5 @@ class AppSG(StatesGroup):
     coin_panel = State()
     grid = State()
     dip = State()
-    dip_edit_tp = State()
-    dip_edit_sl = State()
-    dip_edit_trailing = State()
-    dip_edit_spend = State()
+    params = State()        # 参数列表
+    edit_param = State()    # 编辑单个参数
