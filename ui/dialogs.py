@@ -8,7 +8,7 @@ from aiogram_dialog.widgets.text import Const, Format
 
 from ui.states import AppSG
 from strategies.manager import StrategyManager
-from strategies.dip_sell import PARAM_META, DEFAULT_PARAMS
+from strategies.dip_sell import DEFAULT_PARAMS
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,31 @@ PUB_WS = None
 _last_price: dict = {}
 
 VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
+
+# 参数元信息（在面板中显示为可点击项）
+PARAM_META = {
+    "use_adaptive":    {"type": "bool",  "range": None,         "desc": "自适应模式"},
+    "bar":             {"type": "bar",   "range": None,         "desc": "K线周期"},
+    "rsi_period":      {"type": "int",   "range": (2, 100),     "desc": "RSI周期"},
+    "rsi_oversold":    {"type": "float", "range": (5, 50),      "desc": "RSI超卖阈值(固定)"},
+    "rsi_overbought":  {"type": "float", "range": (50, 95),     "desc": "RSI超买阈值(固定)"},
+    "bb_period":       {"type": "int",   "range": (5, 100),     "desc": "布林带周期"},
+    "bb_std":          {"type": "float", "range": (0.5, 5),     "desc": "布林带标准差(固定)"},
+    "macd_fast":       {"type": "int",   "range": (2, 50),      "desc": "MACD快线"},
+    "macd_slow":       {"type": "int",   "range": (5, 100),     "desc": "MACD慢线"},
+    "macd_signal":     {"type": "int",   "range": (2, 50),      "desc": "MACD信号线"},
+    "ema_period":      {"type": "int",   "range": (20, 500),    "desc": "EMA趋势周期"},
+    "vol_ma_period":   {"type": "int",   "range": (5, 100),     "desc": "成交量均线周期"},
+    "vol_multiplier":  {"type": "float", "range": (1.0, 5.0),   "desc": "成交量倍数"},
+    "trend_filter":    {"type": "bool",  "range": None,         "desc": "趋势过滤"},
+    "volume_confirm":  {"type": "bool",  "range": None,         "desc": "成交量确认"},
+    "limit_offset_pct":{"type": "pct",   "range": (0.001, 0.5), "desc": "限价偏移"},
+    "maxSpend":        {"type": "float", "range": (1, 100000),  "desc": "单次金额USDT"},
+    "take_profit_pct": {"type": "pct",   "range": (0.001, 0.5), "desc": "止盈(固定)"},
+    "stop_loss_pct":   {"type": "pct",   "range": (0.001, 0.5), "desc": "止损(固定)"},
+    "trailing_pct":    {"type": "pct",   "range": (0.001, 0.5), "desc": "移动止盈回撤(固定)"},
+    "use_trailing":    {"type": "bool",  "range": None,         "desc": "移动止盈开关"},
+}
 
 
 def _format_param_value(key, value, meta):
@@ -454,12 +479,27 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
                 "profit": "0", "fee": "0", "sl": "5", "tp": "3",
                 "trailing_state": "开启", "trailing_pct": "2",
                 "spend": "100", "last_action": "-",
-                "pending_buy": "-", "pending_sell": "-"}
+                "pending_buy": "-", "pending_sell": "-",
+                "adaptive_state": "开启", "effective_sl": "-", "effective_tp": "-",
+                "effective_rsi_os": "-", "volatility": "-"}
     s = dip.snapshot()
     avg = s.get("avg_buy_price", 0)
     peak = s.get("peak_price", 0)
     la = s.get("last_action")
     la_text = f"{la[0]} @ {la[1]:.2f}" if la else "-"
+
+    use_adaptive = dip.params.get("use_adaptive", True)
+    if use_adaptive:
+        effective_sl = f"{dip.adaptive.stop_loss_pct * 100:.2f}"
+        effective_tp = f"{dip.adaptive.take_profit_pct * 100:.2f}"
+        effective_rsi_os = f"{dip.adaptive.rsi_oversold:.1f}"
+        volatility = f"{dip.adaptive.volatility * 100:.2f}"
+    else:
+        effective_sl = f"{dip.params.get('stop_loss_pct', 0.05) * 100:.2f}"
+        effective_tp = f"{dip.params.get('take_profit_pct', 0.03) * 100:.2f}"
+        effective_rsi_os = f"{dip.params.get('rsi_oversold', 30):.1f}"
+        volatility = "-"
+
     return {
         "inst_id": inst_id,
         "status": "监控中" if s["running"] else "已暂停",
@@ -469,14 +509,19 @@ async def dip_getter(dialog_manager: DialogManager, **kwargs):
         "position": f"{s.get('position', 0):.6f}",
         "profit": f"{s.get('total_profit', 0):.4f}",
         "fee": f"{s.get('total_fee', 0):.4f}",
-        "sl": f"{dip.params.get('stop_loss_pct', 0.05) * 100:.1f}",
-        "tp": f"{dip.params.get('take_profit_pct', 0.03) * 100:.1f}",
+        "sl": f"{dip.params.get('stop_loss_pct', 0.05) * 100:.2f}",
+        "tp": f"{dip.params.get('take_profit_pct', 0.03) * 100:.2f}",
         "trailing_state": "开启" if dip.params.get("use_trailing", True) else "关闭",
-        "trailing_pct": f"{dip.params.get('trailing_pct', 0.02) * 100:.1f}",
+        "trailing_pct": f"{dip.params.get('trailing_pct', 0.02) * 100:.2f}",
         "spend": f"{dip.params.get('maxSpend', 100):.0f}",
         "last_action": la_text,
         "pending_buy": s.get("pending_buy") or "-",
         "pending_sell": s.get("pending_sell") or "-",
+        "adaptive_state": "开启" if use_adaptive else "关闭",
+        "effective_sl": effective_sl,
+        "effective_tp": effective_tp,
+        "effective_rsi_os": effective_rsi_os,
+        "volatility": volatility,
     }
 
 
@@ -501,16 +546,31 @@ async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
     await manager.update()
 
 
+async def on_toggle_adaptive(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    if not dip:
+        await _handle_expired(cb, manager)
+        return
+    new_val = not dip.params.get("use_adaptive", True)
+    await dip.set_param("use_adaptive", new_val)
+    mode = "自适应模式" if new_val else "固定参数模式"
+    await cb.answer(f"已切换到 {mode}", show_alert=True)
+    await manager.update()
+
+
 dip_panel_window = Window(
     Format(
         "{inst_id} 全自动低吸高卖\n"
         "状态: {status}\n"
+        "自适应: {adaptive_state}\n"
         "当前价: {lastPx}\n"
         "持仓: {position}\n"
         "平均买入价: {avg_buy_price}\n"
         "持仓最高价: {peak_price}\n"
-        "止盈: +{tp}%\n"
-        "止损: -{sl}%\n"
+        "波动率: {volatility}%\n"
+        "生效止损: -{effective_sl}% | 生效止盈: +{effective_tp}%\n"
+        "生效RSI超卖: <{effective_rsi_os}\n"
         "移动止盈: {trailing_state} (回撤 {trailing_pct}%)\n"
         "单次金额: {spend} USDT\n"
         "最近动作: {last_action}\n"
@@ -522,6 +582,7 @@ dip_panel_window = Window(
     Column(
         Button(Const("启动监控"), id="dip_start", on_click=on_start_dip),
         Button(Const("暂停"), id="dip_stop", on_click=on_stop_dip),
+        Button(Const("切换自适应"), id="toggle_adaptive", on_click=on_toggle_adaptive),
         Back(Const("返回币种面板")),
     ),
     state=AppSG.dip,
