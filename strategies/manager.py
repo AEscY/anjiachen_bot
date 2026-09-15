@@ -52,7 +52,7 @@ class StrategyManager:
         self.dips[inst_id] = DipSellStrategy(inst_id)
         self._inst_ids.append(inst_id)
 
-        # 从 Gist 恢复状态
+        # 从 Neon 恢复状态
         saved = await self.state_store.load_strategy(inst_id)
         if saved:
             dip = self.dips[inst_id]
@@ -67,7 +67,7 @@ class StrategyManager:
             dip._pending_sell_ord_id = saved.get("pending_sell") or None
             if saved.get("batch_tp_triggered"):
                 dip._batch_tp_triggered = set(saved["batch_tp_triggered"])
-            logger.info(f"{inst_id} 从 Gist 恢复状态: pos={dip.position}")
+            logger.info(f"{inst_id} 从 Neon 恢复状态: pos={dip.position}")
 
         logger.info(f"已添加 {inst_id} @ {price}")
 
@@ -107,7 +107,7 @@ class StrategyManager:
                 logger.error(f"{inst_id} 持仓同步失败: {e}")
 
     async def start_periodic_save(self, interval=60):
-        """每60秒自动保存一次到 Gist"""
+        """每60秒自动保存一次到 Neon"""
         async def _loop():
             while True:
                 await asyncio.sleep(interval)
@@ -116,7 +116,7 @@ class StrategyManager:
                 except Exception as e:
                     logger.error(f"定期保存失败: {e}")
         self._save_task = asyncio.create_task(_loop())
-        logger.info("Gist 定期保存任务已启动（每60秒）")
+        logger.info("Neon 定期保存任务已启动（每60秒）")
 
     async def activate_dip_only(self, inst_id):
         inst_id = inst_id.upper().strip()
