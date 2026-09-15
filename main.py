@@ -400,7 +400,7 @@ async def main():
             risk_manager.peak_capital = risk_saved.get("peak_capital", 0.0)
             risk_manager.current_capital = risk_saved.get("current_capital", 0.0)
             risk_manager.daily_pnl = risk_saved.get("daily_pnl", 0.0)
-            logger.info(f"风控状态已从 Gist 恢复: 峰值={risk_manager.peak_capital:.2f}")
+            logger.info(f"风控状态已从 Neon 恢复: 峰值={risk_manager.peak_capital:.2f}")
         except Exception as e:
             logger.error(f"风控状态恢复失败: {e}")
 
@@ -458,7 +458,7 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
-        logger.info("正在保存状态到 Gist 并关闭...")
+        logger.info("正在保存状态到 Neon 并关闭...")
         try:
             await manager.state_store.save_all(manager)
             await manager.state_store.close()
