@@ -5,3 +5,5 @@ httpx>=0.27,<1.0
 aiohttp>=3.9,<4.0
 python-okx>=0.3
 numpy>=1.24
+asyncpg>=0.29
+sqlalchemy>=2.0
