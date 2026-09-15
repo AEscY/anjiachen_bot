@@ -42,6 +42,7 @@ dp = Dispatcher(storage=MemoryStorage())
 VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
 
 
+# ==================== 事件处理 ====================
 async def on_market_event(event: MarketEvent):
     _last_price[event.inst_id] = event.price
     if dlg.MANAGER:
@@ -60,6 +61,7 @@ async def on_grid_sub_order(data: dict):
         await dlg.MANAGER.on_grid_sub_order(data)
 
 
+# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -220,33 +222,27 @@ async def cmd_signals(msg: Message):
         if not dip:
             continue
         try:
-            forecast = await dip.get_signal_forecast()
+            f = await dip.get_signal_forecast()
         except Exception as e:
             lines.append(f"\n{iid}: 获取失败 {e}")
             continue
 
-        if "error" in forecast:
-            lines.append(f"\n{iid}: {forecast['error']}")
+        if "error" in f:
+            lines.append(f"\n{iid}: {f['error']}")
             continue
 
-        bar = forecast["bar"]
-        price = forecast["price"]
-        current_score = forecast["current_score"]
-        threshold = forecast["threshold"]
-        gap = forecast["gap"]
-        rsi = forecast["rsi"]
-        rsi_th = forecast["rsi_threshold"]
-        rsi_gap = forecast["rsi_gap"]
-        bb_lower = forecast["bb_lower"]
-        bb_gap_pct = forecast["bb_gap_pct"]
-        macd_ok = forecast["macd_ok"]
-        vol_ratio = forecast["vol_ratio"]
-        estimated_bars = forecast["estimated_bars"]
-        estimated_minutes = forecast["estimated_minutes"]
+        bar = f["bar"]
+        gap = f["gap"]
+        current_score = f["current_score"]
+        threshold = f["threshold"]
 
-        # 信号强度图标
-        if gap == 0:
-            status_icon = "🎯 已满足"
+        # 状态图标
+        if not f["running"]:
+            status_icon = "⛔ 未启动"
+        elif gap == 0 and not f["blockers"]:
+            status_icon = "✅ 等待成交"
+        elif gap == 0:
+            status_icon = "🟡 已满足但有拦截"
         elif gap <= 10:
             status_icon = "🔥 接近"
         elif gap <= 25:
@@ -256,37 +252,47 @@ async def cmd_signals(msg: Message):
 
         lines.append(f"\n{iid}  [{bar}]  {status_icon}")
 
-        # 评分进度条
         pct = min(100, current_score / threshold * 100) if threshold > 0 else 0
         bar_filled = int(pct / 10)
         bar_str = "█" * bar_filled + "░" * (10 - bar_filled)
         lines.append(f"  评分: [{bar_str}] {current_score:.0f}/{threshold:.0f}")
 
-        # 各子条件
+        rsi = f["rsi"]
         if rsi is not None:
+            rsi_gap = f["rsi_gap"]
             rsi_status = f"差 {rsi_gap:.1f}" if rsi_gap > 0 else "✅"
-            lines.append(f"  RSI: {rsi:.1f} (阈值<{rsi_th:.1f}) {rsi_status}")
-        if bb_lower is not None and bb_gap_pct is not None:
-            bb_status = f"差 {bb_gap_pct:.2f}%" if bb_gap_pct > 0 else "✅"
-            lines.append(f"  布林带下轨: {bb_lower:.4f} (当前价 {price:.4f}) {bb_status}")
-        lines.append(f"  MACD: {'✅ 金叉' if macd_ok else '❌ 未金叉'}")
-        if vol_ratio is not None:
-            lines.append(f"  成交量倍数: {vol_ratio:.2f}x")
+            lines.append(f"  RSI: {rsi:.1f} (阈值<{f['rsi_threshold']:.1f}) {rsi_status}")
 
-        # 时间预测
-        if estimated_bars is not None and estimated_bars > 0:
-            if estimated_minutes < 60:
-                lines.append(f"  ⏱ 预估: 约 {estimated_minutes} 分钟")
-            elif estimated_minutes < 1440:
-                lines.append(f"  ⏱ 预估: 约 {estimated_minutes/60:.1f} 小时")
+        bb_lower = f["bb_lower"]
+        if bb_lower is not None and f["bb_gap_pct"] is not None:
+            bb_status = f"差 {f['bb_gap_pct']:.2f}%" if f["bb_gap_pct"] > 0 else "✅"
+            lines.append(f"  布林带下轨: {bb_lower:.4f} {bb_status}")
+
+        lines.append(f"  MACD: {'✅ 金叉' if f['macd_ok'] else '❌ 未金叉'}")
+
+        if f["vol_ratio"] is not None:
+            lines.append(f"  成交量倍数: {f['vol_ratio']:.2f}x")
+
+        # 拦截原因
+        blockers = f.get("blockers", [])
+        if blockers:
+            lines.append("  ⚠️ 拦截原因:")
+            for b in blockers:
+                lines.append(f"    · {b}")
+
+        # 时间估算
+        est = f.get("estimated_minutes")
+        if est is not None and est > 0:
+            if est < 60:
+                lines.append(f"  ⏱ 预估: 约 {est} 分钟")
+            elif est < 1440:
+                lines.append(f"  ⏱ 预估: 约 {est/60:.1f} 小时")
             else:
-                lines.append(f"  ⏱ 预估: 约 {estimated_minutes/1440:.1f} 天")
-        elif estimated_bars == 0:
-            lines.append(f"  ⏱ 已满足条件")
-        else:
-            lines.append(f"  ⏱ 暂无上升趋势，无法估算")
+                lines.append(f"  ⏱ 预估: 约 {est/1440:.1f} 天")
+        elif gap == 0:
+            lines.append(f"  ⏱ 评分已达标")
 
-    lines.append("\n提示: 评分达到阈值即触发买入。")
+    lines.append("\n提示: 如显示拦截原因，按原因排查即可。")
     await msg.answer("\n".join(lines))
 
 
@@ -338,7 +344,12 @@ async def cmd_profit(msg: Message):
             total_fee += fee
             lines.append(f"\n{iid}\n  已实现盈亏: {profit:.4f} USDT\n  手续费: {fee:.4f} USDT")
     net = total_profit - total_fee
-    lines.append(f"\n合计\n  已实现盈亏: {total_profit:.4f} USDT\n  累计手续费: {total_fee:.4f} USDT\n  净收益: {net:.4f} USDT")
+    lines.append(
+        f"\n合计\n"
+        f"  已实现盈亏: {total_profit:.4f} USDT\n"
+        f"  累计手续费: {total_fee:.4f} USDT\n"
+        f"  净收益: {net:.4f} USDT"
+    )
     await msg.answer("\n".join(lines))
 
 
@@ -362,6 +373,7 @@ async def health(request):
     return web.Response(text="OK")
 
 
+# ==================== 后台初始化 ====================
 async def background_init(manager, dashboard):
     for iid in WATCHLIST:
         ok, text = await manager.add_inst(iid)
@@ -392,7 +404,12 @@ async def background_init(manager, dashboard):
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        await alert(f"部署完成\nCommit: {commit}\n时间: {now}\n币种: {', '.join(manager.all_inst_ids())}")
+        await alert(
+            f"部署完成\n"
+            f"Commit: {commit}\n"
+            f"时间: {now}\n"
+            f"币种: {', '.join(manager.all_inst_ids())}"
+        )
     except Exception:
         pass
 
@@ -420,7 +437,9 @@ async def main():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None)
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None
+    )
     webhook_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     runner = web.AppRunner(app)
@@ -434,7 +453,11 @@ async def main():
     if WEBHOOK_URL:
         try:
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-            await bot.set_webhook(url=webhook_full_url, secret_token=WEBHOOK_SECRET or None, drop_pending_updates=True)
+            await bot.set_webhook(
+                url=webhook_full_url,
+                secret_token=WEBHOOK_SECRET or None,
+                drop_pending_updates=True,
+            )
             logger.info(f"Webhook 已设置: {webhook_full_url}")
         except Exception as e:
             logger.error(f"设置 Webhook 失败: {e}")
