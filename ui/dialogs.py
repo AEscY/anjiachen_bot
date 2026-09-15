@@ -19,7 +19,6 @@ _last_price: dict = {}
 VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
 
 
-# 参数按分类分组，便于界面展示
 PARAM_GROUPS = {
     "signal": {
         "title": "信号参数",
@@ -59,7 +58,6 @@ PARAM_GROUPS = {
     },
 }
 
-# 参数元信息扁平化，便于编辑时查询
 PARAM_META = {}
 for group in PARAM_GROUPS.values():
     PARAM_META.update(group["params"])
@@ -215,14 +213,18 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
         return {"inst_id": inst_id, "status": "未初始化", "price": "-",
-                "score": "0/0", "pos": "0", "pnl": "0.0000"}
+                "score": "0/0", "pos": "0", "pnl": "0.0000", "regime": "-"}
 
     status = "🟢 监控中" if dip.running else "⏸ 已暂停"
     try:
         forecast = await dip.get_signal_forecast()
         score = f"{forecast.get('current_score', 0):.0f}/{forecast.get('threshold', 0):.0f}"
+        regime = forecast.get("regime", "-")
     except Exception:
         score = "-"
+        regime = "-"
+
+    regime_icon = {"trending": "📈 趋势", "ranging": "📊 震荡", "transitional": "🔄 过渡"}.get(regime, "-")
 
     return {
         "inst_id": inst_id,
@@ -231,6 +233,7 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
         "score": score,
         "pos": f"{dip.position:.6f}",
         "pnl": f"{dip.total_profit:+.4f}",
+        "regime": regime_icon,
     }
 
 
@@ -294,6 +297,7 @@ coin_panel_window = Window(
         "📊 <b>{inst_id}</b>\n"
         "━━━━━━━━━━━━━━━\n"
         "状态: {status}\n"
+        "市场体制: {regime}\n"
         "当前价: {price}\n"
         "信号评分: {score}\n"
         "持仓: {pos}\n"
@@ -358,11 +362,17 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
 
     vol_line = f"成交量: {f['vol_ratio']:.2f}x" if f["vol_ratio"] is not None else "成交量: -"
 
-    # 拦截原因
+    regime = f.get("regime", "unknown")
+    regime_icon = {"trending": "📈 趋势市", "ranging": "📊 震荡市", "transitional": "🔄 过渡期"}.get(regime, "❓ 未知")
+    adx_val = f.get("adx", 0)
+    regime_line = f"市场体制: {regime_icon} (ADX: {adx_val:.1f})" if adx_val else f"市场体制: {regime_icon}"
+
+    batch_count = f.get("batch_tp_triggered", 0)
+    batch_line = f"分批止盈: 已触发 {batch_count}/3 档" if batch_count > 0 else "分批止盈: 未触发"
+
     blockers = f.get("blockers", [])
     blocker_text = "\n".join(f"  · {b}" for b in blockers) if blockers else "  无"
 
-    # 时间估算
     est = f.get("estimated_minutes")
     if est is not None and est > 0:
         if est < 60:
@@ -387,6 +397,8 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
         "bb_line": bb_line,
         "macd_line": macd_line,
         "vol_line": vol_line,
+        "regime_line": regime_line,
+        "batch_line": batch_line,
         "blocker_text": blocker_text,
         "est_text": est_text,
     }
@@ -399,10 +411,12 @@ signal_window = Window(
         "状态: {status}\n"
         "评分: [{bar_visual}] {score}/{threshold}\n"
         "━━━━━━━━━━━━━━━\n"
+        "{regime_line}\n"
         "{rsi_line}\n"
         "{bb_line}\n"
         "{macd_line}\n"
         "{vol_line}\n"
+        "{batch_line}\n"
         "━━━━━━━━━━━━━━━\n"
         "⚠️ 拦截原因:\n{blocker_text}\n"
         "⏱ 预估: {est_text}"
@@ -437,6 +451,9 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
     else:
         pnl_line = "浮动盈亏: -"
 
+    batch_count = s.get("batch_tp_triggered", 0)
+    batch_line = f"分批止盈已触发: {batch_count}/3 档" if batch_count > 0 else "分批止盈: 未触发"
+
     return {
         "inst_id": inst_id,
         "pos": f"{pos:.6f}",
@@ -448,6 +465,7 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
         "realized": f"{s.get('total_profit', 0):+.4f}",
         "fee": f"{s.get('total_fee', 0):.4f}",
         "pnl_line": pnl_line,
+        "batch_line": batch_line,
     }
 
 
@@ -460,6 +478,7 @@ position_window = Window(
         "均价: {avg}\n"
         "最高价: {peak}\n"
         "{pnl_line}\n"
+        "{batch_line}\n"
         "━━━━━━━━━━━━━━━\n"
         "挂单买入: {pending_buy}\n"
         "挂单卖出: {pending_sell}\n"
@@ -476,7 +495,7 @@ position_window = Window(
 )
 
 
-# ==================== 参数设置（分组） ====================
+# ==================== 参数设置 ====================
 async def params_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
@@ -512,10 +531,7 @@ async def on_reset(cb: CallbackQuery, button, manager: DialogManager):
 
 
 params_window = Window(
-    Format(
-        "⚙️ <b>{inst_id} 参数设置</b>\n\n"
-        "点击下方参数修改："
-    ),
+    Format("⚙️ <b>{inst_id} 参数设置</b>\n\n点击下方参数修改："),
     ScrollingGroup(
         Select(
             Format("{item[label]}\n  当前: {item[value]}"),
