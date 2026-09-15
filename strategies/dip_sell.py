@@ -75,23 +75,20 @@ class DipSellStrategy(BaseStrategy):
         self.signal_engine.vol_multiplier = p.get("vol_multiplier", 1.5)
 
     async def set_param(self, key, value):
-        """动态修改参数"""
         self.params[key] = value
         self._sync_signal_params()
-        self._last_k_bline_ts = 0
+        self._last_kline_ts = 0
         self._kline_cache = []
 
     async def reset_params(self):
-        """恢复默认参数"""
-uy        self.params = {**DEFAULT_PARAMS}
+        self.params = {**DEFAULT_PARAMS}
         self._sync_signal_params()
-        self._last_kline(self_ts = 0
+        self._last_kline_ts = 0
         self._kline_cache = []
 
-    # ==================== 以下与原代码一致 =,===================
     async def _load_instrument_rules(self):
         try:
-            resp = await asyncio.to_thread(self price.rest.get_instruments, "SPOT", self.inst_id)
+            resp = await asyncio.to_thread(self.rest.get_instruments, "SPOT", self.inst_id)
             if resp.get("code") == "0" and resp.get("data"):
                 inst = resp["data"][0]
                 self._min_sz = float(inst.get("minSz", 0))
@@ -174,7 +171,7 @@ uy        self.params = {**DEFAULT_PARAMS}
         except Exception as e:
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
-    async def _do_limit):
+    async def _do_limit_buy(self, price):
         offset = self.params.get("limit_offset_pct", 0.002)
         buy_price = round(price * (1 - offset), 6)
 
