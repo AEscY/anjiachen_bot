@@ -31,6 +31,30 @@ DEFAULT_PARAMS = {
     "vol_multiplier": 1.5,
 }
 
+# 参数元信息：type 用于解析，range 用于范围校验，desc 显示名称
+PARAM_META = {
+    "bar":             {"type": "bar",   "range": None,         "desc": "K线周期"},
+    "rsi_period":      {"type": "int",   "range": (2, 100),     "desc": "RSI周期"},
+    "rsi_oversold":    {"type": "float", "range": (5, 50),      "desc": "RSI超卖阈值"},
+    "rsi_overbought":  {"type": "float", "range": (50, 95),     "desc": "RSI超买阈值"},
+    "bb_period":       {"type": "int",   "range": (5, 100),     "desc": "布林带周期"},
+    "bb_std":          {"type": "float", "range": (0.5, 5),     "desc": "布林带标准差"},
+    "macd_fast":       {"type": "int",   "range": (2, 50),      "desc": "MACD快线"},
+    "macd_slow":       {"type": "int",   "range": (5, 100),     "desc": "MACD慢线"},
+    "macd_signal":     {"type": "int",   "range": (2, 50),      "desc": "MACD信号线"},
+    "ema_period":      {"type": "int",   "range": (20, 500),    "desc": "EMA趋势周期"},
+    "vol_ma_period":   {"type": "int",   "range": (5, 100),     "desc": "成交量均线周期"},
+    "vol_multiplier":  {"type": "float", "range": (1.0, 5.0),   "desc": "成交量倍数"},
+    "trend_filter":    {"type": "bool",  "range": None,         "desc": "趋势过滤"},
+    "volume_confirm":  {"type": "bool",  "range": None,         "desc": "成交量确认"},
+    "limit_offset_pct":{"type": "pct",   "range": (0.001, 0.5), "desc": "限价偏移"},
+    "maxSpend":        {"type": "float", "range": (1, 100000),  "desc": "单次金额USDT"},
+    "take_profit_pct": {"type": "pct",   "range": (0.001, 0.5), "desc": "止盈"},
+    "stop_loss_pct":   {"type": "pct",   "range": (0.001, 0.5), "desc": "止损"},
+    "trailing_pct":    {"type": "pct",   "range": (0.001, 0.5), "desc": "移动止盈回撤"},
+    "use_trailing":    {"type": "bool",  "range": None,         "desc": "移动止盈开关"},
+}
+
 
 class DipSellStrategy(BaseStrategy):
     def __init__(self, inst_id, params=None):
