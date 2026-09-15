@@ -42,7 +42,6 @@ dp = Dispatcher(storage=MemoryStorage())
 VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
 
 
-# ==================== 事件处理 ====================
 async def on_market_event(event: MarketEvent):
     _last_price[event.inst_id] = event.price
     if dlg.MANAGER:
@@ -51,7 +50,6 @@ async def on_market_event(event: MarketEvent):
 
 async def on_risk_event(event: RiskEvent):
     await alert(f"⚠️ 风控触发: {event.detail}")
-    # 停止所有策略
     if dlg.MANAGER:
         for iid in dlg.MANAGER.all_inst_ids():
             await dlg.MANAGER.stop_all_strategies(iid)
@@ -62,7 +60,6 @@ async def on_grid_sub_order(data: dict):
         await dlg.MANAGER.on_grid_sub_order(data)
 
 
-# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -208,6 +205,91 @@ async def cmd_positions(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+@dp.message(Command("signals"))
+async def cmd_signals(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    lines = ["信号诊断"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        try:
+            forecast = await dip.get_signal_forecast()
+        except Exception as e:
+            lines.append(f"\n{iid}: 获取失败 {e}")
+            continue
+
+        if "error" in forecast:
+            lines.append(f"\n{iid}: {forecast['error']}")
+            continue
+
+        bar = forecast["bar"]
+        price = forecast["price"]
+        current_score = forecast["current_score"]
+        threshold = forecast["threshold"]
+        gap = forecast["gap"]
+        rsi = forecast["rsi"]
+        rsi_th = forecast["rsi_threshold"]
+        rsi_gap = forecast["rsi_gap"]
+        bb_lower = forecast["bb_lower"]
+        bb_gap_pct = forecast["bb_gap_pct"]
+        macd_ok = forecast["macd_ok"]
+        vol_ratio = forecast["vol_ratio"]
+        estimated_bars = forecast["estimated_bars"]
+        estimated_minutes = forecast["estimated_minutes"]
+
+        # 信号强度图标
+        if gap == 0:
+            status_icon = "🎯 已满足"
+        elif gap <= 10:
+            status_icon = "🔥 接近"
+        elif gap <= 25:
+            status_icon = "⚡ 中等"
+        else:
+            status_icon = "⏳ 等待"
+
+        lines.append(f"\n{iid}  [{bar}]  {status_icon}")
+
+        # 评分进度条
+        pct = min(100, current_score / threshold * 100) if threshold > 0 else 0
+        bar_filled = int(pct / 10)
+        bar_str = "█" * bar_filled + "░" * (10 - bar_filled)
+        lines.append(f"  评分: [{bar_str}] {current_score:.0f}/{threshold:.0f}")
+
+        # 各子条件
+        if rsi is not None:
+            rsi_status = f"差 {rsi_gap:.1f}" if rsi_gap > 0 else "✅"
+            lines.append(f"  RSI: {rsi:.1f} (阈值<{rsi_th:.1f}) {rsi_status}")
+        if bb_lower is not None and bb_gap_pct is not None:
+            bb_status = f"差 {bb_gap_pct:.2f}%" if bb_gap_pct > 0 else "✅"
+            lines.append(f"  布林带下轨: {bb_lower:.4f} (当前价 {price:.4f}) {bb_status}")
+        lines.append(f"  MACD: {'✅ 金叉' if macd_ok else '❌ 未金叉'}")
+        if vol_ratio is not None:
+            lines.append(f"  成交量倍数: {vol_ratio:.2f}x")
+
+        # 时间预测
+        if estimated_bars is not None and estimated_bars > 0:
+            if estimated_minutes < 60:
+                lines.append(f"  ⏱ 预估: 约 {estimated_minutes} 分钟")
+            elif estimated_minutes < 1440:
+                lines.append(f"  ⏱ 预估: 约 {estimated_minutes/60:.1f} 小时")
+            else:
+                lines.append(f"  ⏱ 预估: 约 {estimated_minutes/1440:.1f} 天")
+        elif estimated_bars == 0:
+            lines.append(f"  ⏱ 已满足条件")
+        else:
+            lines.append(f"  ⏱ 暂无上升趋势，无法估算")
+
+    lines.append("\n提示: 评分达到阈值即触发买入。")
+    await msg.answer("\n".join(lines))
+
+
 @dp.message(Command("balance"))
 async def cmd_balance(msg: Message):
     if not _allowed(msg.from_user.id):
@@ -268,6 +350,7 @@ async def setup_menu():
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
         BotCommand(command="status", description="状态"),
+        BotCommand(command="signals", description="信号与买入预测"),
         BotCommand(command="risk", description="风控状态"),
         BotCommand(command="positions", description="建仓与挂单"),
         BotCommand(command="balance", description="查询余额"),
@@ -279,27 +362,22 @@ async def health(request):
     return web.Response(text="OK")
 
 
-# ==================== 后台初始化 ====================
 async def background_init(manager, dashboard):
-    # 加载币种
     for iid in WATCHLIST:
         ok, text = await manager.add_inst(iid)
         logger.info(text)
 
-    # 恢复网格
     try:
         await manager.restore_all()
     except Exception as e:
         logger.error(f"状态恢复失败: {e}")
 
-    # 启动WebSocket
     pub_ws = PublicWS(lambda iid, p, r: bus.publish(MarketEvent(iid, p, r)))
     priv_ws = PrivateWS(lambda o: None)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
-    # 启动网格子订单WebSocket
     algo_ids = []
     for iid in manager.all_inst_ids():
         g = manager.grids.get(iid)
@@ -309,10 +387,8 @@ async def background_init(manager, dashboard):
         bus_ws = BusinessWS(on_grid_sub_order)
         asyncio.create_task(bus_ws.connect(algo_ids))
 
-    # 设置仪表盘数据源
     dashboard.set_manager(manager, manager.risk_manager)
 
-    # 部署提示
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -322,17 +398,14 @@ async def background_init(manager, dashboard):
 
 
 async def main():
-    # 初始化
     risk_manager = RiskManager()
     manager = StrategyManager(risk_manager=risk_manager)
     dlg.MANAGER = manager
     dashboard = Dashboard(port=DASHBOARD_PORT)
 
-    # 注册事件
     bus.subscribe(MarketEvent, on_market_event)
     bus.subscribe(RiskEvent, on_risk_event)
 
-    # 注册dialogs
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
@@ -342,10 +415,8 @@ async def main():
     except Exception as e:
         logger.error(f"设置菜单失败: {e}")
 
-    # 启动事件总线
     asyncio.create_task(bus.start())
 
-    # 启动aiohttp web服务器（Render端口）
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -358,10 +429,8 @@ async def main():
     await site.start()
     logger.info(f"Web 服务器已启动: {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
-    # 启动Web仪表盘
     dashboard_runner = await dashboard.start()
 
-    # 设置Webhook
     if WEBHOOK_URL:
         try:
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
@@ -370,7 +439,6 @@ async def main():
         except Exception as e:
             logger.error(f"设置 Webhook 失败: {e}")
 
-    # 后台初始化
     asyncio.create_task(background_init(manager, dashboard))
 
     try:
