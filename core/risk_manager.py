@@ -1,5 +1,6 @@
 import logging
-from datetime import date, datetime
+import asyncio
+from datetime import date
 from core.events import RiskEvent
 from core.event_bus import bus
 
@@ -82,6 +83,3 @@ class RiskManager:
         self._risk_triggered = False
         self.daily_pnl = 0.0
         self.today = date.today()
-
-
-import asyncio
