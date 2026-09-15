@@ -20,6 +20,7 @@ from okx_client.ws_private import PrivateWS
 from okx_client.rest import OKXRest
 from strategies.manager import StrategyManager
 from core.risk_manager import RiskManager
+from core.state_store import StateStore
 from core.event_bus import bus
 from core.events import MarketEvent, RiskEvent
 from web.dashboard import Dashboard
@@ -39,6 +40,7 @@ bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+# ==================== 事件处理 ====================
 async def on_market_event(event: MarketEvent):
     _last_price[event.inst_id] = event.price
     if dlg.MANAGER:
@@ -52,6 +54,7 @@ async def on_risk_event(event: RiskEvent):
             await dlg.MANAGER.stop_all_strategies(iid)
 
 
+# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -193,13 +196,18 @@ async def cmd_signals(msg: Message):
         filled = int(pct / 10)
         bar = "█" * filled + "░" * (10 - filled)
 
-        lines.append(f"\n{icon} {iid} [{f['bar']}]")
+        regime = f.get("regime", "unknown")
+        regime_icon = {"trending": "📈", "ranging": "📊", "transitional": "🔄"}.get(regime, "❓")
+
+        lines.append(f"\n{icon} {iid} [{f['bar']}] {regime_icon}")
         lines.append(f"  评分: [{bar}] {score:.0f}/{th:.0f}")
         if f["rsi"] is not None:
             lines.append(f"  RSI: {f['rsi']:.1f}")
         if f["bb_gap_pct"] is not None:
             lines.append(f"  距BB下轨: {f['bb_gap_pct']:.2f}%")
         lines.append(f"  MACD: {'✅' if f['macd_ok'] else '❌'}")
+        if f.get("batch_tp_triggered", 0) > 0:
+            lines.append(f"  分批止盈已触发: {f['batch_tp_triggered']}/3")
         if f["blockers"]:
             for b in f["blockers"]:
                 lines.append(f"  ⚠️ {b}")
@@ -238,6 +246,9 @@ async def cmd_positions(msg: Message):
         if ps:
             lines.append(f"  ⏳ 挂单卖出: {ps}")
         lines.append(f"  已实现盈亏: {s.get('total_profit', 0):+.4f} USDT")
+        batch = s.get("batch_tp_triggered", 0)
+        if batch > 0:
+            lines.append(f"  分批止盈: 已触发 {batch}/3 档")
     if not has_any:
         lines.append("\n暂无持仓或挂单。")
     await msg.answer("\n".join(lines))
@@ -319,6 +330,7 @@ async def cmd_risk(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+# ==================== 菜单按钮 ====================
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
@@ -335,45 +347,83 @@ async def setup_menu():
     ])
 
 
+# ==================== 健康检查 ====================
 async def health(request):
     return web.Response(text="OK")
 
 
+# ==================== 后台初始化 ====================
 async def background_init(manager, dashboard):
+    # 加载币种（同时从SQLite恢复状态）
     for iid in WATCHLIST:
         ok, text = await manager.add_inst(iid)
         logger.info(text)
 
+    # 从OKX同步真实持仓
     try:
         await manager.restore_all()
     except Exception as e:
         logger.error(f"状态恢复失败: {e}")
 
+    # 启动定期保存任务
+    await manager.start_periodic_save(60)
+    logger.info("SQLite定期保存已启动（每60秒）")
+
+    # 启动WebSocket
     pub_ws = PublicWS(lambda iid, p, r: bus.publish(MarketEvent(iid, p, r)))
     priv_ws = PrivateWS(lambda o: None)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
+    # 仪表盘
     dashboard.set_manager(manager, manager.risk_manager)
 
+    # 部署提示
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        await alert(f"✅ 部署完成\nCommit: {commit}\n时间: {now}\n币种: {', '.join(manager.all_inst_ids())}")
+        await alert(
+            f"✅ 部署完成\n"
+            f"Commit: {commit}\n"
+            f"时间: {now}\n"
+            f"币种: {', '.join(manager.all_inst_ids())}"
+        )
     except Exception:
         pass
 
 
+# ==================== 入口 ====================
 async def main():
+    # 初始化状态存储
+    state_store = StateStore()
+    await state_store.init()
+
+    # 初始化风控和策略管理器
     risk_manager = RiskManager()
-    manager = StrategyManager(risk_manager=risk_manager)
+
+    # 从SQLite恢复风控状态
+    risk_saved = await state_store.load_risk()
+    if risk_saved:
+        try:
+            risk_manager.initial_capital = risk_saved.get("initial_capital", 0.0)
+            risk_manager.peak_capital = risk_saved.get("peak_capital", 0.0)
+            risk_manager.current_capital = risk_saved.get("current_capital", 0.0)
+            risk_manager.daily_pnl = risk_saved.get("daily_pnl", 0.0)
+            logger.info(f"风控状态已从SQLite恢复: 峰值={risk_manager.peak_capital:.2f}")
+        except Exception as e:
+            logger.error(f"风控状态恢复失败: {e}")
+
+    manager = StrategyManager(risk_manager=risk_manager, state_store=state_store)
     dlg.MANAGER = manager
+
     dashboard = Dashboard(port=DASHBOARD_PORT)
 
+    # 订阅事件
     bus.subscribe(MarketEvent, on_market_event)
     bus.subscribe(RiskEvent, on_risk_event)
 
+    # 注册Dialog
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
@@ -383,12 +433,16 @@ async def main():
     except Exception as e:
         logger.error(f"设置菜单失败: {e}")
 
+    # 启动事件总线
     asyncio.create_task(bus.start())
 
+    # 启动aiohttp（Render主端口）
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None)
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None
+    )
     webhook_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     runner = web.AppRunner(app)
@@ -397,23 +451,40 @@ async def main():
     await site.start()
     logger.info(f"Web 服务器: {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
+    # 启动仪表盘
     dashboard_runner = await dashboard.start()
 
+    # 设置Webhook
     if WEBHOOK_URL:
         try:
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-            await bot.set_webhook(url=webhook_full_url, secret_token=WEBHOOK_SECRET or None, drop_pending_updates=True)
+            await bot.set_webhook(
+                url=webhook_full_url,
+                secret_token=WEBHOOK_SECRET or None,
+                drop_pending_updates=True,
+            )
             logger.info(f"Webhook: {webhook_full_url}")
         except Exception as e:
             logger.error(f"设置 Webhook 失败: {e}")
 
+    # 后台初始化
     asyncio.create_task(background_init(manager, dashboard))
 
+    # 保持运行
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
+        # 优雅关闭：保存状态
+        logger.info("正在保存状态并关闭...")
+        try:
+            await manager.save_all()
+            await state_store.close()
+            logger.info("状态已保存")
+        except Exception as e:
+            logger.error(f"保存状态失败: {e}")
+
         await bus.stop()
         await bot.session.close()
         await runner.cleanup()
