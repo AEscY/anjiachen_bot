@@ -38,10 +38,7 @@ DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", 8080))
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
 
-
-# ==================== 事件处理 ====================
 async def on_market_event(event: MarketEvent):
     _last_price[event.inst_id] = event.price
     if dlg.MANAGER:
@@ -55,7 +52,6 @@ async def on_risk_event(event: RiskEvent):
             await dlg.MANAGER.stop_all_strategies(iid)
 
 
-# ==================== 命令处理 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -84,7 +80,13 @@ async def cmd_list(msg: Message):
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
-    lines = [f"{iid} {_last_price.get(iid, '-')}" for iid in dlg.MANAGER.all_inst_ids()]
+    lines = []
+    for iid in dlg.MANAGER.all_inst_ids():
+        d = dlg.MANAGER.dips.get(iid)
+        status = "🟢" if (d and d.running) else "⏸"
+        price = _last_price.get(iid, "-")
+        pos = d.position if d else 0
+        lines.append(f"{status} {iid} {price} 仓:{pos:.4f}")
     await msg.answer("监控币种:\n" + "\n".join(lines))
 
 
@@ -104,7 +106,7 @@ async def cmd_add(msg: Message):
     ok, text = await dlg.MANAGER.add_inst(inst_id)
     if ok and dlg.PUB_WS:
         await dlg.PUB_WS.subscribe(inst_id)
-    await msg.answer(("成功: " if ok else "失败: ") + text)
+    await msg.answer(("✅ " if ok else "❌ ") + text)
 
 
 @dp.message(Command("remove"))
@@ -123,7 +125,7 @@ async def cmd_remove(msg: Message):
     ok, text = await dlg.MANAGER.remove_inst(inst_id)
     if ok and dlg.PUB_WS:
         await dlg.PUB_WS.unsubscribe(inst_id)
-    await msg.answer(("成功: " if ok else "失败: ") + text)
+    await msg.answer(("✅ " if ok else "❌ ") + text)
 
 
 @dp.message(Command("status"))
@@ -134,32 +136,74 @@ async def cmd_status(msg: Message):
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
-    lines = []
+    rm = dlg.MANAGER.risk_manager
+    lines = [
+        "📊 状态概览",
+        f"风控: {'⚠️ 已触发' if rm.is_risk_triggered() else '✅ 正常'}",
+        f"今日盈亏: {rm.daily_pnl:+.2f} USDT",
+        "",
+    ]
     for iid in dlg.MANAGER.all_inst_ids():
         d = dlg.MANAGER.dips.get(iid)
-        ds = "监控" if (d and d.running) else "暂停"
-        lines.append(f"{iid} 低吸{ds} {_last_price.get(iid, '-')}")
-    await msg.answer("状态总览:\n" + "\n".join(lines))
+        status = "🟢" if (d and d.running) else "⏸"
+        pos = d.position if d else 0
+        profit = d.total_profit if d else 0
+        lines.append(f"{status} {iid}  {_last_price.get(iid, '-')}  仓:{pos:.4f}  盈亏:{profit:+.4f}")
+    await msg.answer("\n".join(lines))
 
 
-@dp.message(Command("risk"))
-async def cmd_risk(msg: Message):
+@dp.message(Command("signals"))
+async def cmd_signals(msg: Message):
     if not _allowed(msg.from_user.id):
         await msg.answer("无权访问")
         return
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
-    rm = dlg.MANAGER.risk_manager
-    lines = [
-        "组合风控",
-        f"当前资金: {rm.current_capital:.2f} USDT",
-        f"峰值资金: {rm.peak_capital:.2f} USDT",
-        f"今日盈亏: {rm.daily_pnl:.2f} USDT",
-        f"最大回撤限制: {rm.max_drawdown*100:.0f}%",
-        f"每日亏损限制: {rm.daily_loss_limit} USDT",
-        f"风控状态: {'已触发' if rm.is_risk_triggered() else '正常'}",
-    ]
+
+    lines = ["📈 信号诊断"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        try:
+            f = await dip.get_signal_forecast()
+        except Exception as e:
+            lines.append(f"\n{iid}: 失败 {e}")
+            continue
+        if "error" in f:
+            lines.append(f"\n{iid}: {f['error']}")
+            continue
+
+        gap = f["gap"]
+        if gap == 0 and not f["blockers"]:
+            icon = "✅"
+        elif gap == 0:
+            icon = "🟡"
+        elif gap <= 10:
+            icon = "🔥"
+        elif gap <= 25:
+            icon = "⚡"
+        else:
+            icon = "⏳"
+
+        score = f["current_score"]
+        th = f["threshold"]
+        pct = min(100, score / th * 100) if th > 0 else 0
+        filled = int(pct / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+
+        lines.append(f"\n{icon} {iid} [{f['bar']}]")
+        lines.append(f"  评分: [{bar}] {score:.0f}/{th:.0f}")
+        if f["rsi"] is not None:
+            lines.append(f"  RSI: {f['rsi']:.1f}")
+        if f["bb_gap_pct"] is not None:
+            lines.append(f"  距BB下轨: {f['bb_gap_pct']:.2f}%")
+        lines.append(f"  MACD: {'✅' if f['macd_ok'] else '❌'}")
+        if f["blockers"]:
+            for b in f["blockers"]:
+                lines.append(f"  ⚠️ {b}")
+
     await msg.answer("\n".join(lines))
 
 
@@ -171,7 +215,7 @@ async def cmd_positions(msg: Message):
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
-    lines = ["建仓与挂单总览"]
+    lines = ["💰 持仓与挂单"]
     has_any = False
     for iid in dlg.MANAGER.all_inst_ids():
         dip = dlg.MANAGER.dips.get(iid)
@@ -188,100 +232,14 @@ async def cmd_positions(msg: Message):
         lines.append(f"  当前价: {_last_price.get(iid, 0)}")
         lines.append(f"  持仓: {pos:.6f}")
         if s.get("avg_buy_price", 0) > 0:
-            lines.append(f"  平均买入价: {s['avg_buy_price']:.6f}")
+            lines.append(f"  均价: {s['avg_buy_price']:.6f}")
         if pb:
             lines.append(f"  ⏳ 挂单买入: {pb}")
         if ps:
             lines.append(f"  ⏳ 挂单卖出: {ps}")
-        lines.append(f"  已实现盈亏: {s.get('total_profit', 0):.4f} USDT")
+        lines.append(f"  已实现盈亏: {s.get('total_profit', 0):+.4f} USDT")
     if not has_any:
-        lines.append("\n暂无建仓或挂单。")
-    await msg.answer("\n".join(lines))
-
-
-@dp.message(Command("signals"))
-async def cmd_signals(msg: Message):
-    if not _allowed(msg.from_user.id):
-        await msg.answer("无权访问")
-        return
-    if not dlg.MANAGER:
-        await msg.answer("未初始化")
-        return
-
-    lines = ["信号诊断"]
-    for iid in dlg.MANAGER.all_inst_ids():
-        dip = dlg.MANAGER.dips.get(iid)
-        if not dip:
-            continue
-        try:
-            f = await dip.get_signal_forecast()
-        except Exception as e:
-            lines.append(f"\n{iid}: 获取失败 {e}")
-            continue
-
-        if "error" in f:
-            lines.append(f"\n{iid}: {f['error']}")
-            continue
-
-        bar = f["bar"]
-        gap = f["gap"]
-        current_score = f["current_score"]
-        threshold = f["threshold"]
-
-        if not f["running"]:
-            status_icon = "⛔ 未启动"
-        elif gap == 0 and not f["blockers"]:
-            status_icon = "✅ 等待成交"
-        elif gap == 0:
-            status_icon = "🟡 已满足但有拦截"
-        elif gap <= 10:
-            status_icon = "🔥 接近"
-        elif gap <= 25:
-            status_icon = "⚡ 中等"
-        else:
-            status_icon = "⏳ 等待"
-
-        lines.append(f"\n{iid}  [{bar}]  {status_icon}")
-
-        pct = min(100, current_score / threshold * 100) if threshold > 0 else 0
-        bar_filled = int(pct / 10)
-        bar_str = "█" * bar_filled + "░" * (10 - bar_filled)
-        lines.append(f"  评分: [{bar_str}] {current_score:.0f}/{threshold:.0f}")
-
-        rsi = f["rsi"]
-        if rsi is not None:
-            rsi_gap = f["rsi_gap"]
-            rsi_status = f"差 {rsi_gap:.1f}" if rsi_gap > 0 else "✅"
-            lines.append(f"  RSI: {rsi:.1f} (阈值<{f['rsi_threshold']:.1f}) {rsi_status}")
-
-        bb_lower = f["bb_lower"]
-        if bb_lower is not None and f["bb_gap_pct"] is not None:
-            bb_status = f"差 {f['bb_gap_pct']:.2f}%" if f["bb_gap_pct"] > 0 else "✅"
-            lines.append(f"  布林带下轨: {bb_lower:.4f} {bb_status}")
-
-        lines.append(f"  MACD: {'✅ 金叉' if f['macd_ok'] else '❌ 未金叉'}")
-
-        if f["vol_ratio"] is not None:
-            lines.append(f"  成交量倍数: {f['vol_ratio']:.2f}x")
-
-        blockers = f.get("blockers", [])
-        if blockers:
-            lines.append("  ⚠️ 拦截原因:")
-            for b in blockers:
-                lines.append(f"    · {b}")
-
-        est = f.get("estimated_minutes")
-        if est is not None and est > 0:
-            if est < 60:
-                lines.append(f"  ⏱ 预估: 约 {est} 分钟")
-            elif est < 1440:
-                lines.append(f"  ⏱ 预估: 约 {est/60:.1f} 小时")
-            else:
-                lines.append(f"  ⏱ 预估: 约 {est/1440:.1f} 天")
-        elif gap == 0:
-            lines.append(f"  ⏱ 评分已达标")
-
-    lines.append("\n提示: 如显示拦截原因，按原因排查即可。")
+        lines.append("\n暂无持仓或挂单。")
     await msg.answer("\n".join(lines))
 
 
@@ -294,10 +252,10 @@ async def cmd_balance(msg: Message):
         rest = OKXRest()
         resp = await asyncio.to_thread(rest.get_balance, "USDT")
         if resp.get("code") != "0" or not resp.get("data"):
-            await msg.answer("查询余额失败")
+            await msg.answer("查询失败")
             return
         details = resp["data"][0].get("details", [])
-        lines = ["账户余额"]
+        lines = ["💵 账户余额"]
         for d in details:
             ccy = d.get("ccy", "")
             try:
@@ -320,41 +278,60 @@ async def cmd_profit(msg: Message):
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
-    lines = ["获利与手续费统计"]
-    total_profit = 0.0
-    total_fee = 0.0
+    lines = ["💹 盈亏统计"]
+    total_p = 0.0
+    total_f = 0.0
     for iid in dlg.MANAGER.all_inst_ids():
         dip = dlg.MANAGER.dips.get(iid)
-        if dip:
-            s = dip.snapshot()
-            profit = s.get("total_profit", 0)
-            fee = s.get("total_fee", 0)
-            total_profit += profit
-            total_fee += fee
-            lines.append(f"\n{iid}\n  已实现盈亏: {profit:.4f} USDT\n  手续费: {fee:.4f} USDT")
-    net = total_profit - total_fee
-    lines.append(
-        f"\n合计\n"
-        f"  已实现盈亏: {total_profit:.4f} USDT\n"
-        f"  累计手续费: {total_fee:.4f} USDT\n"
-        f"  净收益: {net:.4f} USDT"
-    )
+        if not dip:
+            continue
+        s = dip.snapshot()
+        p = s.get("total_profit", 0)
+        f = s.get("total_fee", 0)
+        total_p += p
+        total_f += f
+        lines.append(f"\n{iid}\n  已实现: {p:+.4f} USDT\n  手续费: {f:.4f} USDT")
+    lines.append(f"\n━━━━━━━━━━━━━━━")
+    lines.append(f"合计已实现: {total_p:+.4f}")
+    lines.append(f"合计手续费: {total_f:.4f}")
+    lines.append(f"净收益: {total_p - total_f:+.4f} USDT")
+    await msg.answer("\n".join(lines))
+
+
+@dp.message(Command("risk"))
+async def cmd_risk(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    rm = dlg.MANAGER.risk_manager
+    lines = [
+        "🛡 组合风控",
+        f"当前资金: {rm.current_capital:.2f} USDT",
+        f"峰值资金: {rm.peak_capital:.2f} USDT",
+        f"今日盈亏: {rm.daily_pnl:+.2f} USDT",
+        f"最大回撤限制: {rm.max_drawdown*100:.0f}%",
+        f"每日亏损限制: {rm.daily_loss_limit} USDT",
+        f"状态: {'⚠️ 已触发' if rm.is_risk_triggered() else '✅ 正常'}",
+    ]
     await msg.answer("\n".join(lines))
 
 
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await bot.set_my_commands([
-        BotCommand(command="start", description="启动"),
         BotCommand(command="menu", description="主菜单"),
+        BotCommand(command="list", description="币种列表"),
+        BotCommand(command="status", description="状态概览"),
+        BotCommand(command="signals", description="信号诊断"),
+        BotCommand(command="positions", description="持仓与挂单"),
+        BotCommand(command="balance", description="查询余额"),
+        BotCommand(command="profit", description="盈亏统计"),
+        BotCommand(command="risk", description="风控状态"),
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
-        BotCommand(command="status", description="状态"),
-        BotCommand(command="signals", description="信号与买入预测"),
-        BotCommand(command="risk", description="风控状态"),
-        BotCommand(command="positions", description="建仓与挂单"),
-        BotCommand(command="balance", description="查询余额"),
-        BotCommand(command="profit", description="获利与手续费"),
     ])
 
 
@@ -383,12 +360,7 @@ async def background_init(manager, dashboard):
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        await alert(
-            f"部署完成\n"
-            f"Commit: {commit}\n"
-            f"时间: {now}\n"
-            f"币种: {', '.join(manager.all_inst_ids())}"
-        )
+        await alert(f"✅ 部署完成\nCommit: {commit}\n时间: {now}\n币种: {', '.join(manager.all_inst_ids())}")
     except Exception:
         pass
 
@@ -416,28 +388,22 @@ async def main():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-    webhook_handler = SimpleRequestHandler(
-        dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None
-    )
+    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None)
     webhook_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_SERVER_HOST, WEB_SERVER_PORT)
     await site.start()
-    logger.info(f"Web 服务器已启动: {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+    logger.info(f"Web 服务器: {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
     dashboard_runner = await dashboard.start()
 
     if WEBHOOK_URL:
         try:
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-            await bot.set_webhook(
-                url=webhook_full_url,
-                secret_token=WEBHOOK_SECRET or None,
-                drop_pending_updates=True,
-            )
-            logger.info(f"Webhook 已设置: {webhook_full_url}")
+            await bot.set_webhook(url=webhook_full_url, secret_token=WEBHOOK_SECRET or None, drop_pending_updates=True)
+            logger.info(f"Webhook: {webhook_full_url}")
         except Exception as e:
             logger.error(f"设置 Webhook 失败: {e}")
 
