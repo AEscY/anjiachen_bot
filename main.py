@@ -36,7 +36,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
 
-# 参数类型映射：用于 /set 命令的校验
 PARAM_TYPES = {
     "bar": "bar",
     "rsi_period": "int",
@@ -239,13 +238,11 @@ async def cmd_set(msg: Message):
         elif ptype == "float":
             value = float(raw_val)
         elif ptype == "pct":
-            # 用户输入 3 表示 3%
             value = float(raw_val) / 100.0
     except ValueError:
         await msg.answer(f"参数值 {raw_val} 格式不正确")
         return
 
-    # 参数合理性校验
     if key == "rsi_period" and not (2 <= value <= 100):
         await msg.answer("rsi_period 范围 2-100")
         return
@@ -283,7 +280,6 @@ async def cmd_set(msg: Message):
 
     await dip.set_param(key, value)
 
-    # 用户友好回显
     if ptype == "pct":
         shown = f"{value * 100:.2f}%"
     elif ptype == "bool":
@@ -530,31 +526,60 @@ async def health(request):
     return web.Response(text="OK")
 
 
-async def main():
-    manager = StrategyManager()
-    dlg.MANAGER = manager
-
-    for iid in WATCHLIST:
-        ok, text = await manager.add_inst(iid)
-        logger.info(text)
-
-    for dialog in get_dialogs():
-        dp.include_router(dialog)
-    setup_dialogs(dp)
-
-    await setup_menu()
+# ==================== 后台初始化（端口先监听，再执行这些） ====================
+async def background_init(manager):
+    """端口监听启动后在后台执行的初始化任务"""
+    try:
+        for iid in WATCHLIST:
+            ok, text = await manager.add_inst(iid)
+            logger.info(text)
+    except Exception as e:
+        logger.error(f"添加初始币种失败: {e}")
 
     try:
         await manager.restore_all()
     except Exception as e:
+        logger.error(f"状态恢复失败: {e}")
         await alert(f"状态恢复失败: {e}")
 
+    # 启动 WebSocket
     pub_ws = PublicWS(on_ticker)
     priv_ws = PrivateWS(on_order_update)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
+    # 部署提示
+    commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        await alert(
+            f"部署完成\n"
+            f"Commit: {commit}\n"
+            f"时间: {now}\n"
+            f"币种: {', '.join(manager.all_inst_ids())}"
+        )
+    except Exception as e:
+        logger.error(f"部署提示失败: {e}")
+
+
+async def main():
+    # 1. 先初始化 Manager（构造函数不涉及网络请求，很快）
+    manager = StrategyManager()
+    dlg.MANAGER = manager
+
+    # 2. 注册 dialogs
+    for dialog in get_dialogs():
+        dp.include_router(dialog)
+    setup_dialogs(dp)
+
+    # 3. 设置菜单（会调用 Telegram API，但很快，约 1 秒）
+    try:
+        await setup_menu()
+    except Exception as e:
+        logger.error(f"设置菜单失败: {e}")
+
+    # 4. 先创建并启动 aiohttp 服务器，让端口立刻监听
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -567,40 +592,36 @@ async def main():
     webhook_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
-    if WEBHOOK_URL:
-        webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-        await bot.set_webhook(
-            url=webhook_full_url,
-            secret_token=WEBHOOK_SECRET or None,
-            drop_pending_updates=True,
-        )
-        logger.info(f"Webhook 已设置: {webhook_full_url}")
-    else:
-        logger.error("WEBHOOK_URL 未设置！")
-        await alert("WEBHOOK_URL 未配置，机器人将无法接收消息")
-
-    commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await alert(
-        f"部署完成\n"
-        f"Commit: {commit}\n"
-        f"时间: {now}\n"
-        f"币种: {', '.join(manager.all_inst_ids())}"
-    )
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_SERVER_HOST, WEB_SERVER_PORT)
     await site.start()
     logger.info(f"Web 服务器已启动: http://{WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
+    # 5. 设置 Webhook（这一步需要 Telegram 可达，可能要 1-3 秒）
+    if WEBHOOK_URL:
+        try:
+            webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
+            await bot.set_webhook(
+                url=webhook_full_url,
+                secret_token=WEBHOOK_SECRET or None,
+                drop_pending_updates=True,
+            )
+            logger.info(f"Webhook 已设置: {webhook_full_url}")
+        except Exception as e:
+            logger.error(f"设置 Webhook 失败: {e}")
+    else:
+        logger.error("WEBHOOK_URL 未设置！")
+
+    # 6. 后台启动其他初始化（加载币种、恢复网格、连接 WS）
+    asyncio.create_task(background_init(manager))
+
+    # 7. 保持运行
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
-        await pub_ws.close()
-        await priv_ws.close()
         await bot.session.close()
         await runner.cleanup()
 
