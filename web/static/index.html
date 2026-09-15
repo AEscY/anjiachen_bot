@@ -1,1 +1,129 @@
-1
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OKX 量化交易仪表盘</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0d1117; color: #c9d1d9; padding: 20px;
+        }
+        h1 { font-size: 20px; margin-bottom: 20px; color: #58a6ff; }
+        h2 { font-size: 15px; margin: 15px 0 10px; color: #8b949e; }
+        .card {
+            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 15px; margin-bottom: 15px;
+        }
+        .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; }
+        .label { color: #8b949e; }
+        .value { color: #c9d1d9; font-weight: 500; }
+        .green { color: #3fb950; }
+        .red { color: #f85149; }
+        .yellow { color: #d29922; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #21262d; }
+        th { color: #8b949e; font-weight: 500; }
+    </style>
+</head>
+<body>
+    <h1>OKX 量化交易仪表盘</h1>
+
+    <div class="card">
+        <h2>组合风控</h2>
+        <div id="risk-panel">加载中...</div>
+    </div>
+
+    <div class="card">
+        <h2>策略状态</h2>
+        <div id="status-panel">加载中...</div>
+    </div>
+
+    <div class="card">
+        <h2>持仓与挂单</h2>
+        <table>
+            <thead><tr><th>币种</th><th>持仓</th><th>均价</th><th>挂单买入</th><th>挂单卖出</th></tr></thead>
+            <tbody id="positions-body"></tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>信号诊断</h2>
+        <div id="signals-panel">加载中...</div>
+    </div>
+
+    <script>
+        async function loadRisk() {
+            try {
+                const r = await fetch('/api/risk').then(r => r.json());
+                const cls = r.risk_triggered ? 'red' : 'green';
+                document.getElementById('risk-panel').innerHTML = `
+                    <div class="row"><span class="label">当前资金</span><span class="value">${r.current_capital.toFixed(2)} USDT</span></div>
+                    <div class="row"><span class="label">峰值资金</span><span class="value">${r.peak_capital.toFixed(2)} USDT</span></div>
+                    <div class="row"><span class="label">今日盈亏</span><span class="value ${r.daily_pnl >= 0 ? 'green' : 'red'}">${r.daily_pnl.toFixed(2)} USDT</span></div>
+                    <div class="row"><span class="label">最大回撤限制</span><span class="value">${(r.max_drawdown*100).toFixed(0)}%</span></div>
+                    <div class="row"><span class="label">每日亏损限制</span><span class="value">${r.daily_loss_limit} USDT</span></div>
+                    <div class="row"><span class="label">风控状态</span><span class="value ${cls}">${r.risk_triggered ? '已触发' : '正常'}</span></div>
+                `;
+            } catch(e) { document.getElementById('risk-panel').textContent = '加载失败'; }
+        }
+
+        async function loadStatus() {
+            try {
+                const data = await fetch('/api/status').then(r => r.json());
+                let html = '<table><thead><tr><th>币种</th><th>网格</th><th>低吸高卖</th><th>持仓</th><th>已实现盈亏</th></tr></thead><tbody>';
+                for (const d of data) {
+                    html += `<tr>
+                        <td>${d.inst_id}</td>
+                        <td class="${d.grid_running ? 'green' : 'red'}">${d.grid_running ? '运行中' : '已停止'}</td>
+                        <td class="${d.dip_running ? 'green' : 'red'}">${d.dip_running ? '监控中' : '已暂停'}</td>
+                        <td>${d.position.toFixed(6)}</td>
+                        <td class="${d.total_profit >= 0 ? 'green' : 'red'}">${d.total_profit.toFixed(4)} USDT</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                document.getElementById('status-panel').innerHTML = html;
+            } catch(e) { document.getElementById('status-panel').textContent = '加载失败'; }
+        }
+
+        async function loadPositions() {
+            try {
+                const data = await fetch('/api/positions').then(r => r.json());
+                let html = '';
+                for (const d of data) {
+                    html += `<tr>
+                        <td>${d.inst_id}</td>
+                        <td>${d.position.toFixed(6)}</td>
+                        <td>${d.avg_buy_price ? d.avg_buy_price.toFixed(6) : '-'}</td>
+                        <td>${d.pending_buy || '-'}</td>
+                        <td>${d.pending_sell || '-'}</td>
+                    </tr>`;
+                }
+                if (!html) html = '<tr><td colspan="5" style="color:#8b949e">暂无持仓</td></tr>';
+                document.getElementById('positions-body').innerHTML = html;
+            } catch(e) {}
+        }
+
+        async function loadSignals() {
+            try {
+                const data = await fetch('/api/signals').then(r => r.json());
+                let html = '';
+                for (const s of data) {
+                    if (s.error) { html += `<div class="row"><span class="label">${s.inst_id}</span><span class="value red">${s.error}</span></div>`; continue; }
+                    const cls = s.buy_ready ? 'green' : 'yellow';
+                    html += `<div class="row">
+                        <span class="label">${s.inst_id}</span>
+                        <span class="value">RSI ${s.rsi ? s.rsi.toFixed(1) : '-'} | 买入分 ${s.buy_score ? s.buy_score.toFixed(0) : '-'}/${s.buy_threshold ? s.buy_threshold.toFixed(0) : '-'} <span class="${cls}">${s.buy_ready ? '🎯' : ''}</span></span>
+                    </div>`;
+                }
+                document.getElementById('signals-panel').innerHTML = html;
+            } catch(e) {}
+        }
+
+        function loadAll() { loadRisk(); loadStatus(); loadPositions(); loadSignals(); }
+        loadAll();
+        setInterval(loadAll, 5000);
+    </script>
+</body>
+</html>
