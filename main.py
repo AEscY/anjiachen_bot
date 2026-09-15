@@ -362,7 +362,6 @@ async def health(request):
     return web.Response(text="OK")
 
 
-# ==================== 后台初始化 ====================
 async def background_init(manager, dashboard):
     for iid in WATCHLIST:
         ok, text = await manager.add_inst(iid)
