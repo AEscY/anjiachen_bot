@@ -52,7 +52,7 @@ class StrategyManager:
         self.dips[inst_id] = DipSellStrategy(inst_id)
         self._inst_ids.append(inst_id)
 
-        # 从 StateStore 恢复状态
+        # 从 Gist 恢复状态
         saved = await self.state_store.load_strategy(inst_id)
         if saved:
             dip = self.dips[inst_id]
@@ -111,7 +111,10 @@ class StrategyManager:
         async def _loop():
             while True:
                 await asyncio.sleep(interval)
-                await self.state_store.save_all(self)
+                try:
+                    await self.state_store.save_all(self)
+                except Exception as e:
+                    logger.error(f"定期保存失败: {e}")
         self._save_task = asyncio.create_task(_loop())
         logger.info("Gist 定期保存任务已启动（每60秒）")
 
@@ -134,6 +137,9 @@ class StrategyManager:
             return False, "未初始化"
         if dip.running:
             await dip.stop()
-            await self.state_store.save_all(self)
+            try:
+                await self.state_store.save_all(self)
+            except Exception as e:
+                logger.error(f"停止后保存失败: {e}")
             return True, "已停止低吸高卖"
         return True, "低吸高卖未运行"
