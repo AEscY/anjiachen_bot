@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OKX 量化交易仪表盘</title>
+    <title>OKX 低吸高卖仪表盘</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -28,7 +28,7 @@
     </style>
 </head>
 <body>
-    <h1>OKX 量化交易仪表盘</h1>
+    <h1>OKX 低吸高卖仪表盘</h1>
 
     <div class="card">
         <h2>组合风控</h2>
@@ -72,11 +72,10 @@
         async function loadStatus() {
             try {
                 const data = await fetch('/api/status').then(r => r.json());
-                let html = '<table><thead><tr><th>币种</th><th>网格</th><th>低吸高卖</th><th>持仓</th><th>已实现盈亏</th></tr></thead><tbody>';
+                let html = '<table><thead><tr><th>币种</th><th>低吸高卖</th><th>持仓</th><th>已实现盈亏</th></tr></thead><tbody>';
                 for (const d of data) {
                     html += `<tr>
                         <td>${d.inst_id}</td>
-                        <td class="${d.grid_running ? 'green' : 'red'}">${d.grid_running ? '运行中' : '已停止'}</td>
                         <td class="${d.dip_running ? 'green' : 'red'}">${d.dip_running ? '监控中' : '已暂停'}</td>
                         <td>${d.position.toFixed(6)}</td>
                         <td class="${d.total_profit >= 0 ? 'green' : 'red'}">${d.total_profit.toFixed(4)} USDT</td>
