@@ -51,6 +51,7 @@ class DipSellStrategy(BaseStrategy):
 
         self._pending_buy_ord_id = None
         self._pending_sell_ord_id = None
+        self._pending_buy_price = None
 
         self.signal_engine = SignalEngine()
         self.score_engine = ScoreEngine()
@@ -113,6 +114,7 @@ class DipSellStrategy(BaseStrategy):
                 sz = float(order.get("sz", 0))
                 if side == "buy":
                     self._pending_buy_ord_id = ord_id
+                    self._pending_buy_price = px
                     logger.info(f"{self.inst_id} 恢复挂单买入 {ord_id} @ {px} x {sz}")
                 elif side == "sell":
                     self._pending_sell_ord_id = ord_id
@@ -189,6 +191,7 @@ class DipSellStrategy(BaseStrategy):
             r = await asyncio.to_thread(self.rest.limit_buy, self.inst_id, buy_price, size)
             if r.get("code") == "0":
                 self._pending_buy_ord_id = r["data"][0]["ordId"]
+                self._pending_buy_price = buy_price
                 self._last_action = ("限价买入挂单", buy_price)
                 logger.info(f"{self.inst_id} 限价买入挂单 @ {buy_price}, size={size}")
         except Exception as e:
@@ -208,7 +211,7 @@ class DipSellStrategy(BaseStrategy):
             if r.get("code") == "0":
                 self._pending_sell_ord_id = r["data"][0]["ordId"]
                 self._last_action = ("限价卖出挂单", sell_price)
-                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={size if False else sell_size}")
+                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={sell_size}")
         except Exception as e:
             logger.error(f"{self.inst_id} 限价卖出失败: {e}")
 
@@ -322,38 +325,9 @@ class DipSellStrategy(BaseStrategy):
                     logger.error(f"撤单失败: {e}")
         self._pending_buy_ord_id = None
         self._pending_sell_ord_id = None
-
-    async def get_signal_status(self):
-        ind = await self._get_indicators()
-        if not ind:
-            return {"inst_id": self.inst_id, "error": "K线数据不足"}
-        use_adaptive = self.params.get("use_adaptive", True)
-        buy_score = self.score_engine.buy_score(ind) if use_adaptive else 0
-        sell_score = self.score_engine.sell_score(ind) if use_adaptive else 0
-        return {
-            "inst_id": self.inst_id,
-            "bar": self.params.get("bar", "15m"),
-            "price": ind["close"],
-            "rsi": ind["rsi"],
-            "rsi_oversold": self.adaptive.rsi_oversold if use_adaptive else self.params.get("rsi_oversold", 30),
-            "bb_lower": ind["bb_lower"],
-            "macd_ok": (ind.get("macd_hist") or 0) > 0 or (
-                ind.get("macd") is not None and ind.get("macd_signal") is not None and ind["macd"] > ind["macd_signal"]
-            ),
-            "buy_score": buy_score,
-            "buy_threshold": self.adaptive.buy_threshold if use_adaptive else 0,
-            "volatility": self.adaptive.volatility if use_adaptive else 0,
-            "buy_ready": (buy_score >= self.adaptive.buy_threshold) if use_adaptive else False,
-            "use_adaptive": use_adaptive,
-        }
+        self._pending_buy_price = None
 
     async def get_signal_forecast(self):
-        """
-        返回买入预测信息，包括：
-        - 当前评分 / 阈值 / 差距
-        - 各子条件距离满足的差距
-        - 基于历史评分变化速度的估算等待时间
-        """
         ind = await self._get_indicators()
         if not ind:
             return {"inst_id": self.inst_id, "error": "K线数据不足"}
@@ -366,7 +340,6 @@ class DipSellStrategy(BaseStrategy):
         threshold = self.adaptive.buy_threshold
         gap = max(0, threshold - current_score)
 
-        # 各子条件差距
         rsi = ind.get("rsi")
         rsi_th = self.adaptive.rsi_oversold
         rsi_gap = max(0, rsi - rsi_th) if rsi is not None else None
@@ -384,12 +357,34 @@ class DipSellStrategy(BaseStrategy):
 
         vol = ind.get("volume")
         vol_ma = ind.get("vol_ma")
-        if vol and vol_ma and vol_ma > 0:
-            vol_ratio = vol / vol_ma
-        else:
-            vol_ratio = None
+        vol_ratio = (vol / vol_ma) if (vol and vol_ma and vol_ma > 0) else None
 
-        # 估算等待时间：对每根K线计算评分，观察变化趋势
+        # ============ 诊断：为什么没买 ============
+        blockers = []
+        if not self.running:
+            blockers.append("策略未启动")
+
+        if self._pending_buy_ord_id:
+            pending_px = self._pending_buy_price
+            blockers.append(f"已挂买单 @ {pending_px}，等成交")
+
+        if time.time() < self._buy_disabled_until:
+            wait_sec = int(self._buy_disabled_until - time.time())
+            blockers.append(f"冷却中，还需 {wait_sec} 秒")
+
+        if self.params.get("trend_filter", True) and ind.get("ema") is not None:
+            if ind["close"] < ind["ema"]:
+                blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200 {ind['ema']:.2f}")
+
+        if gap > 0:
+            blockers.append(f"评分不足：{current_score:.0f} < {threshold:.0f}")
+
+        if not blockers:
+            # 评分到但没下单，可能是限价单已挂在下方
+            buy_target = round(price * (1 - self.params.get("limit_offset_pct", 0.002)), 6)
+            blockers.append(f"限价单目标 {buy_target}，等价格回落成交")
+
+        # 估算等待时间
         bar_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
                        "1H": 60, "2H": 120, "4H": 240, "6H": 360, "12H": 720, "1D": 1440}
         bar_min = bar_minutes.get(self.params.get("bar", "15m"), 15)
@@ -397,13 +392,12 @@ class DipSellStrategy(BaseStrategy):
         estimated_bars = None
         estimated_minutes = None
 
-        if len(self._kline_cache) >= 60:
+        if len(self._kline_cache) >= 60 and gap > 0:
             closes = [float(k[4]) for k in self._kline_cache]
             highs = [float(k[2]) for k in self._kline_cache]
             lows = [float(k[3]) for k in self._kline_cache]
             volumes = [float(k[5]) for k in self._kline_cache]
 
-            # 计算过去 N 根的评分序列
             lookback = 20
             scores_history = []
             for i in range(len(closes) - lookback, len(closes)):
@@ -418,20 +412,12 @@ class DipSellStrategy(BaseStrategy):
                 scores_history.append(s)
 
             if len(scores_history) >= 5:
-                # 计算评分变化率（每根K线平均变化）
                 recent = scores_history[-5:]
                 diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
                 avg_change = sum(diffs) / len(diffs) if diffs else 0
-
                 if avg_change > 0.05:
-                    estimated_bars = int(gap / avg_change) if gap > 0 else 0
+                    estimated_bars = int(gap / avg_change)
                     estimated_minutes = estimated_bars * bar_min
-                elif gap == 0:
-                    estimated_bars = 0
-                    estimated_minutes = 0
-                else:
-                    estimated_bars = None
-                    estimated_minutes = None
 
         return {
             "inst_id": self.inst_id,
@@ -450,6 +436,10 @@ class DipSellStrategy(BaseStrategy):
             "estimated_bars": estimated_bars,
             "estimated_minutes": estimated_minutes,
             "bar_minutes": bar_min,
+            "blockers": blockers,
+            "running": self.running,
+            "pending_buy": self._pending_buy_ord_id,
+            "pending_buy_price": self._pending_buy_price,
         }
 
     def snapshot(self):
