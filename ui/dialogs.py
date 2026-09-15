@@ -25,10 +25,10 @@ PARAM_GROUPS = {
         "params": {
             "bar":             {"type": "bar",   "range": None,         "desc": "K线周期"},
             "rsi_period":      {"type": "int",   "range": (2, 100),     "desc": "RSI周期"},
-            "rsi_oversold":    {"type": "float", "range": (5, 50),      "desc": "RSI超卖(固定)"},
-            "rsi_overbought":  {"type": "float", "range": (50, 95),     "desc": "RSI超买(固定)"},
+            "rsi_oversold":    {"type": "float", "range": (5, 50),      "desc": "RSI超卖阈值"},
+            "rsi_overbought":  {"type": "float", "range": (50, 95),     "desc": "RSI超买阈值"},
             "bb_period":       {"type": "int",   "range": (5, 100),     "desc": "布林带周期"},
-            "bb_std":          {"type": "float", "range": (0.5, 5),     "desc": "布林带标准差(固定)"},
+            "bb_std":          {"type": "float", "range": (0.5, 5),     "desc": "布林带标准差"},
             "macd_fast":       {"type": "int",   "range": (2, 50),      "desc": "MACD快线"},
             "macd_slow":       {"type": "int",   "range": (5, 100),     "desc": "MACD慢线"},
             "macd_signal":     {"type": "int",   "range": (2, 50),      "desc": "MACD信号线"},
@@ -43,9 +43,9 @@ PARAM_GROUPS = {
     "risk": {
         "title": "风控参数",
         "params": {
-            "take_profit_pct": {"type": "pct",   "range": (0.001, 0.5), "desc": "止盈(固定)"},
-            "stop_loss_pct":   {"type": "pct",   "range": (0.001, 0.5), "desc": "止损(固定)"},
-            "trailing_pct":    {"type": "pct",   "range": (0.001, 0.5), "desc": "移动止盈回撤(固定)"},
+            "take_profit_pct": {"type": "pct",   "range": (0.001, 0.5), "desc": "止盈%"},
+            "stop_loss_pct":   {"type": "pct",   "range": (0.001, 0.5), "desc": "止损%"},
+            "trailing_pct":    {"type": "pct",   "range": (0.001, 0.5), "desc": "移动止盈回撤%"},
             "use_trailing":    {"type": "bool",  "range": None,         "desc": "移动止盈开关"},
         },
     },
@@ -53,7 +53,7 @@ PARAM_GROUPS = {
         "title": "交易参数",
         "params": {
             "maxSpend":        {"type": "float", "range": (1, 100000),  "desc": "单次金额USDT"},
-            "limit_offset_pct":{"type": "pct",   "range": (0.001, 0.5), "desc": "限价偏移"},
+            "limit_offset_pct":{"type": "pct",   "range": (0.001, 0.5), "desc": "限价偏移%"},
         },
     },
 }
@@ -500,7 +500,14 @@ async def params_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
-        return {"inst_id": inst_id, "params": []}
+        return {"inst_id": inst_id, "params": [], "mode_text": ""}
+
+    # 判断当前模式
+    is_adaptive = dip.params.get("use_adaptive", True)
+    if is_adaptive:
+        mode_text = "🔵 当前为自适应模式\n下方参数为【备用】值，仅在关闭自适应时生效"
+    else:
+        mode_text = "🟠 当前为固定参数模式\n下方参数直接生效"
 
     items = []
     for group_key, group in PARAM_GROUPS.items():
@@ -511,7 +518,7 @@ async def params_getter(dialog_manager: DialogManager, **kwargs):
                 "label": f"[{group['title']}] {meta['desc']}",
                 "value": _fmt(key, value, meta),
             })
-    return {"inst_id": inst_id, "params": items}
+    return {"inst_id": inst_id, "params": items, "mode_text": mode_text}
 
 
 async def on_param_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
@@ -531,7 +538,11 @@ async def on_reset(cb: CallbackQuery, button, manager: DialogManager):
 
 
 params_window = Window(
-    Format("⚙️ <b>{inst_id} 参数设置</b>\n\n点击下方参数修改："),
+    Format(
+        "⚙️ <b>{inst_id} 参数设置</b>\n\n"
+        "{mode_text}\n\n"
+        "点击下方参数修改："
+    ),
     ScrollingGroup(
         Select(
             Format("{item[label]}\n  当前: {item[value]}"),
