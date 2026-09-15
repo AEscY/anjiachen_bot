@@ -32,6 +32,10 @@ DEFAULT_PARAMS = {
     "trailing_pct": 0.02,
 }
 
+# 分批止盈层级（相对于均价的涨幅），最后一档为全平
+BATCH_TP_LEVELS = [0.03, 0.06, 0.10]
+BATCH_TP_RATIOS = [0.30, 0.30, 0.40]  # 每档卖出比例
+
 
 class DipSellStrategy(BaseStrategy):
     def __init__(self, inst_id, params=None):
@@ -52,6 +56,9 @@ class DipSellStrategy(BaseStrategy):
         self._pending_buy_ord_id = None
         self._pending_sell_ord_id = None
         self._pending_buy_price = None
+
+        # 分批止盈状态
+        self._batch_tp_triggered = set()
 
         self.signal_engine = SignalEngine()
         self.score_engine = ScoreEngine()
@@ -149,11 +156,13 @@ class DipSellStrategy(BaseStrategy):
                         else:
                             self.avg_buy_price = 0.0
                             self.peak_price = 0.0
+                            self._batch_tp_triggered.clear()
                         return
             self.position = 0.0
             self.cost = 0.0
             self.avg_buy_price = 0.0
             self.peak_price = 0.0
+            self._batch_tp_triggered.clear()
         except Exception as e:
             logger.error(f"{self.inst_id} 同步持仓失败: {e}")
 
@@ -197,12 +206,12 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 限价买入失败: {e}")
 
-    async def _do_limit_sell(self, price):
-        sell_size = self.position
+    async def _do_limit_sell(self, price, size=None):
+        sell_size = size if size is not None else self.position
         if sell_size <= 0:
             return
         if self._min_sz > 0 and sell_size < self._min_sz:
-            logger.warning(f"{self.inst_id} 持仓 {sell_size} < 最小 {self._min_sz}")
+            logger.warning(f"{self.inst_id} 卖出数量 {sell_size} < 最小 {self._min_sz}")
             return
         offset = self.params.get("limit_offset_pct", 0.002)
         sell_price = round(price * (1 + offset), 6)
@@ -240,8 +249,27 @@ class DipSellStrategy(BaseStrategy):
             return None
         if price > self.peak_price:
             self.peak_price = price
+
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
+        # 分批止盈：先检查是否触发新层级
+        for i, (tp_level, ratio) in enumerate(zip(BATCH_TP_LEVELS, BATCH_TP_RATIOS)):
+            if i in self._batch_tp_triggered:
+                continue
+            if profit_pct >= tp_level:
+                self._batch_tp_triggered.add(i)
+                sell_size = self.position * ratio
+                if i == len(BATCH_TP_LEVELS) - 1:
+                    sell_size = self.position  # 最后一档全平
+                if self._min_sz > 0 and sell_size < self._min_sz:
+                    continue
+                return {
+                    "action": "batch_tp",
+                    "reason": f"分批止盈{i+1}档({tp_level*100:.0f}%)",
+                    "sell_size": sell_size,
+                }
+
+        # ATR 动态止损
         if self.params.get("use_adaptive", True):
             sl_pct = self.adaptive.stop_loss_pct
             tp_pct = self.adaptive.take_profit_pct
@@ -251,20 +279,26 @@ class DipSellStrategy(BaseStrategy):
             tp_pct = self.params.get("take_profit_pct", 0.03)
             tr_pct = self.params.get("trailing_pct", 0.02)
 
+        # 移动止盈
         if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
             drawdown = (self.peak_price - price) / self.peak_price
             if profit_pct > 0.005 and drawdown >= tr_pct:
-                return f"移动止盈(回撤{drawdown*100:.2f}%)"
-        if profit_pct >= tp_pct:
-            return f"止盈({profit_pct*100:.2f}%)"
-        if profit_pct <= -sl_pct:
-            return f"止损({profit_pct*100:.2f}%)"
+                return {"action": "sell", "reason": f"移动止盈(回撤{drawdown*100:.2f}%)"}
 
+        # 固定止盈（仅在未触发任何分批止盈时生效）
+        if not self._batch_tp_triggered and profit_pct >= tp_pct:
+            return {"action": "sell", "reason": f"止盈({profit_pct*100:.2f}%)"}
+
+        # 止损
+        if profit_pct <= -sl_pct:
+            return {"action": "sell", "reason": f"止损({profit_pct*100:.2f}%)"}
+
+        # 信号卖出
         ind = await self._get_indicators()
         if ind:
             sell_score = self.score_engine.sell_score(ind)
             if sell_score >= self.adaptive.sell_threshold:
-                return f"信号(分数{sell_score:.0f})"
+                return {"action": "sell", "reason": f"信号(分数{sell_score:.0f})"}
         return None
 
     async def on_ticker(self, price, raw):
@@ -275,9 +309,12 @@ class DipSellStrategy(BaseStrategy):
         if self.position > 0:
             if self._pending_sell_ord_id:
                 return
-            reason = await self._check_sell(price)
-            if reason:
-                await self._do_limit_sell(price)
+            result = await self._check_sell(price)
+            if result:
+                if result["action"] == "batch_tp":
+                    await self._do_limit_sell(price, result["sell_size"])
+                else:
+                    await self._do_limit_sell(price)
             return
 
         if self._pending_buy_ord_id:
@@ -359,45 +396,34 @@ class DipSellStrategy(BaseStrategy):
         vol_ma = ind.get("vol_ma")
         vol_ratio = (vol / vol_ma) if (vol and vol_ma and vol_ma > 0) else None
 
-        # ============ 诊断：为什么没买 ============
         blockers = []
         if not self.running:
             blockers.append("策略未启动")
-
         if self._pending_buy_ord_id:
-            pending_px = self._pending_buy_price
-            blockers.append(f"已挂买单 @ {pending_px}，等成交")
-
+            blockers.append(f"已挂买单 @ {self._pending_buy_price}，等成交")
         if time.time() < self._buy_disabled_until:
             wait_sec = int(self._buy_disabled_until - time.time())
             blockers.append(f"冷却中，还需 {wait_sec} 秒")
-
         if self.params.get("trend_filter", True) and ind.get("ema") is not None:
             if ind["close"] < ind["ema"]:
                 blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200 {ind['ema']:.2f}")
-
         if gap > 0:
             blockers.append(f"评分不足：{current_score:.0f} < {threshold:.0f}")
-
         if not blockers:
-            # 评分到但没下单，可能是限价单已挂在下方
             buy_target = round(price * (1 - self.params.get("limit_offset_pct", 0.002)), 6)
             blockers.append(f"限价单目标 {buy_target}，等价格回落成交")
 
-        # 估算等待时间
         bar_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
                        "1H": 60, "2H": 120, "4H": 240, "6H": 360, "12H": 720, "1D": 1440}
         bar_min = bar_minutes.get(self.params.get("bar", "15m"), 15)
 
         estimated_bars = None
         estimated_minutes = None
-
         if len(self._kline_cache) >= 60 and gap > 0:
             closes = [float(k[4]) for k in self._kline_cache]
             highs = [float(k[2]) for k in self._kline_cache]
             lows = [float(k[3]) for k in self._kline_cache]
             volumes = [float(k[5]) for k in self._kline_cache]
-
             lookback = 20
             scores_history = []
             for i in range(len(closes) - lookback, len(closes)):
@@ -410,7 +436,6 @@ class DipSellStrategy(BaseStrategy):
                 sub_ind = self.signal_engine.calculate(sub_closes, sub_highs, sub_lows, sub_vols)
                 s = self.score_engine.buy_score(sub_ind)
                 scores_history.append(s)
-
             if len(scores_history) >= 5:
                 recent = scores_history[-5:]
                 diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
@@ -440,6 +465,9 @@ class DipSellStrategy(BaseStrategy):
             "running": self.running,
             "pending_buy": self._pending_buy_ord_id,
             "pending_buy_price": self._pending_buy_price,
+            "batch_tp_triggered": len(self._batch_tp_triggered),
+            "regime": self.adaptive.regime,
+            "adx": self.adaptive.adx,
         }
 
     def snapshot(self):
@@ -462,5 +490,8 @@ class DipSellStrategy(BaseStrategy):
             "adaptive_tp": self.adaptive.take_profit_pct,
             "adaptive_rsi_os": self.adaptive.rsi_oversold,
             "adaptive_threshold": self.adaptive.buy_threshold,
+            "regime": self.adaptive.regime,
+            "adx": self.adaptive.adx,
+            "batch_tp_triggered": len(self._batch_tp_triggered),
         })
         return s
