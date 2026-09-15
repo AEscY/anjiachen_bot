@@ -1,20 +1,22 @@
 import asyncio
 import logging
+import time
 from okx_client.rest import OKXRest
 from strategies.dip_sell import DipSellStrategy
 from core.risk_manager import RiskManager
+from core.state_store import StateStore
 
 logger = logging.getLogger(__name__)
 
 
 class StrategyManager:
-    """只管理低吸高卖策略"""
-
-    def __init__(self, risk_manager=None):
+    def __init__(self, risk_manager=None, state_store=None):
         self.rest = OKXRest()
         self.dips = {}
         self._inst_ids = []
         self.risk_manager = risk_manager or RiskManager()
+        self.state_store = state_store or StateStore()
+        self._save_task = None
 
     def all_inst_ids(self):
         return list(self._inst_ids)
@@ -50,6 +52,23 @@ class StrategyManager:
 
         self.dips[inst_id] = DipSellStrategy(inst_id)
         self._inst_ids.append(inst_id)
+
+        saved = await self.state_store.load_strategy(inst_id)
+        if saved:
+            dip = self.dips[inst_id]
+            dip.position = saved.get("position", 0.0)
+            dip.avg_buy_price = saved.get("avg_buy_price", 0.0)
+            dip.peak_price = saved.get("peak_price", 0.0)
+            dip.total_profit = saved.get("total_profit", 0.0)
+            dip.total_fee = saved.get("total_fee", 0.0)
+            dip.trade_count = saved.get("trade_count", 0)
+            dip._last_action = saved.get("last_action")
+            dip._pending_buy_ord_id = saved.get("pending_buy") or None
+            dip._pending_sell_ord_id = saved.get("pending_sell") or None
+            if saved.get("batch_tp_triggered"):
+                dip._batch_tp_triggered = set(saved["batch_tp_triggered"])
+            logger.info(f"{inst_id} 从SQLite恢复状态: pos={dip.position}")
+
         logger.info(f"已添加 {inst_id} @ {price}")
 
         msg = f"已添加 {inst_id}，当前价 {price}"
@@ -87,6 +106,33 @@ class StrategyManager:
             except Exception as e:
                 logger.error(f"{inst_id} 持仓同步失败: {e}")
 
+    async def save_all(self):
+        """保存所有策略状态到SQLite"""
+        for inst_id, dip in self.dips.items():
+            try:
+                await self.state_store.save_strategy(inst_id, dip.snapshot())
+            except Exception as e:
+                logger.error(f"保存 {inst_id} 失败: {e}")
+        try:
+            rm = self.risk_manager
+            await self.state_store.save_risk({
+                "initial_capital": rm.initial_capital,
+                "peak_capital": rm.peak_capital,
+                "current_capital": rm.current_capital,
+                "daily_pnl": rm.daily_pnl,
+                "today": str(rm.today),
+            })
+        except Exception as e:
+            logger.error(f"保存风控失败: {e}")
+
+    async def start_periodic_save(self, interval=60):
+        """每60秒自动保存一次"""
+        async def _loop():
+            while True:
+                await asyncio.sleep(interval)
+                await self.save_all()
+        self._save_task = asyncio.create_task(_loop())
+
     async def activate_dip_only(self, inst_id):
         inst_id = inst_id.upper().strip()
         dip = self.dips.get(inst_id)
@@ -106,5 +152,6 @@ class StrategyManager:
             return False, "未初始化"
         if dip.running:
             await dip.stop()
+            await self.save_all()
             return True, "已停止低吸高卖"
         return True, "低吸高卖未运行"
