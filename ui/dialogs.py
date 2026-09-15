@@ -8,6 +8,7 @@ from aiogram_dialog.widgets.text import Const, Format
 
 from ui.states import AppSG
 from strategies.manager import StrategyManager
+from strategies.dip_sell import PARAM_META, DEFAULT_PARAMS
 
 logger = logging.getLogger(__name__)
 
@@ -15,12 +16,41 @@ MANAGER: "StrategyManager | None" = None
 PUB_WS = None
 _last_price: dict = {}
 
+VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
 
-def _parse_float(text: str):
-    try:
-        return float(text.strip()), None
-    except ValueError:
-        return None, "输入必须为有效数字"
+
+def _format_param_value(key, value, meta):
+    t = meta.get("type")
+    if t == "pct":
+        try:
+            return f"{float(value) * 100:.2f}%"
+        except (ValueError, TypeError):
+            return str(value)
+    if t == "bool":
+        return "开" if value else "关"
+    return str(value)
+
+
+def _param_hint(meta):
+    t = meta.get("type")
+    rng = meta.get("range")
+    if t == "bar":
+        return "可选: " + "/".join(VALID_BARS)
+    if t == "bool":
+        return "输入 true 或 false"
+    if t == "pct":
+        if rng:
+            return f"输入百分比数字，如 3 表示 3%，范围 {rng[0]*100:.1f}-{rng[1]*100:.1f}"
+        return "输入百分比数字，如 3 表示 3%"
+    if t == "int":
+        if rng:
+            return f"输入整数，范围 {rng[0]}-{rng[1]}"
+        return "输入整数"
+    if t == "float":
+        if rng:
+            return f"输入数字，范围 {rng[0]}-{rng[1]}"
+        return "输入数字"
+    return ""
 
 
 async def _handle_expired(cb: CallbackQuery, manager: DialogManager):
@@ -180,6 +210,14 @@ async def on_enter_dip(cb: CallbackQuery, button, manager: DialogManager):
     await manager.switch_to(AppSG.dip)
 
 
+async def on_enter_params(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    if not inst_id:
+        await _handle_expired(cb, manager)
+        return
+    await manager.switch_to(AppSG.params)
+
+
 async def on_delete_coin(cb: CallbackQuery, button, manager: DialogManager):
     inst_id = manager.dialog_data.get("inst_id")
     if not inst_id:
@@ -207,8 +245,7 @@ coin_panel_window = Window(
         "当前价: {lastPx}\n"
         "当前模式: {active_mode}\n"
         "网格: {grid_status}\n"
-        "低吸高卖: {dip_status}\n"
-        "\n注意: 两个模式互斥，启用一个会自动停止另一个。"
+        "低吸高卖: {dip_status}"
     ),
     Column(
         Button(Const("启用网格 (自动停低吸)"), id="toggle_grid", on_click=on_toggle_grid),
@@ -216,11 +253,150 @@ coin_panel_window = Window(
         Button(Const("停止全部"), id="stop_all", on_click=on_stop_all),
         Button(Const("网格详情"), id="to_grid", on_click=on_enter_grid),
         Button(Const("低吸高卖详情"), id="to_dip", on_click=on_enter_dip),
+        Button(Const("参数设置"), id="to_params", on_click=on_enter_params),
         Button(Const("删除此币种"), id="del_coin", on_click=on_delete_coin),
         Button(Const("返回主菜单"), id="back_main", on_click=lambda c, b, m: m.start(AppSG.menu)),
     ),
     state=AppSG.coin_panel,
     getter=coin_getter,
+)
+
+
+# ==================== 参数设置 ====================
+async def params_getter(dialog_manager: DialogManager, **kwargs):
+    inst_id = dialog_manager.dialog_data.get("inst_id", "-")
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    if not dip:
+        return {"inst_id": inst_id, "params": []}
+
+    items = []
+    for key, meta in PARAM_META.items():
+        value = dip.params.get(key, DEFAULT_PARAMS.get(key))
+        items.append({
+            "id": key,
+            "label": meta["desc"],
+            "value": _format_param_value(key, value, meta),
+        })
+    return {"inst_id": inst_id, "params": items}
+
+
+async def on_param_selected(cb: CallbackQuery, widget, manager: DialogManager, item_id: str):
+    manager.dialog_data["param_key"] = item_id
+    await manager.switch_to(AppSG.edit_param)
+
+
+async def on_reset_params_ui(cb: CallbackQuery, button, manager: DialogManager):
+    inst_id = manager.dialog_data.get("inst_id")
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    if not dip:
+        await cb.answer("未初始化", show_alert=True)
+        return
+    await dip.reset_params()
+    await cb.answer("已恢复默认参数", show_alert=True)
+    await manager.update()
+
+
+params_window = Window(
+    Format(
+        "{inst_id} 参数设置\n\n"
+        "点击下方任意参数进行修改："
+    ),
+    ScrollingGroup(
+        Select(
+            Format("{item[label]}: {item[value]}"),
+            id="param_select",
+            item_id_getter=lambda x: x["id"],
+            items="params",
+            on_click=on_param_selected,
+        ),
+        id="params_scroll",
+        width=1,
+        height=10,
+    ),
+    Column(
+        Button(Const("恢复默认值"), id="reset_params", on_click=on_reset_params_ui),
+        Back(Const("返回币种面板")),
+    ),
+    state=AppSG.params,
+    getter=params_getter,
+)
+
+
+# ==================== 编辑单个参数 ====================
+async def edit_param_getter(dialog_manager: DialogManager, **kwargs):
+    inst_id = dialog_manager.dialog_data.get("inst_id", "-")
+    key = dialog_manager.dialog_data.get("param_key", "-")
+    meta = PARAM_META.get(key, {})
+    dip = MANAGER.dips.get(inst_id) if MANAGER else None
+    value = dip.params.get(key, DEFAULT_PARAMS.get(key)) if dip else "-"
+
+    return {
+        "key": key,
+        "desc": meta.get("desc", key),
+        "value": _format_param_value(key, value, meta) if dip else "-",
+        "hint": _param_hint(meta),
+    }
+
+
+async def on_param_input(msg: Message, widget, manager: DialogManager):
+    if not MANAGER:
+        return
+    inst_id = manager.dialog_data.get("inst_id")
+    key = manager.dialog_data.get("param_key")
+    dip = MANAGER.dips.get(inst_id)
+    meta = PARAM_META.get(key)
+
+    if not dip or not meta:
+        await msg.answer("无效操作")
+        await manager.switch_to(AppSG.params)
+        return
+
+    raw = (msg.text or "").strip()
+    if raw.startswith("/"):
+        return
+
+    ptype = meta["type"]
+    try:
+        if ptype == "bar":
+            if raw not in VALID_BARS:
+                await msg.answer(f"不支持的周期 {raw}。可用: " + "/".join(VALID_BARS))
+                return
+            value = raw
+        elif ptype == "bool":
+            value = raw.lower() in ("1", "true", "on", "yes", "开")
+        elif ptype == "int":
+            value = int(raw)
+        elif ptype == "float":
+            value = float(raw)
+        elif ptype == "pct":
+            value = float(raw) / 100.0
+        else:
+            await msg.answer(f"未知参数类型: {ptype}")
+            return
+    except ValueError:
+        await msg.answer(f"输入格式不正确: {raw}")
+        return
+
+    rng = meta.get("range")
+    if rng and not (rng[0] <= value <= rng[1]):
+        await msg.answer(f"值超出范围 {rng[0]}-{rng[1]}")
+        return
+
+    await dip.set_param(key, value)
+    await msg.answer(f"{meta['desc']} 已设为 {_format_param_value(key, value, meta)}")
+    await manager.switch_to(AppSG.params)
+
+
+edit_param_window = Window(
+    Format(
+        "修改 {desc}\n\n"
+        "当前值: {value}\n\n"
+        "{hint}"
+    ),
+    MessageInput(on_param_input),
+    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.params)),
+    state=AppSG.edit_param,
+    getter=edit_param_getter,
 )
 
 
@@ -325,102 +501,6 @@ async def on_stop_dip(cb: CallbackQuery, button, manager: DialogManager):
     await manager.update()
 
 
-async def on_toggle_trailing(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if not dip:
-        await _handle_expired(cb, manager)
-        return
-    dip.params["use_trailing"] = not dip.params.get("use_trailing", True)
-    state = "开启" if dip.params["use_trailing"] else "关闭"
-    await cb.answer(f"移动止盈已{state}", show_alert=True)
-    await manager.update()
-
-
-async def on_edit_tp(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_tp)
-
-
-async def on_edit_sl(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_sl)
-
-
-async def on_edit_trailing(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_trailing)
-
-
-async def on_edit_spend(cb: CallbackQuery, button, manager: DialogManager):
-    inst_id = manager.dialog_data.get("inst_id")
-    if not inst_id:
-        await _handle_expired(cb, manager)
-        return
-    await manager.switch_to(AppSG.dip_edit_spend)
-
-
-async def on_tp_input(msg: Message, widget, manager: DialogManager):
-    val, err = _parse_float(msg.text or "")
-    if err or val is None or val <= 0 or val > 50:
-        await msg.answer("请输入 0-50 之间的数字，单位 %")
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.params["take_profit_pct"] = val / 100.0
-        await msg.answer(f"止盈已修改为 {val}%")
-    await manager.switch_to(AppSG.dip)
-
-
-async def on_sl_input(msg: Message, widget, manager: DialogManager):
-    val, err = _parse_float(msg.text or "")
-    if err or val is None or val <= 0 or val > 50:
-        await msg.answer("请输入 0-50 之间的数字，单位 %")
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.params["stop_loss_pct"] = val / 100.0
-        await msg.answer(f"止损已修改为 {val}%")
-    await manager.switch_to(AppSG.dip)
-
-
-async def on_trailing_input(msg: Message, widget, manager: DialogManager):
-    val, err = _parse_float(msg.text or "")
-    if err or val is None or val <= 0 or val > 20:
-        await msg.answer("请输入 0-20 之间的数字，单位 %")
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.params["trailing_pct"] = val / 100.0
-        await msg.answer(f"移动止盈回撤已修改为 {val}%")
-    await manager.switch_to(AppSG.dip)
-
-
-async def on_spend_input(msg: Message, widget, manager: DialogManager):
-    val, err = _parse_float(msg.text or "")
-    if err or val is None or val <= 0:
-        await msg.answer("请输入大于 0 的数字，单位 USDT")
-        return
-    inst_id = manager.dialog_data.get("inst_id")
-    dip = MANAGER.dips.get(inst_id) if MANAGER else None
-    if dip:
-        dip.params["maxSpend"] = val
-        await msg.answer(f"单次买入金额已修改为 {val} USDT")
-    await manager.switch_to(AppSG.dip)
-
-
 dip_panel_window = Window(
     Format(
         "{inst_id} 全自动低吸高卖\n"
@@ -442,43 +522,10 @@ dip_panel_window = Window(
     Column(
         Button(Const("启动监控"), id="dip_start", on_click=on_start_dip),
         Button(Const("暂停"), id="dip_stop", on_click=on_stop_dip),
-        Button(Const("切换移动止盈"), id="toggle_trailing", on_click=on_toggle_trailing),
-        Button(Const("修改止盈%"), id="edit_tp", on_click=on_edit_tp),
-        Button(Const("修改止损%"), id="edit_sl", on_click=on_edit_sl),
-        Button(Const("修改移动回撤%"), id="edit_trailing", on_click=on_edit_trailing),
-        Button(Const("修改单次金额"), id="edit_spend", on_click=on_edit_spend),
         Back(Const("返回币种面板")),
     ),
     state=AppSG.dip,
     getter=dip_getter,
-)
-
-dip_edit_tp_window = Window(
-    Const("修改止盈\n\n请输入百分比数字，例如 3 表示 3%\n范围 0-50："),
-    MessageInput(on_tp_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_tp,
-)
-
-dip_edit_sl_window = Window(
-    Const("修改止损\n\n请输入百分比数字，例如 5 表示 5%\n范围 0-50："),
-    MessageInput(on_sl_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_sl,
-)
-
-dip_edit_trailing_window = Window(
-    Const("修改移动止盈回撤\n\n请输入百分比数字，例如 2 表示 2%\n范围 0-20："),
-    MessageInput(on_trailing_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_trailing,
-)
-
-dip_edit_spend_window = Window(
-    Const("修改单次买入金额\n\n请输入 USDT 金额，例如 100："),
-    MessageInput(on_spend_input),
-    Button(Const("取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.dip)),
-    state=AppSG.dip_edit_spend,
 )
 
 
@@ -487,12 +534,10 @@ main_dialog = Dialog(
     main_menu_window,
     add_coin_window,
     coin_panel_window,
+    params_window,
+    edit_param_window,
     grid_panel_window,
     dip_panel_window,
-    dip_edit_tp_window,
-    dip_edit_sl_window,
-    dip_edit_trailing_window,
-    dip_edit_spend_window,
 )
 
 
