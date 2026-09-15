@@ -35,6 +35,7 @@ class StateStore:
             pool_size=5,
             max_overflow=10,
             pool_recycle=300,
+            connect_args={"ssl": "require"},
         )
         self.session_factory = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
