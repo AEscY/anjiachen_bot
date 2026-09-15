@@ -17,7 +17,6 @@ import ui.dialogs as dlg
 from ui.states import AppSG
 from okx_client.ws_public import PublicWS
 from okx_client.ws_private import PrivateWS
-from okx_client.ws_business import BusinessWS
 from okx_client.rest import OKXRest
 from strategies.manager import StrategyManager
 from core.risk_manager import RiskManager
@@ -54,11 +53,6 @@ async def on_risk_event(event: RiskEvent):
     if dlg.MANAGER:
         for iid in dlg.MANAGER.all_inst_ids():
             await dlg.MANAGER.stop_all_strategies(iid)
-
-
-async def on_grid_sub_order(data: dict):
-    if dlg.MANAGER:
-        await dlg.MANAGER.on_grid_sub_order(data)
 
 
 # ==================== 命令处理 ====================
@@ -142,11 +136,9 @@ async def cmd_status(msg: Message):
         return
     lines = []
     for iid in dlg.MANAGER.all_inst_ids():
-        g = dlg.MANAGER.grids.get(iid)
         d = dlg.MANAGER.dips.get(iid)
-        gs = "运行" if (g and g.running) else "停止"
-        ds = "运行" if (d and d.running) else "暂停"
-        lines.append(f"{iid} 网格{gs} 低吸{ds} {_last_price.get(iid, '-')}")
+        ds = "监控" if (d and d.running) else "暂停"
+        lines.append(f"{iid} 低吸{ds} {_last_price.get(iid, '-')}")
     await msg.answer("状态总览:\n" + "\n".join(lines))
 
 
@@ -236,7 +228,6 @@ async def cmd_signals(msg: Message):
         current_score = f["current_score"]
         threshold = f["threshold"]
 
-        # 状态图标
         if not f["running"]:
             status_icon = "⛔ 未启动"
         elif gap == 0 and not f["blockers"]:
@@ -273,14 +264,12 @@ async def cmd_signals(msg: Message):
         if f["vol_ratio"] is not None:
             lines.append(f"  成交量倍数: {f['vol_ratio']:.2f}x")
 
-        # 拦截原因
         blockers = f.get("blockers", [])
         if blockers:
             lines.append("  ⚠️ 拦截原因:")
             for b in blockers:
                 lines.append(f"    · {b}")
 
-        # 时间估算
         est = f.get("estimated_minutes")
         if est is not None and est > 0:
             if est < 60:
@@ -389,15 +378,6 @@ async def background_init(manager, dashboard):
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
-
-    algo_ids = []
-    for iid in manager.all_inst_ids():
-        g = manager.grids.get(iid)
-        if g and g.algo_id:
-            algo_ids.append(g.algo_id)
-    if algo_ids:
-        bus_ws = BusinessWS(on_grid_sub_order)
-        asyncio.create_task(bus_ws.connect(algo_ids))
 
     dashboard.set_manager(manager, manager.risk_manager)
 
