@@ -51,6 +51,7 @@ PARAM_TYPES = {
     "vol_multiplier": "float",
     "trend_filter": "bool",
     "volume_confirm": "bool",
+    "use_adaptive": "bool",
     "limit_offset_pct": "pct",
     "maxSpend": "float",
     "take_profit_pct": "pct",
@@ -74,7 +75,6 @@ def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
 
-# ==================== 命令处理 ====================
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
@@ -155,9 +155,41 @@ async def cmd_status(msg: Message):
         d = dlg.MANAGER.dips.get(iid)
         gs = "运行" if (g and g.running) else "停止"
         ds = "运行" if (d and d.running) else "暂停"
-        bar = d.params.get("bar", "15m") if d else "-"
-        lines.append(f"{iid} 网格{gs} 低吸{ds} [{bar}] {_last_price.get(iid, '-')}")
+        mode = "自适应" if (d and d.params.get("use_adaptive")) else "固定"
+        lines.append(f"{iid} 网格{gs} 低吸{ds}[{mode}] {_last_price.get(iid, '-')}")
     await msg.answer("状态总览:\n" + "\n".join(lines))
+
+
+@dp.message(Command("adaptive"))
+async def cmd_adaptive(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    lines = ["自适应参数（基于ATR和趋势）"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        a = dip.adaptive
+        mode = "自适应" if dip.params.get("use_adaptive", True) else "固定参数"
+        lines.append(
+            f"\n{iid}  [{mode}]\n"
+            f"  当前波动率: {a.volatility * 100:.2f}%\n"
+            f"  ATR(14): {a.atr:.4f}\n"
+            f"  趋势强度: {a.trend_strength * 100:+.2f}%\n"
+            f"  --- 动态参数 ---\n"
+            f"  RSI超卖: <{a.rsi_oversold:.1f} | RSI超买: >{a.rsi_overbought:.1f}\n"
+            f"  布林带标准差: {a.bb_std:.2f}\n"
+            f"  止损: -{a.stop_loss_pct * 100:.2f}% | 止盈: +{a.take_profit_pct * 100:.2f}%\n"
+            f"  移动回撤: {a.trailing_pct * 100:.2f}%\n"
+            f"  买入分数阈值: {a.buy_threshold:.0f}"
+        )
+    lines.append("\n切换模式: /set <币种> use_adaptive true/false")
+    await msg.answer("\n".join(lines))
 
 
 @dp.message(Command("bar"))
@@ -167,16 +199,12 @@ async def cmd_bar(msg: Message):
         return
     parts = (msg.text or "").split()
     if len(parts) < 3:
-        await msg.answer(
-            "用法: /bar <币种> <周期>\n"
-            f"可用周期: {', '.join(VALID_BARS)}\n"
-            "示例: /bar BTC-USDT 15m"
-        )
+        await msg.answer("用法: /bar <币种> <周期>\n可用: " + "/".join(VALID_BARS))
         return
     inst_id = parts[1].upper()
     bar = parts[2]
     if bar not in VALID_BARS:
-        await msg.answer(f"周期 {bar} 不支持。可用: {', '.join(VALID_BARS)}")
+        await msg.answer(f"周期 {bar} 不支持")
         return
     dip = dlg.MANAGER.dips.get(inst_id) if dlg.MANAGER else None
     if not dip:
@@ -197,17 +225,10 @@ async def cmd_set(msg: Message):
 
     parts = (msg.text or "").split()
     if len(parts) < 4:
-        lines = ["用法: /set <币种> <参数名> <值>", "示例: /set BTC-USDT rsi_oversold 35", "", "可用参数:"]
+        lines = ["用法: /set <币种> <参数名> <值>", "示例: /set BTC-USDT use_adaptive false", "", "可用参数:"]
         for k, t in PARAM_TYPES.items():
             default = DEFAULT_PARAMS.get(k, "-")
-            if t == "bool":
-                lines.append(f"  {k}: true/false (默认 {default})")
-            elif t == "pct":
-                lines.append(f"  {k}: 百分比数字 (默认 {default})")
-            elif t == "bar":
-                lines.append(f"  {k}: {'/'.join(VALID_BARS)} (默认 {default})")
-            else:
-                lines.append(f"  {k}: {t} (默认 {default})")
+            lines.append(f"  {k}: {t} (默认 {default})")
         await msg.answer("\n".join(lines))
         return
 
@@ -216,7 +237,7 @@ async def cmd_set(msg: Message):
     raw_val = parts[3]
 
     if key not in PARAM_TYPES:
-        await msg.answer(f"未知参数: {key}。发送 /set 查看所有参数。")
+        await msg.answer(f"未知参数: {key}")
         return
 
     dip = dlg.MANAGER.dips.get(inst_id)
@@ -228,7 +249,7 @@ async def cmd_set(msg: Message):
     try:
         if ptype == "bar":
             if raw_val not in VALID_BARS:
-                await msg.answer(f"周期 {raw_val} 不支持。可用: {', '.join(VALID_BARS)}")
+                await msg.answer(f"周期不支持")
                 return
             value = raw_val
         elif ptype == "bool":
@@ -240,42 +261,7 @@ async def cmd_set(msg: Message):
         elif ptype == "pct":
             value = float(raw_val) / 100.0
     except ValueError:
-        await msg.answer(f"参数值 {raw_val} 格式不正确")
-        return
-
-    if key == "rsi_period" and not (2 <= value <= 100):
-        await msg.answer("rsi_period 范围 2-100")
-        return
-    if key == "rsi_oversold" and not (5 <= value <= 50):
-        await msg.answer("rsi_oversold 范围 5-50")
-        return
-    if key == "rsi_overbought" and not (50 <= value <= 95):
-        await msg.answer("rsi_overbought 范围 50-95")
-        return
-    if key == "bb_period" and not (5 <= value <= 100):
-        await msg.answer("bb_period 范围 5-100")
-        return
-    if key == "bb_std" and not (0.5 <= value <= 5):
-        await msg.answer("bb_std 范围 0.5-5")
-        return
-    if key == "macd_fast" and not (2 <= value <= 50):
-        await msg.answer("macd_fast 范围 2-50")
-        return
-    if key == "macd_slow" and not (5 <= value <= 100):
-        await msg.answer("macd_slow 范围 5-100")
-        return
-    if key == "ema_period" and not (20 <= value <= 500):
-        await msg.answer("ema_period 范围 20-500")
-        return
-    if key == "vol_multiplier" and not (1.0 <= value <= 5.0):
-        await msg.answer("vol_multiplier 范围 1-5")
-        return
-    if key in ("take_profit_pct", "stop_loss_pct", "trailing_pct", "limit_offset_pct"):
-        if not (0.001 <= value <= 0.5):
-            await msg.answer(f"{key} 范围 0.1%-50%")
-            return
-    if key == "maxSpend" and value <= 0:
-        await msg.answer("maxSpend 必须大于 0")
+        await msg.answer(f"格式不正确")
         return
 
     await dip.set_param(key, value)
@@ -299,7 +285,7 @@ async def cmd_reset(msg: Message):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await msg.answer("用法: /reset <币种>\n示例: /reset BTC-USDT")
+        await msg.answer("用法: /reset <币种>")
         return
     inst_id = parts[1].strip().upper()
     dip = dlg.MANAGER.dips.get(inst_id)
@@ -307,92 +293,7 @@ async def cmd_reset(msg: Message):
         await msg.answer(f"{inst_id} 不在监控中")
         return
     await dip.reset_params()
-    await msg.answer(f"{inst_id} 所有参数已恢复默认值")
-
-
-@dp.message(Command("signal_params"))
-async def cmd_signal_params(msg: Message):
-    if not _allowed(msg.from_user.id):
-        await msg.answer("无权访问")
-        return
-    if not dlg.MANAGER:
-        await msg.answer("未初始化")
-        return
-    lines = ["当前信号参数"]
-    for iid in dlg.MANAGER.all_inst_ids():
-        dip = dlg.MANAGER.dips.get(iid)
-        if not dip:
-            continue
-        p = dip.params
-        lines.append(
-            f"\n{iid}\n"
-            f"  K线周期: {p.get('bar', '15m')}\n"
-            f"  RSI: {p.get('rsi_period', 14)}周期, 超卖<{p.get('rsi_oversold', 30)}, 超买>{p.get('rsi_overbought', 70)}\n"
-            f"  BB: {p.get('bb_period', 20)}周期, {p.get('bb_std', 2.0)}标准差\n"
-            f"  MACD: {p.get('macd_fast', 12)}/{p.get('macd_slow', 26)}/{p.get('macd_signal', 9)}\n"
-            f"  EMA趋势: {p.get('ema_period', 200)}\n"
-            f"  成交量倍数: {p.get('vol_multiplier', 1.5)}\n"
-            f"  止盈: +{p.get('take_profit_pct', 0.03)*100:.2f}% | 止损: -{p.get('stop_loss_pct', 0.05)*100:.2f}%\n"
-            f"  移动止盈: {'开' if p.get('use_trailing', True) else '关'} 回撤{p.get('trailing_pct', 0.02)*100:.2f}%\n"
-            f"  单次金额: {p.get('maxSpend', 100)} USDT\n"
-            f"  趋势过滤: {'开' if p.get('trend_filter', True) else '关'} | "
-            f"成交量确认: {'开' if p.get('volume_confirm', True) else '关'}"
-        )
-    lines.append("\n修改参数: /set <币种> <参数名> <值>")
-    lines.append("恢复默认: /reset <币种>")
-    await msg.answer("\n".join(lines))
-
-
-@dp.message(Command("positions"))
-async def cmd_positions(msg: Message):
-    if not _allowed(msg.from_user.id):
-        await msg.answer("无权访问")
-        return
-    if not dlg.MANAGER:
-        await msg.answer("未初始化")
-        return
-
-    lines = ["建仓与挂单总览"]
-    has_any = False
-
-    for iid in dlg.MANAGER.all_inst_ids():
-        dip = dlg.MANAGER.dips.get(iid)
-        if not dip:
-            continue
-        s = dip.snapshot()
-        pos = s.get("position", 0)
-        pending_buy = s.get("pending_buy")
-        pending_sell = s.get("pending_sell")
-        last_action = s.get("last_action")
-        profit = s.get("total_profit", 0)
-        fee = s.get("total_fee", 0)
-        price = _last_price.get(iid, 0)
-
-        if pos <= 0 and not pending_buy and not pending_sell and not last_action:
-            continue
-
-        has_any = True
-        lines.append(f"\n{iid}  [{s.get('bar', '15m')}]")
-        lines.append(f"  当前价: {price}")
-        lines.append(f"  持仓: {pos:.6f}")
-        if s.get("avg_buy_price", 0) > 0:
-            lines.append(f"  平均买入价: {s['avg_buy_price']:.6f}")
-        if s.get("peak_price", 0) > 0:
-            lines.append(f"  持仓最高价: {s['peak_price']:.6f}")
-        if pending_buy:
-            lines.append(f"  ⏳ 挂单买入: {pending_buy}")
-        if pending_sell:
-            lines.append(f"  ⏳ 挂单卖出: {pending_sell}")
-        if last_action:
-            lines.append(f"  最近动作: {last_action[0]} @ {last_action[1]:.2f}")
-        lines.append(f"  已实现盈亏: {profit:.4f} USDT")
-        lines.append(f"  累计手续费: {fee:.4f} USDT")
-
-    if not has_any:
-        lines.append("\n暂无任何建仓、挂单或交易记录。")
-        lines.append("发送 /signals 查看当前信号状态。")
-
-    await msg.answer("\n".join(lines))
+    await msg.answer(f"{inst_id} 参数已恢复默认（含自适应模式）")
 
 
 @dp.message(Command("signals"))
@@ -419,25 +320,69 @@ async def cmd_signals(msg: Message):
             lines.append(f"\n{iid}: {status['error']}")
             continue
 
-        rsi = status["rsi"]
-        bb_lower = status["bb_lower"]
-        price = status["price"]
-        rsi_ok = status["rsi_ok"]
-        bb_ok = status["bb_ok"]
-        macd_ok = status["macd_ok"]
         bar = status.get("bar", "15m")
-
-        lines.append(f"\n{iid}  [{bar}]")
-        lines.append(f"  当前价: {price:.4f}")
-        lines.append(f"  RSI(14): {rsi:.1f} {'✅超卖' if rsi_ok else '❌需<' + str(status['rsi_oversold'])}")
-        lines.append(f"  BB下轨: {bb_lower:.4f}  {'✅已触及' if bb_ok else '❌未触及'}")
-        lines.append(f"  MACD: {'✅金叉/转正' if macd_ok else '❌未金叉'}")
-        if status["buy_ready"]:
-            lines.append(f"  🎯 买入条件已满足")
+        if status.get("use_adaptive"):
+            lines.append(
+                f"\n{iid}  [{bar}] 自适应\n"
+                f"  当前价: {status['price']:.4f}\n"
+                f"  波动率: {status['volatility']*100:.2f}%\n"
+                f"  RSI: {status['rsi']:.1f} (超卖阈值 <{status['rsi_oversold']:.1f})\n"
+                f"  BB下轨: {status['bb_lower']:.4f}\n"
+                f"  MACD: {'✅金叉/转正' if status['macd_ok'] else '❌'}\n"
+                f"  买入分数: {status['buy_score']:.0f} / 阈值 {status['buy_threshold']:.0f}\n"
+                f"  {'🎯 已达阈值' if status['buy_ready'] else '⏳ 等待中'}"
+            )
         else:
-            lines.append(f"  ⏳ 等待条件满足")
+            lines.append(
+                f"\n{iid}  [{bar}] 固定参数\n"
+                f"  当前价: {status['price']:.4f}\n"
+                f"  RSI: {status['rsi']:.1f}\n"
+                f"  BB下轨: {status['bb_lower']:.4f}\n"
+                f"  MACD: {'✅' if status['macd_ok'] else '❌'}"
+            )
+    lines.append("\n自适应参数: /adaptive")
+    await msg.answer("\n".join(lines))
 
-    lines.append("\n调整参数: /set <币种> <参数名> <值>")
+
+@dp.message(Command("positions"))
+async def cmd_positions(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    lines = ["建仓与挂单总览"]
+    has_any = False
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        s = dip.snapshot()
+        pos = s.get("position", 0)
+        pb = s.get("pending_buy")
+        ps = s.get("pending_sell")
+        la = s.get("last_action")
+        if pos <= 0 and not pb and not ps and not la:
+            continue
+        has_any = True
+        lines.append(f"\n{iid}  [{s.get('bar', '15m')}]")
+        lines.append(f"  当前价: {_last_price.get(iid, 0)}")
+        lines.append(f"  持仓: {pos:.6f}")
+        if s.get("avg_buy_price", 0) > 0:
+            lines.append(f"  平均买入价: {s['avg_buy_price']:.6f}")
+        if pb:
+            lines.append(f"  ⏳ 挂单买入: {pb}")
+        if ps:
+            lines.append(f"  ⏳ 挂单卖出: {ps}")
+        if la:
+            lines.append(f"  最近动作: {la[0]} @ {la[1]:.2f}")
+        lines.append(f"  已实现盈亏: {s.get('total_profit', 0):.4f} USDT")
+        lines.append(f"  累计手续费: {s.get('total_fee', 0):.4f} USDT")
+
+    if not has_any:
+        lines.append("\n暂无建仓或挂单。")
     await msg.answer("\n".join(lines))
 
 
@@ -512,9 +457,9 @@ async def setup_menu():
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
         BotCommand(command="status", description="状态"),
+        BotCommand(command="adaptive", description="自适应参数"),
         BotCommand(command="set", description="设置参数"),
-        BotCommand(command="reset", description="恢复默认参数"),
-        BotCommand(command="signal_params", description="查看参数"),
+        BotCommand(command="reset", description="恢复默认"),
         BotCommand(command="positions", description="建仓与挂单"),
         BotCommand(command="signals", description="信号诊断"),
         BotCommand(command="balance", description="查询余额"),
@@ -526,9 +471,7 @@ async def health(request):
     return web.Response(text="OK")
 
 
-# ==================== 后台初始化（端口先监听，再执行这些） ====================
 async def background_init(manager):
-    """端口监听启动后在后台执行的初始化任务"""
     try:
         for iid in WATCHLIST:
             ok, text = await manager.add_inst(iid)
@@ -540,46 +483,38 @@ async def background_init(manager):
         await manager.restore_all()
     except Exception as e:
         logger.error(f"状态恢复失败: {e}")
-        await alert(f"状态恢复失败: {e}")
 
-    # 启动 WebSocket
     pub_ws = PublicWS(on_ticker)
     priv_ws = PrivateWS(on_order_update)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
-    # 部署提示
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         await alert(
-            f"部署完成\n"
-            f"Commit: {commit}\n"
-            f"时间: {now}\n"
+            f"部署完成\nCommit: {commit}\n时间: {now}\n"
             f"币种: {', '.join(manager.all_inst_ids())}"
         )
-    except Exception as e:
-        logger.error(f"部署提示失败: {e}")
+    except Exception:
+        pass
 
 
 async def main():
-    # 1. 先初始化 Manager（构造函数不涉及网络请求，很快）
     manager = StrategyManager()
     dlg.MANAGER = manager
 
-    # 2. 注册 dialogs
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
 
-    # 3. 设置菜单（会调用 Telegram API，但很快，约 1 秒）
     try:
         await setup_menu()
     except Exception as e:
         logger.error(f"设置菜单失败: {e}")
 
-    # 4. 先创建并启动 aiohttp 服务器，让端口立刻监听
+    # 先启动 aiohttp，让端口立即监听
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -596,9 +531,8 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, WEB_SERVER_HOST, WEB_SERVER_PORT)
     await site.start()
-    logger.info(f"Web 服务器已启动: http://{WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+    logger.info(f"Web 服务器已启动: {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
-    # 5. 设置 Webhook（这一步需要 Telegram 可达，可能要 1-3 秒）
     if WEBHOOK_URL:
         try:
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
@@ -610,13 +544,9 @@ async def main():
             logger.info(f"Webhook 已设置: {webhook_full_url}")
         except Exception as e:
             logger.error(f"设置 Webhook 失败: {e}")
-    else:
-        logger.error("WEBHOOK_URL 未设置！")
 
-    # 6. 后台启动其他初始化（加载币种、恢复网格、连接 WS）
     asyncio.create_task(background_init(manager))
 
-    # 7. 保持运行
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
