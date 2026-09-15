@@ -208,7 +208,7 @@ class DipSellStrategy(BaseStrategy):
             if r.get("code") == "0":
                 self._pending_sell_ord_id = r["data"][0]["ordId"]
                 self._last_action = ("限价卖出挂单", sell_price)
-                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={sell_size}")
+                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={size if False else sell_size}")
         except Exception as e:
             logger.error(f"{self.inst_id} 限价卖出失败: {e}")
 
@@ -230,7 +230,6 @@ class DipSellStrategy(BaseStrategy):
             self.signal_engine.bb_std = self.adaptive.bb_std
             self.score_engine.rsi_oversold = self.adaptive.rsi_oversold
             self.score_engine.rsi_overbought = self.adaptive.rsi_overbought
-        # 关键：传入 4 个参数
         return self.signal_engine.calculate(closes, highs, lows, volumes)
 
     async def _check_sell(self, price):
@@ -346,6 +345,111 @@ class DipSellStrategy(BaseStrategy):
             "volatility": self.adaptive.volatility if use_adaptive else 0,
             "buy_ready": (buy_score >= self.adaptive.buy_threshold) if use_adaptive else False,
             "use_adaptive": use_adaptive,
+        }
+
+    async def get_signal_forecast(self):
+        """
+        返回买入预测信息，包括：
+        - 当前评分 / 阈值 / 差距
+        - 各子条件距离满足的差距
+        - 基于历史评分变化速度的估算等待时间
+        """
+        ind = await self._get_indicators()
+        if not ind:
+            return {"inst_id": self.inst_id, "error": "K线数据不足"}
+
+        use_adaptive = self.params.get("use_adaptive", True)
+        if not use_adaptive:
+            return {"inst_id": self.inst_id, "error": "当前为固定参数模式，无评分预测"}
+
+        current_score = self.score_engine.buy_score(ind)
+        threshold = self.adaptive.buy_threshold
+        gap = max(0, threshold - current_score)
+
+        # 各子条件差距
+        rsi = ind.get("rsi")
+        rsi_th = self.adaptive.rsi_oversold
+        rsi_gap = max(0, rsi - rsi_th) if rsi is not None else None
+
+        price = ind.get("close")
+        bb_lower = ind.get("bb_lower")
+        if price and bb_lower and bb_lower > 0:
+            bb_gap_pct = max(0, (price - bb_lower) / bb_lower * 100)
+        else:
+            bb_gap_pct = None
+
+        macd_ok = (ind.get("macd_hist") or 0) > 0 or (
+            ind.get("macd") is not None and ind.get("macd_signal") is not None and ind["macd"] > ind["macd_signal"]
+        )
+
+        vol = ind.get("volume")
+        vol_ma = ind.get("vol_ma")
+        if vol and vol_ma and vol_ma > 0:
+            vol_ratio = vol / vol_ma
+        else:
+            vol_ratio = None
+
+        # 估算等待时间：对每根K线计算评分，观察变化趋势
+        bar_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+                       "1H": 60, "2H": 120, "4H": 240, "6H": 360, "12H": 720, "1D": 1440}
+        bar_min = bar_minutes.get(self.params.get("bar", "15m"), 15)
+
+        estimated_bars = None
+        estimated_minutes = None
+
+        if len(self._kline_cache) >= 60:
+            closes = [float(k[4]) for k in self._kline_cache]
+            highs = [float(k[2]) for k in self._kline_cache]
+            lows = [float(k[3]) for k in self._kline_cache]
+            volumes = [float(k[5]) for k in self._kline_cache]
+
+            # 计算过去 N 根的评分序列
+            lookback = 20
+            scores_history = []
+            for i in range(len(closes) - lookback, len(closes)):
+                sub_closes = closes[:i+1]
+                sub_highs = highs[:i+1]
+                sub_lows = lows[:i+1]
+                sub_vols = volumes[:i+1]
+                if len(sub_closes) < 50:
+                    continue
+                sub_ind = self.signal_engine.calculate(sub_closes, sub_highs, sub_lows, sub_vols)
+                s = self.score_engine.buy_score(sub_ind)
+                scores_history.append(s)
+
+            if len(scores_history) >= 5:
+                # 计算评分变化率（每根K线平均变化）
+                recent = scores_history[-5:]
+                diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
+                avg_change = sum(diffs) / len(diffs) if diffs else 0
+
+                if avg_change > 0.05:
+                    estimated_bars = int(gap / avg_change) if gap > 0 else 0
+                    estimated_minutes = estimated_bars * bar_min
+                elif gap == 0:
+                    estimated_bars = 0
+                    estimated_minutes = 0
+                else:
+                    estimated_bars = None
+                    estimated_minutes = None
+
+        return {
+            "inst_id": self.inst_id,
+            "bar": self.params.get("bar", "15m"),
+            "price": price,
+            "current_score": current_score,
+            "threshold": threshold,
+            "gap": gap,
+            "rsi": rsi,
+            "rsi_threshold": rsi_th,
+            "rsi_gap": rsi_gap,
+            "bb_lower": bb_lower,
+            "bb_gap_pct": bb_gap_pct,
+            "macd_ok": macd_ok,
+            "vol_ratio": vol_ratio,
+            "estimated_bars": estimated_bars,
+            "estimated_minutes": estimated_minutes,
+            "bar_minutes": bar_min,
         }
 
     def snapshot(self):
