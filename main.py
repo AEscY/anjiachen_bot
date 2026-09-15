@@ -354,32 +354,25 @@ async def health(request):
 
 # ==================== 后台初始化 ====================
 async def background_init(manager, dashboard):
-    # 加载币种（同时从SQLite恢复状态）
     for iid in WATCHLIST:
         ok, text = await manager.add_inst(iid)
         logger.info(text)
 
-    # 从OKX同步真实持仓
     try:
         await manager.restore_all()
     except Exception as e:
         logger.error(f"状态恢复失败: {e}")
 
-    # 启动定期保存任务
     await manager.start_periodic_save(60)
-    logger.info("SQLite定期保存已启动（每60秒）")
 
-    # 启动WebSocket
     pub_ws = PublicWS(lambda iid, p, r: bus.publish(MarketEvent(iid, p, r)))
     priv_ws = PrivateWS(lambda o: None)
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
 
-    # 仪表盘
     dashboard.set_manager(manager, manager.risk_manager)
 
-    # 部署提示
     commit = os.environ.get("RENDER_GIT_COMMIT", "unknown")[:8]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -395,14 +388,11 @@ async def background_init(manager, dashboard):
 
 # ==================== 入口 ====================
 async def main():
-    # 初始化状态存储
     state_store = StateStore()
     await state_store.init()
 
-    # 初始化风控和策略管理器
     risk_manager = RiskManager()
 
-    # 从SQLite恢复风控状态
     risk_saved = await state_store.load_risk()
     if risk_saved:
         try:
@@ -410,7 +400,7 @@ async def main():
             risk_manager.peak_capital = risk_saved.get("peak_capital", 0.0)
             risk_manager.current_capital = risk_saved.get("current_capital", 0.0)
             risk_manager.daily_pnl = risk_saved.get("daily_pnl", 0.0)
-            logger.info(f"风控状态已从SQLite恢复: 峰值={risk_manager.peak_capital:.2f}")
+            logger.info(f"风控状态已从 Gist 恢复: 峰值={risk_manager.peak_capital:.2f}")
         except Exception as e:
             logger.error(f"风控状态恢复失败: {e}")
 
@@ -419,11 +409,9 @@ async def main():
 
     dashboard = Dashboard(port=DASHBOARD_PORT)
 
-    # 订阅事件
     bus.subscribe(MarketEvent, on_market_event)
     bus.subscribe(RiskEvent, on_risk_event)
 
-    # 注册Dialog
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
@@ -433,10 +421,8 @@ async def main():
     except Exception as e:
         logger.error(f"设置菜单失败: {e}")
 
-    # 启动事件总线
     asyncio.create_task(bus.start())
 
-    # 启动aiohttp（Render主端口）
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -451,10 +437,8 @@ async def main():
     await site.start()
     logger.info(f"Web 服务器: {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
 
-    # 启动仪表盘
     dashboard_runner = await dashboard.start()
 
-    # 设置Webhook
     if WEBHOOK_URL:
         try:
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
@@ -467,20 +451,17 @@ async def main():
         except Exception as e:
             logger.error(f"设置 Webhook 失败: {e}")
 
-    # 后台初始化
     asyncio.create_task(background_init(manager, dashboard))
 
-    # 保持运行
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
-        # 优雅关闭：保存状态
-        logger.info("正在保存状态并关闭...")
+        logger.info("正在保存状态到 Gist 并关闭...")
         try:
-            await manager.save_all()
-            await state_store.close()
+            await manager.state_store.save_all(manager)
+            await manager.state_store.close()
             logger.info("状态已保存")
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
