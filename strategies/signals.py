@@ -1,328 +1,377 @@
-import numpy as np
+import asyncio
+import logging
+import time
+from strategies.base import BaseStrategy
+from strategies.signals import SignalEngine, ScoreEngine, AdaptiveEngine
+from okx_client.rest import OKXRest
+
+logger = logging.getLogger(__name__)
 
 
-def _ema_series(data, period):
-    alpha = 2.0 / (period + 1)
-    result = np.empty_like(data, dtype=float)
-    result[0] = data[0]
-    for i in range(1, len(data)):
-        result[i] = alpha * data[i] + (1 - alpha) * result[i - 1]
-    return result
+DEFAULT_PARAMS = {
+    "maxSpend": 100,
+    "use_adaptive": True,
+    "use_trailing": True,
+    "trend_filter": True,
+    "volume_confirm": True,
+    "limit_offset_pct": 0.002,
+    "bar": "15m",
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "ema_period": 200,
+    "vol_ma_period": 20,
+    "vol_multiplier": 1.5,
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.03,
+    "trailing_pct": 0.02,
+}
 
 
-def _rsi_series(closes, period=14):
-    n = len(closes)
-    result = np.full(n, np.nan)
-    if n <= period:
-        return result
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    if avg_loss == 0:
-        result[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        result[period] = 100.0 - 100.0 / (1.0 + rs)
-    for i in range(period + 1, n):
-        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
-        if avg_loss == 0:
-            result[i] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            result[i] = 100.0 - 100.0 / (1.0 + rs)
-    return result
+class DipSellStrategy(BaseStrategy):
+    def __init__(self, inst_id, params=None):
+        merged = {**DEFAULT_PARAMS, **(params or {})}
+        super().__init__(inst_id, merged)
 
+        self.rest = OKXRest()
+        self.position = 0.0
+        self.cost = 0.0
+        self.avg_buy_price = 0.0
+        self.peak_price = 0.0
+        self.total_profit = 0.0
+        self.total_fee = 0.0
+        self.trade_count = 0
+        self._last_action = None
+        self._last_score = 0.0
 
-def _bbands(closes, period=20, std_mult=2.0):
-    n = len(closes)
-    upper = np.full(n, np.nan)
-    middle = np.full(n, np.nan)
-    lower = np.full(n, np.nan)
-    for i in range(period - 1, n):
-        window = closes[i - period + 1:i + 1]
-        ma = np.mean(window)
-        sd = np.std(window)
-        middle[i] = ma
-        upper[i] = ma + std_mult * sd
-        lower[i] = ma - std_mult * sd
-    return upper, middle, lower
+        self._pending_buy_ord_id = None
+        self._pending_sell_ord_id = None
 
+        self.signal_engine = SignalEngine()
+        self.score_engine = ScoreEngine()
+        self.adaptive = AdaptiveEngine()
+        self._sync_signal_params()
 
-def _macd(closes, fast=12, slow=26, signal=9):
-    ema_fast = _ema_series(closes, fast)
-    ema_slow = _ema_series(closes, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = _ema_series(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+        self._kline_cache = []
+        self._last_kline_ts = 0
+        self._last_price = 0.0
+        self._buy_disabled_until = 0.0
+        self._min_sz = 0.0
+        self._lot_sz = 0.0
 
+    def _sync_signal_params(self):
+        p = self.params
+        self.signal_engine.rsi_period = p.get("rsi_period", 14)
+        self.signal_engine.rsi_oversold = p.get("rsi_oversold", 30)
+        self.signal_engine.rsi_overbought = p.get("rsi_overbought", 70)
+        self.signal_engine.bb_period = p.get("bb_period", 20)
+        self.signal_engine.bb_std = p.get("bb_std", 2.0)
+        self.signal_engine.macd_fast = p.get("macd_fast", 12)
+        self.signal_engine.macd_slow = p.get("macd_slow", 26)
+        self.signal_engine.macd_signal = p.get("macd_signal", 9)
+        self.signal_engine.ema_period = p.get("ema_period", 200)
+        self.signal_engine.vol_ma_period = p.get("vol_ma_period", 20)
+        self.signal_engine.vol_multiplier = p.get("vol_multiplier", 1.5)
 
-class SignalEngine:
-    """基础技术指标计算"""
+    async def set_param(self, key, value):
+        self.params[key] = value
+        self._sync_signal_params()
+        self._last_kline_ts = 0
+        self._kline_cache = []
 
-    def __init__(self, config=None):
-        cfg = config or {}
-        self.rsi_period = cfg.get("rsi_period", 14)
-        self.rsi_oversold = cfg.get("rsi_oversold", 30)
-        self.rsi_overbought = cfg.get("rsi_overbought", 70)
-        self.bb_period = cfg.get("bb_period", 20)
-        self.bb_std = cfg.get("bb_std", 2.0)
-        self.macd_fast = cfg.get("macd_fast", 12)
-        self.macd_slow = cfg.get("macd_slow", 26)
-        self.macd_signal = cfg.get("macd_signal", 9)
-        self.ema_period = cfg.get("ema_period", 200)
-        self.vol_ma_period = cfg.get("vol_ma_period", 20)
-        self.vol_multiplier = cfg.get("vol_multiplier", 1.5)
+    async def reset_params(self):
+        self.params = {**DEFAULT_PARAMS}
+        self._sync_signal_params()
+        self._last_kline_ts = 0
+        self._kline_cache = []
 
-    def calculate(self, closes, highs, lows, volumes):
-        c = np.array(closes, dtype=float)
-        v = np.array(volumes, dtype=float)
-        result = {}
+    async def _load_instrument_rules(self):
+        try:
+            resp = await asyncio.to_thread(self.rest.get_instruments, "SPOT", self.inst_id)
+            if resp.get("code") == "0" and resp.get("data"):
+                inst = resp["data"][0]
+                self._min_sz = float(inst.get("minSz", 0))
+                self._lot_sz = float(inst.get("lotSz", 0.00000001))
+                logger.info(f"{self.inst_id} 规格: minSz={self._min_sz}, lotSz={self._lot_sz}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 加载规格失败: {e}")
 
-        rsi = _rsi_series(c, self.rsi_period)
-        result["rsi"] = float(rsi[-1]) if not np.isnan(rsi[-1]) else None
+    async def _restore_pending_orders(self):
+        try:
+            resp = await asyncio.to_thread(self.rest.get_pending_orders, self.inst_id)
+            if resp.get("code") != "0":
+                return
+            for order in resp.get("data", []):
+                side = order.get("side")
+                ord_id = order.get("ordId")
+                px = float(order.get("px", 0))
+                sz = float(order.get("sz", 0))
+                if side == "buy":
+                    self._pending_buy_ord_id = ord_id
+                    logger.info(f"{self.inst_id} 恢复挂单买入 {ord_id} @ {px} x {sz}")
+                elif side == "sell":
+                    self._pending_sell_ord_id = ord_id
+                    logger.info(f"{self.inst_id} 恢复挂单卖出 {ord_id} @ {px} x {sz}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 恢复挂单失败: {e}")
 
-        upper, middle, lower = _bbands(c, self.bb_period, self.bb_std)
-        result["bb_upper"] = float(upper[-1]) if not np.isnan(upper[-1]) else None
-        result["bb_middle"] = float(middle[-1]) if not np.isnan(middle[-1]) else None
-        result["bb_lower"] = float(lower[-1]) if not np.isnan(lower[-1]) else None
+    async def _fetch_klines(self):
+        bar = self.params.get("bar", "15m")
+        try:
+            resp = await asyncio.to_thread(self.rest.get_candles, self.inst_id, bar, 300)
+            if resp.get("code") == "0" and resp.get("data"):
+                self._kline_cache = list(reversed(resp["data"]))
+        except Exception as e:
+            logger.error(f"{self.inst_id} 获取K线失败: {e}")
 
-        macd_line, signal_line, hist = _macd(
-            c, self.macd_fast, self.macd_slow, self.macd_signal
-        )
-        result["macd"] = float(macd_line[-1]) if not np.isnan(macd_line[-1]) else None
-        result["macd_signal"] = float(signal_line[-1]) if not np.isnan(signal_line[-1]) else None
-        result["macd_hist"] = float(hist[-1]) if not np.isnan(hist[-1]) else None
-        result["macd_hist_prev"] = (
-            float(hist[-2]) if len(hist) >= 2 and not np.isnan(hist[-2]) else None
-        )
+    async def _sync_position_from_okx(self):
+        try:
+            base_ccy = self.inst_id.split("-")[0]
+            bal_resp = await asyncio.to_thread(self.rest.get_balance, "USDT")
+            if bal_resp.get("code") == "0" and bal_resp.get("data"):
+                details = bal_resp["data"][0].get("details", [])
+                for d in details:
+                    if d.get("ccy") == base_ccy:
+                        prev_pos = self.position
+                        self.position = float(d.get("eq", 0))
+                        self.cost = float(d.get("eqUsd", 0))
+                        if self.position > 0:
+                            self.avg_buy_price = self.cost / self.position
+                            if prev_pos <= 0:
+                                self.peak_price = self.avg_buy_price
+                        else:
+                            self.avg_buy_price = 0.0
+                            self.peak_price = 0.0
+                        return
+            self.position = 0.0
+            self.cost = 0.0
+            self.avg_buy_price = 0.0
+            self.peak_price = 0.0
+        except Exception as e:
+            logger.error(f"{self.inst_id} 同步持仓失败: {e}")
 
-        if len(c) >= self.ema_period:
-            ema = _ema_series(c, self.ema_period)
-            result["ema"] = float(ema[-1])
-        else:
-            result["ema"] = None
+    async def _record_fee(self):
+        try:
+            await asyncio.sleep(1.5)
+            fills = await asyncio.to_thread(self.rest.get_fills, "SPOT", self.inst_id, 20)
+            if fills.get("code") != "0":
+                return
+            now_ms = int(time.time() * 1000)
+            for f in fills.get("data", []):
+                try:
+                    ts = int(f.get("ts", 0))
+                    if now_ms - ts > 30000:
+                        continue
+                    fee = abs(float(f.get("fee", 0)))
+                    self.total_fee += fee
+                    self.trade_count += 1
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
-        if len(v) >= self.vol_ma_period:
-            vol_ma = np.mean(v[-self.vol_ma_period:])
-            result["vol_ma"] = float(vol_ma)
-        else:
-            result["vol_ma"] = None
+    async def _do_limit_buy(self, price):
+        offset = self.params.get("limit_offset_pct", 0.002)
+        buy_price = round(price * (1 - offset), 6)
 
-        result["volume"] = float(v[-1])
-        result["close"] = float(c[-1])
-        return result
-
-    def buy_signal(self, ind, use_trend_filter=False, use_volume=False):
-        if ind.get("rsi") is None or ind.get("bb_lower") is None:
-            return False
-        conditions = []
-        conditions.append(ind["rsi"] < self.rsi_oversold)
-        conditions.append(ind["close"] <= ind["bb_lower"])
-        macd_ok = False
-        if ind.get("macd") is not None and ind.get("macd_signal") is not None:
-            if ind["macd"] > ind["macd_signal"]:
-                macd_ok = True
-        if ind.get("macd_hist") is not None and ind.get("macd_hist_prev") is not None:
-            if ind["macd_hist"] > 0 and ind["macd_hist_prev"] <= 0:
-                macd_ok = True
-        conditions.append(macd_ok)
-        if use_trend_filter and ind.get("ema") is not None:
-            conditions.append(ind["close"] > ind["ema"])
-        if use_volume and ind.get("vol_ma") is not None:
-            conditions.append(ind["volume"] > self.vol_multiplier * ind["vol_ma"])
-        return all(conditions)
-
-    def sell_signal(self, ind):
-        if ind.get("rsi") is None:
-            return False
-        if ind["rsi"] > self.rsi_overbought:
-            return True
-        if ind.get("bb_upper") is not None and ind["close"] >= ind["bb_upper"]:
-            return True
-        if ind.get("macd") is not None and ind.get("macd_signal") is not None:
-            if ind["macd"] < ind["macd_signal"]:
-                return True
-        return False
-
-
-class ScoreEngine:
-    """
-    多因子评分引擎（参考 NexusQuant 的评分制）。
-    买入评分 0-100：RSI 30 + BB 25 + MACD 20 + 成交量 15 + 趋势 10
-    卖出评分 0-100：RSI 35 + BB 30 + MACD 35
-    """
-
-    def __init__(self, config=None):
-        cfg = config or {}
-        self.rsi_oversold = cfg.get("rsi_oversold", 30)
-        self.rsi_overbought = cfg.get("rsi_overbought", 70)
-        self.buy_threshold = cfg.get("buy_threshold", 55)
-        self.sell_threshold = cfg.get("sell_threshold", 65)
-
-    def buy_score(self, ind) -> float:
-        if ind.get("rsi") is None:
-            return 0.0
-        score = 0.0
-
-        rsi = ind["rsi"]
-        os_th = self.rsi_oversold
-        if rsi <= os_th:
-            score += 30.0
-        elif rsi <= os_th + 10:
-            score += 30.0 * (1.0 - (rsi - os_th) / 10.0)
-
-        price = ind.get("close")
-        bb_lower = ind.get("bb_lower")
-        if price and bb_lower and bb_lower > 0:
-            dev = (price - bb_lower) / bb_lower
-            if dev <= 0:
-                score += 25.0
-            elif dev <= 0.01:
-                score += 25.0 * (1.0 - dev / 0.01)
-
-        hist = ind.get("macd_hist")
-        prev = ind.get("macd_hist_prev")
-        if hist is not None and prev is not None:
-            if hist > 0 and prev <= 0:
-                score += 20.0
-            elif hist > 0:
-                score += 10.0
-            elif hist > prev:
-                score += 5.0
-
-        vol = ind.get("volume")
-        vol_ma = ind.get("vol_ma")
-        if vol and vol_ma and vol_ma > 0:
-            ratio = vol / vol_ma
-            if ratio >= 1.5:
-                score += 15.0
-            elif ratio >= 1.0:
-                score += 15.0 * (ratio - 1.0) / 0.5
-
-        price = ind.get("close")
-        ema = ind.get("ema")
-        if price and ema and price > ema:
-            score += 10.0
-
-        return min(score, 100.0)
-
-    def sell_score(self, ind) -> float:
-        if ind.get("rsi") is None:
-            return 0.0
-        score = 0.0
-        rsi = ind["rsi"]
-        ob_th = self.rsi_overbought
-        if rsi >= ob_th:
-            score += 35.0
-        elif rsi >= ob_th - 10:
-            score += 35.0 * (1.0 - (ob_th - rsi) / 10.0)
-
-        price = ind.get("close")
-        bb_upper = ind.get("bb_upper")
-        if price and bb_upper and bb_upper > 0:
-            dev = (bb_upper - price) / bb_upper
-            if dev <= 0:
-                score += 30.0
-            elif dev <= 0.01:
-                score += 30.0 * (1.0 - dev / 0.01)
-
-        macd = ind.get("macd")
-        macd_sig = ind.get("macd_signal")
-        if macd is not None and macd_sig is not None:
-            if macd < macd_sig:
-                score += 35.0
-
-        return min(score, 100.0)
-
-
-class AdaptiveEngine:
-    """
-    自适应引擎：根据币种波动率动态调整参数。
-    核心逻辑：
-    - 波动率 = ATR(14) / 当前价
-    - 高波动币种 → RSI阈值更严格，止损止盈更大
-    - 低波动币种 → RSI阈值更宽松，止损止盈更小
-    - 趋势强时提高买入门槛
-    """
-
-    def __init__(self):
-        self.volatility = 0.02
-        self.trend_strength = 0.0
-        self.atr = 0.0
-        self.rsi_oversold = 30.0
-        self.rsi_overbought = 70.0
-        self.bb_std = 2.0
-        self.stop_loss_pct = 0.05
-        self.take_profit_pct = 0.03
-        self.trailing_pct = 0.02
-        self.buy_threshold = 60.0
-        self.sell_threshold = 70.0
-
-    def update(self, closes, highs, lows):
-        n = len(closes)
-        if n < 30:
+        spend = self.params.get("maxSpend", 100)
+        size = spend / buy_price
+        if self._lot_sz > 0:
+            size = round(size / self._lot_sz) * self._lot_sz
+        if self._min_sz > 0 and size < self._min_sz:
+            logger.warning(f"{self.inst_id} 买入数量 {size} < 最小 {self._min_sz}")
             return
-        c = np.array(closes, dtype=float)
-        h = np.array(highs, dtype=float)
-        l = np.array(lows, dtype=float)
 
-        trs = []
-        for i in range(1, n):
-            tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
-            trs.append(tr)
-        period = min(14, len(trs))
-        atr = float(np.mean(trs[-period:]))
-        price = float(c[-1])
-        if price <= 0:
+        try:
+            r = await asyncio.to_thread(self.rest.limit_buy, self.inst_id, buy_price, size)
+            if r.get("code") == "0":
+                self._pending_buy_ord_id = r["data"][0]["ordId"]
+                self._last_action = ("限价买入挂单", buy_price)
+                logger.info(f"{self.inst_id} 限价买入挂单 @ {buy_price}, size={size}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 限价买入失败: {e}")
+
+    async def _do_limit_sell(self, price):
+        sell_size = self.position
+        if sell_size <= 0:
             return
-        self.atr = atr
-        vol = atr / price
-        self.volatility = vol
+        if self._min_sz > 0 and sell_size < self._min_sz:
+            logger.warning(f"{self.inst_id} 持仓 {sell_size} < 最小 {self._min_sz}")
+            return
 
-        if n >= 60:
-            ema = _ema_series(c, 60)
-            if ema[-15] > 0:
-                self.trend_strength = (ema[-1] - ema[-15]) / ema[-15]
+        offset = self.params.get("limit_offset_pct", 0.002)
+        sell_price = round(price * (1 + offset), 6)
 
-        # RSI 超卖：低波动→阈值更高（容易触发）；高波动→阈值更低（更难触发）
-        self.rsi_oversold = max(20.0, min(40.0, 30.0 + (0.02 - vol) * 500.0))
-        self.rsi_overbought = max(60.0, min(80.0, 70.0 - (0.02 - vol) * 500.0))
+        try:
+            r = await asyncio.to_thread(self.rest.limit_sell, self.inst_id, sell_price, sell_size)
+            if r.get("code") == "0":
+                self._pending_sell_ord_id = r["data"][0]["ordId"]
+                self._last_action = ("限价卖出挂单", sell_price)
+                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={sell_size}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 限价卖出失败: {e}")
 
-        # 布林带标准差：高波动加大标准差
-        self.bb_std = max(1.5, min(3.0, 2.0 + (vol - 0.02) * 50.0))
+    async def _get_indicators(self):
+        now = time.time()
+        if now - self._last_kline_ts > 30:
+            await self._fetch_klines()
+            self._last_kline_ts = now
+        if len(self._kline_cache) < 50:
+            return None
+        closes = [float(k[4]) for k in self._kline_cache]
+        highs = [float(k[2]) for k in self._kline_cache]
+        lows = [float(k[3]) for k in self._kline_cache]
+        volumes = [float(k[5]) for k in self._kline_cache]
 
-        # 止损：高波动容忍更大回撤
-        self.stop_loss_pct = max(0.02, min(0.10, vol * 2.5))
+        if self.params.get("use_adaptive", True):
+            self.adaptive.update(closes, highs, lows)
+            self.signal_engine.rsi_oversold = self.adaptive.rsi_oversold
+            self.signal_engine.rsi_overbought = self.adaptive.rsi_overbought
+            self.signal_engine.bb_std = self.adaptive.bb_std
+            self.score_engine.rsi_oversold = self.adaptive.rsi_oversold
+            self.score_engine.rsi_overbought = self.adaptive.rsi_overbought
 
-        # 止盈：高波动目标更大
-        self.take_profit_pct = max(0.02, min(0.08, vol * 1.5))
+        return self.signal_engine.calculate(closes, highs, lows, volumes)
 
-        # 移动止盈回撤
-        self.trailing_pct = max(0.01, min(0.05, vol * 0.8))
+    async def _check_sell(self, price):
+        if self.position <= 0 or self.avg_buy_price <= 0:
+            return None
+        if price > self.peak_price:
+            self.peak_price = price
+        profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
-        # 买入分数阈值：趋势强时提高门槛
-        abs_trend = abs(self.trend_strength)
-        if abs_trend > 0.05:
-            self.buy_threshold = 75.0
-        elif abs_trend > 0.02:
-            self.buy_threshold = 65.0
+        sl_pct = self.adaptive.stop_loss_pct if self.params.get("use_adaptive", True) else self.params.get("stop_loss_pct", 0.05)
+        tp_pct = self.adaptive.take_profit_pct if self.params.get("use_adaptive", True) else self.params.get("take_profit_pct", 0.03)
+        tr_pct = self.adaptive.trailing_pct if self.params.get("use_adaptive", True) else self.params.get("trailing_pct", 0.02)
+
+        if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
+            drawdown = (self.peak_price - price) / self.peak_price
+            if profit_pct > 0.005 and drawdown >= tr_pct:
+                return f"移动止盈(回撤{drawdown*100:.2f}%)"
+
+        if profit_pct >= tp_pct:
+            return f"止盈({profit_pct*100:.2f}%)"
+
+        if profit_pct <= -sl_pct:
+            return f"止损({profit_pct*100:.2f}%)"
+
+        ind = await self._get_indicators()
+        if ind:
+            sell_score = self.score_engine.sell_score(ind)
+            if sell_score >= self.adaptive.sell_threshold:
+                return f"信号(分数{sell_score:.0f})"
+        return None
+
+    async def on_ticker(self, price, raw):
+        if not self.running:
+            return
+        self._last_price = price
+
+        if self.position > 0:
+            if self._pending_sell_ord_id:
+                return
+            reason = await self._check_sell(price)
+            if reason:
+                await self._do_limit_sell(price)
+            return
+
+        if self._pending_buy_ord_id:
+            return
+
+        if time.time() < self._buy_disabled_until:
+            return
+
+        ind = await self._get_indicators()
+        if not ind:
+            return
+
+        use_adaptive = self.params.get("use_adaptive", True)
+        if use_adaptive:
+            score = self.score_engine.buy_score(ind)
+            self._last_score = score
+            if self.params.get("trend_filter", True) and ind.get("ema") is not None:
+                if ind["close"] < ind["ema"]:
+                    return
+            if score >= self.adaptive.buy_threshold:
+                logger.info(f"{self.inst_id} 买入信号分数 {score:.0f} >= {self.adaptive.buy_threshold}")
+                await self._do_limit_buy(price)
         else:
-            self.buy_threshold = 55.0
+            if self.signal_engine.buy_signal(
+                ind,
+                use_trend_filter=self.params.get("trend_filter", True),
+                use_volume=self.params.get("volume_confirm", True),
+            ):
+                await self._do_limit_buy(price)
+
+    async def start(self):
+        self.running = True
+        await self._load_instrument_rules()
+        await self._restore_pending_orders()
+        await self._sync_position_from_okx()
+        mode = "自适应模式" if self.params.get("use_adaptive", True) else "固定参数模式"
+        logger.info(f"{self.inst_id} 低吸高卖已启动（{mode}），周期 {self.params.get('bar')}")
+
+    async def stop(self):
+        self.running = False
+        for ord_id in [self._pending_buy_ord_id, self._pending_sell_ord_id]:
+            if ord_id:
+                try:
+                    await asyncio.to_thread(self.rest.cancel_order, self.inst_id, ord_id)
+                except Exception as e:
+                    logger.error(f"撤单失败: {e}")
+        self._pending_buy_ord_id = None
+        self._pending_sell_ord_id = None
+
+    async def get_signal_status(self):
+        ind = await self._get_indicators()
+        if not ind:
+            return {"inst_id": self.inst_id, "error": "K线数据不足"}
+
+        use_adaptive = self.params.get("use_adaptive", True)
+        buy_score = self.score_engine.buy_score(ind) if use_adaptive else 0
+        sell_score = self.score_engine.sell_score(ind) if use_adaptive else 0
+
+        return {
+            "inst_id": self.inst_id,
+            "bar": self.params.get("bar", "15m"),
+            "price": ind["close"],
+            "rsi": ind["rsi"],
+            "rsi_oversold": self.adaptive.rsi_oversold if use_adaptive else self.params.get("rsi_oversold", 30),
+            "bb_lower": ind["bb_lower"],
+            "macd_ok": (ind.get("macd_hist") or 0) > 0 or (
+                ind.get("macd") is not None and ind.get("macd_signal") is not None and ind["macd"] > ind["macd_signal"]
+            ),
+            "buy_score": buy_score,
+            "buy_threshold": self.adaptive.buy_threshold if use_adaptive else 0,
+            "volatility": self.adaptive.volatility if use_adaptive else 0,
+            "buy_ready": (buy_score >= self.adaptive.buy_threshold) if use_adaptive else False,
+            "use_adaptive": use_adaptive,
+        }
 
     def snapshot(self):
-        return {
-            "volatility": self.volatility,
-            "atr": self.atr,
-            "trend_strength": self.trend_strength,
-            "rsi_oversold": self.rsi_oversold,
-            "rsi_overbought": self.rsi_overbought,
-            "bb_std": self.bb_std,
-            "stop_loss_pct": self.stop_loss_pct,
-            "take_profit_pct": self.take_profit_pct,
-            "trailing_pct": self.trailing_pct,
-            "buy_threshold": self.buy_threshold,
-        }
+        s = super().snapshot()
+        s.update({
+            "position": self.position,
+            "avg_buy_price": self.avg_buy_price,
+            "peak_price": self.peak_price,
+            "last_action": self._last_action,
+            "total_profit": self.total_profit,
+            "total_fee": self.total_fee,
+            "trade_count": self.trade_count,
+            "pending_buy": self._pending_buy_ord_id,
+            "pending_sell": self._pending_sell_ord_id,
+            "bar": self.params.get("bar", "15m"),
+            "use_adaptive": self.params.get("use_adaptive", True),
+            "last_score": self._last_score,
+            "adaptive_vol": self.adaptive.volatility,
+            "adaptive_sl": self.adaptive.stop_loss_pct,
+            "adaptive_tp": self.adaptive.take_profit_pct,
+            "adaptive_rsi_os": self.adaptive.rsi_oversold,
+            "adaptive_threshold": self.adaptive.buy_threshold,
+        })
+        return s
