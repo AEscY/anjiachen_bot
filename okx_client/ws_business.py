@@ -8,13 +8,16 @@ import websockets
 from config import OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE, OKX_DEMO
 
 WS_BUSINESS = "wss://ws.okx.com:8443/ws/v5/business"
-
+WS_BUSINESS_DEMO = "wss://wspap.okx.com:8443/ws/v5/business?brokerId=9999"
 
 def _sign(ts: str) -> str:
     msg = ts + "GET" + "/users/self/verify"
-    mac = hmac.new(OKX_SECRET_KEY.encode(), msg.encode(), hashlib.sha256)
+    mac = hmac.new(
+        OKX_SECRET_KEY.encode(),
+        msg.encode(),
+        hashlib.sha256
+    )
     return base64.b64encode(mac.digest()).decode()
-
 
 class BusinessWS:
     """网格子订单WebSocket"""
@@ -25,7 +28,10 @@ class BusinessWS:
         self._subscribed_algo_ids = set()
 
     async def connect(self, algo_ids: list):
-        self.ws = await websockets.connect(WS_BUSINESS, ping_interval=20)
+        url = WS_BUSINESS_DEMO if OKX_DEMO else WS_BUSINESS
+        self.ws = await websockets.connect(url, ping_interval=20)
+
+        # 使用秒级时间戳（OKX要求）
         ts = str(int(time.time()))
         await self.ws.send(json.dumps({
             "op": "login",
@@ -36,6 +42,7 @@ class BusinessWS:
                 "sign": _sign(ts)
             }]
         }))
+
         resp = json.loads(await self.ws.recv())
         if resp.get("code") != "0":
             raise RuntimeError(f"OKX business login failed: {resp}")
