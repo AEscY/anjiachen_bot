@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from strategies.base import BaseStrategy
-from strategies.signals import SignalEngine, AdaptiveEngine
+from strategies.signals import SignalEngine, ScoreEngine, AdaptiveEngine
 from okx_client.rest import OKXRest
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,7 @@ class DipSellStrategy(BaseStrategy):
         self._pending_sell_ord_id = None
 
         self.signal_engine = SignalEngine()
+        self.score_engine = ScoreEngine()
         self.adaptive = AdaptiveEngine()
         self._sync_signal_params()
 
@@ -76,23 +77,6 @@ class DipSellStrategy(BaseStrategy):
         self.signal_engine.ema_period = p.get("ema_period", 200)
         self.signal_engine.vol_ma_period = p.get("vol_ma_period", 20)
         self.signal_engine.vol_multiplier = p.get("vol_multiplier", 1.5)
-
-    def _effective(self, key):
-        """获取生效参数：自适应开启时优先使用自适应值"""
-        if self.params.get("use_adaptive", True):
-            if key == "rsi_oversold":
-                return self.adaptive.rsi_oversold
-            if key == "rsi_overbought":
-                return self.adaptive.rsi_overbought
-            if key == "bb_std":
-                return self.adaptive.bb_std
-            if key == "stop_loss_pct":
-                return self.adaptive.stop_loss_pct
-            if key == "take_profit_pct":
-                return self.adaptive.take_profit_pct
-            if key == "trailing_pct":
-                return self.adaptive.trailing_pct
-        return self.params.get(key)
 
     async def set_param(self, key, value):
         self.params[key] = value
@@ -194,7 +178,6 @@ class DipSellStrategy(BaseStrategy):
     async def _do_limit_buy(self, price):
         offset = self.params.get("limit_offset_pct", 0.002)
         buy_price = round(price * (1 - offset), 6)
-
         spend = self.params.get("maxSpend", 100)
         size = spend / buy_price
         if self._lot_sz > 0:
@@ -202,7 +185,6 @@ class DipSellStrategy(BaseStrategy):
         if self._min_sz > 0 and size < self._min_sz:
             logger.warning(f"{self.inst_id} 买入数量 {size} < 最小 {self._min_sz}")
             return
-
         try:
             r = await asyncio.to_thread(self.rest.limit_buy, self.inst_id, buy_price, size)
             if r.get("code") == "0":
@@ -219,10 +201,8 @@ class DipSellStrategy(BaseStrategy):
         if self._min_sz > 0 and sell_size < self._min_sz:
             logger.warning(f"{self.inst_id} 持仓 {sell_size} < 最小 {self._min_sz}")
             return
-
         offset = self.params.get("limit_offset_pct", 0.002)
         sell_price = round(price * (1 + offset), 6)
-
         try:
             r = await asyncio.to_thread(self.rest.limit_sell, self.inst_id, sell_price, sell_size)
             if r.get("code") == "0":
@@ -243,16 +223,15 @@ class DipSellStrategy(BaseStrategy):
         highs = [float(k[2]) for k in self._kline_cache]
         lows = [float(k[3]) for k in self._kline_cache]
         volumes = [float(k[5]) for k in self._kline_cache]
-
-        # 更新自适应引擎
         if self.params.get("use_adaptive", True):
             self.adaptive.update(closes, highs, lows)
-            # 同步 RSI / BB 阈值到 signal_engine
             self.signal_engine.rsi_oversold = self.adaptive.rsi_oversold
             self.signal_engine.rsi_overbought = self.adaptive.rsi_overbought
             self.signal_engine.bb_std = self.adaptive.bb_std
-
-        return self.signal_engine.calculate(closes, highs, lows)
+            self.score_engine.rsi_oversold = self.adaptive.rsi_oversold
+            self.score_engine.rsi_overbought = self.adaptive.rsi_overbought
+        # 关键：传入 4 个参数
+        return self.signal_engine.calculate(closes, highs, lows, volumes)
 
     async def _check_sell(self, price):
         if self.position <= 0 or self.avg_buy_price <= 0:
@@ -261,28 +240,27 @@ class DipSellStrategy(BaseStrategy):
             self.peak_price = price
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
-        sl_pct = self._effective("stop_loss_pct")
-        tp_pct = self._effective("take_profit_pct")
-        tr_pct = self._effective("trailing_pct")
+        if self.params.get("use_adaptive", True):
+            sl_pct = self.adaptive.stop_loss_pct
+            tp_pct = self.adaptive.take_profit_pct
+            tr_pct = self.adaptive.trailing_pct
+        else:
+            sl_pct = self.params.get("stop_loss_pct", 0.05)
+            tp_pct = self.params.get("take_profit_pct", 0.03)
+            tr_pct = self.params.get("trailing_pct", 0.02)
 
-        # 移动止盈优先
         if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
             drawdown = (self.peak_price - price) / self.peak_price
             if profit_pct > 0.005 and drawdown >= tr_pct:
                 return f"移动止盈(回撤{drawdown*100:.2f}%)"
-
-        # 固定止盈
         if profit_pct >= tp_pct:
             return f"止盈({profit_pct*100:.2f}%)"
-
-        # 止损
         if profit_pct <= -sl_pct:
             return f"止损({profit_pct*100:.2f}%)"
 
-        # 信号卖出（分数制）
         ind = await self._get_indicators()
         if ind:
-            sell_score = self.adaptive.calc_sell_score(ind)
+            sell_score = self.score_engine.sell_score(ind)
             if sell_score >= self.adaptive.sell_threshold:
                 return f"信号(分数{sell_score:.0f})"
         return None
@@ -302,7 +280,6 @@ class DipSellStrategy(BaseStrategy):
 
         if self._pending_buy_ord_id:
             return
-
         if time.time() < self._buy_disabled_until:
             return
 
@@ -310,12 +287,10 @@ class DipSellStrategy(BaseStrategy):
         if not ind:
             return
 
-        # 分数制买入
         use_adaptive = self.params.get("use_adaptive", True)
         if use_adaptive:
-            score = self.adaptive.calc_buy_score(ind)
+            score = self.score_engine.buy_score(ind)
             self._last_score = score
-            # 趋势过滤
             if self.params.get("trend_filter", True) and ind.get("ema") is not None:
                 if ind["close"] < ind["ema"]:
                     return
@@ -323,7 +298,6 @@ class DipSellStrategy(BaseStrategy):
                 logger.info(f"{self.inst_id} 买入信号分数 {score:.0f} >= {self.adaptive.buy_threshold}")
                 await self._do_limit_buy(price)
         else:
-            # 保留老的布尔条件模式
             if self.signal_engine.buy_signal(
                 ind,
                 use_trend_filter=self.params.get("trend_filter", True),
@@ -354,11 +328,9 @@ class DipSellStrategy(BaseStrategy):
         ind = await self._get_indicators()
         if not ind:
             return {"inst_id": self.inst_id, "error": "K线数据不足"}
-
         use_adaptive = self.params.get("use_adaptive", True)
-        buy_score = self.adaptive.calc_buy_score(ind) if use_adaptive else 0
-        sell_score = self.adaptive.calc_sell_score(ind) if use_adaptive else 0
-
+        buy_score = self.score_engine.buy_score(ind) if use_adaptive else 0
+        sell_score = self.score_engine.sell_score(ind) if use_adaptive else 0
         return {
             "inst_id": self.inst_id,
             "bar": self.params.get("bar", "15m"),
