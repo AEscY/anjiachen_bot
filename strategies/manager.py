@@ -8,11 +8,10 @@ logger = logging.getLogger(__name__)
 
 
 class StrategyManager:
-    """只管理低吸高卖策略的管理器"""
+    """只管理低吸高卖策略"""
 
     def __init__(self, risk_manager=None):
         self.rest = OKXRest()
-        self.grids = {}   # 保留空字典，兼容 dashboard 引用
         self.dips = {}
         self._inst_ids = []
         self.risk_manager = risk_manager or RiskManager()
@@ -62,14 +61,12 @@ class StrategyManager:
         inst_id = inst_id.upper().strip()
         if inst_id not in self.dips:
             return False, f"{inst_id} 不在监控中"
-
         dip = self.dips.pop(inst_id)
         try:
             if dip.running:
                 await dip.stop()
         except Exception as e:
             logger.error(f"停止 {inst_id} 低吸高卖失败: {e}")
-
         self._inst_ids.remove(inst_id)
         return True, f"已删除 {inst_id}"
 
@@ -80,7 +77,6 @@ class StrategyManager:
             await self.dips[inst_id].on_ticker(price, raw)
 
     async def restore_all(self):
-        """启动时同步所有币种的持仓状态"""
         for inst_id in self.all_inst_ids():
             dip = self.dips.get(inst_id)
             if not dip:
