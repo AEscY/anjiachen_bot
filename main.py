@@ -4,9 +4,10 @@ import os
 from datetime import datetime
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, MenuButtonCommands, BotCommand
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram_dialog import setup_dialogs, DialogManager, StartMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -39,6 +40,8 @@ DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", 8080))
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+VALID_BARS = ["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"]
+
 
 # ==================== 事件处理 ====================
 async def on_market_event(event: MarketEvent):
@@ -54,11 +57,12 @@ async def on_risk_event(event: RiskEvent):
             await dlg.MANAGER.stop_all_strategies(iid)
 
 
-# ==================== 命令处理 ====================
+# ==================== 鉴权 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
 
+# ==================== 所有命令（优先注册） ====================
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, dialog_manager: DialogManager):
     if not _allowed(msg.from_user.id):
@@ -178,38 +182,36 @@ async def cmd_signals(msg: Message):
             lines.append(f"\n{iid}: {f['error']}")
             continue
 
-        gap = f["gap"]
-        if gap == 0 and not f["blockers"]:
-            icon = "✅"
-        elif gap == 0:
-            icon = "🟡"
-        elif gap <= 10:
-            icon = "🔥"
-        elif gap <= 25:
-            icon = "⚡"
+        bar = f["bar"]
+        price = f.get("price", 0)
+        rsi = f.get("rsi", 0)
+        bb_lower = f.get("bb_lower", 0)
+        macd_ok = f.get("macd_ok", False)
+        regime = f.get("regime", "unknown")
+        adx = f.get("adx", 0)
+        buy_ready = f.get("buy_ready", False)
+
+        regime_icon = {"trending": "📈趋势", "ranging": "📊震荡", "transitional": "🔄过渡"}.get(regime, "❓")
+
+        if buy_ready:
+            icon = "🎯"
         else:
             icon = "⏳"
 
-        score = f["current_score"]
-        th = f["threshold"]
-        pct = min(100, score / th * 100) if th > 0 else 0
-        filled = int(pct / 10)
-        bar = "█" * filled + "░" * (10 - filled)
+        lines.append(f"\n{icon} {iid} [{bar}] {regime_icon}")
+        lines.append(f"  价格: {price}")
+        if rsi:
+            lines.append(f"  RSI: {rsi:.1f}")
+        if bb_lower and price:
+            gap = (price - bb_lower) / bb_lower * 100
+            lines.append(f"  距BB下轨: {gap:+.2f}%")
+        lines.append(f"  MACD: {'✅' if macd_ok else '❌'}")
+        if adx:
+            lines.append(f"  ADX: {adx:.1f}")
 
-        regime = f.get("regime", "unknown")
-        regime_icon = {"trending": "📈", "ranging": "📊", "transitional": "🔄"}.get(regime, "❓")
-
-        lines.append(f"\n{icon} {iid} [{f['bar']}] {regime_icon}")
-        lines.append(f"  评分: [{bar}] {score:.0f}/{th:.0f}")
-        if f["rsi"] is not None:
-            lines.append(f"  RSI: {f['rsi']:.1f}")
-        if f["bb_gap_pct"] is not None:
-            lines.append(f"  距BB下轨: {f['bb_gap_pct']:.2f}%")
-        lines.append(f"  MACD: {'✅' if f['macd_ok'] else '❌'}")
-        if f.get("batch_tp_triggered", 0) > 0:
-            lines.append(f"  分批止盈已触发: {f['batch_tp_triggered']}/3")
-        if f["blockers"]:
-            for b in f["blockers"]:
+        blockers = f.get("blockers", [])
+        if blockers:
+            for b in blockers:
                 lines.append(f"  ⚠️ {b}")
 
     await msg.answer("\n".join(lines))
@@ -330,6 +332,127 @@ async def cmd_risk(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+@dp.message(Command("set"))
+async def cmd_set(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) < 4:
+        await msg.answer(
+            "用法: /set <币种> <参数名> <值>\n"
+            "示例: /set BTC-USDT rsi_oversold 35\n"
+            "可用参数: bar, rsi_period, rsi_oversold, bb_period, bb_std, "
+            "macd_fast, macd_slow, macd_signal, ema_period, vol_multiplier, "
+            "maxSpend, take_profit_pct, stop_loss_pct, trailing_pct, "
+            "use_adaptive, trend_filter, use_trailing, limit_offset_pct"
+        )
+        return
+
+    inst_id = parts[1].upper()
+    key = parts[2]
+    raw_val = parts[3]
+
+    dip = dlg.MANAGER.dips.get(inst_id)
+    if not dip:
+        await msg.answer(f"{inst_id} 不在监控中")
+        return
+
+    # 参数类型映射
+    pct_keys = {"take_profit_pct", "stop_loss_pct", "trailing_pct", "limit_offset_pct"}
+    int_keys = {"rsi_period", "bb_period", "macd_fast", "macd_slow", "macd_signal", "ema_period", "vol_ma_period"}
+    float_keys = {"rsi_oversold", "rsi_overbought", "bb_std", "vol_multiplier", "maxSpend"}
+    bool_keys = {"use_adaptive", "trend_filter", "use_trailing", "volume_confirm"}
+
+    try:
+        if key == "bar":
+            if raw_val not in VALID_BARS:
+                await msg.answer(f"不支持的周期。可用: {', '.join(VALID_BARS)}")
+                return
+            value = raw_val
+        elif key in bool_keys:
+            value = raw_val.lower() in ("1", "true", "on", "yes", "开")
+        elif key in int_keys:
+            value = int(raw_val)
+        elif key in pct_keys:
+            value = float(raw_val) / 100.0
+        elif key in float_keys:
+            value = float(raw_val)
+        else:
+            await msg.answer(f"未知参数: {key}")
+            return
+    except ValueError:
+        await msg.answer(f"格式不正确: {raw_val}")
+        return
+
+    await dip.set_param(key, value)
+
+    if key in pct_keys:
+        shown = f"{value * 100:.2f}%"
+    elif key in bool_keys:
+        shown = "true" if value else "false"
+    else:
+        shown = str(value)
+    await msg.answer(f"✅ {inst_id} 的 {key} 已设为 {shown}")
+
+
+@dp.message(Command("reset"))
+async def cmd_reset(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("用法: /reset <币种>")
+        return
+    inst_id = parts[1].strip().upper()
+    dip = dlg.MANAGER.dips.get(inst_id)
+    if not dip:
+        await msg.answer(f"{inst_id} 不在监控中")
+        return
+    await dip.reset_params()
+    await msg.answer(f"✅ {inst_id} 参数已恢复默认")
+
+
+@dp.message(Command("signal_params"))
+async def cmd_signal_params(msg: Message):
+    if not _allowed(msg.from_user.id):
+        await msg.answer("无权访问")
+        return
+    if not dlg.MANAGER:
+        await msg.answer("未初始化")
+        return
+    lines = ["⚙️ 当前信号参数"]
+    for iid in dlg.MANAGER.all_inst_ids():
+        dip = dlg.MANAGER.dips.get(iid)
+        if not dip:
+            continue
+        p = dip.params
+        s = dip.snapshot()
+        lines.append(
+            f"\n{iid}\n"
+            f"  K线周期: {p.get('bar', '15m')}\n"
+            f"  自适应: {'开' if p.get('use_adaptive', True) else '关'}\n"
+            f"  市场体制: {s.get('regime', '-')}\n"
+            f"  ADX: {s.get('adx', 0):.1f}\n"
+            f"  RSI: {p.get('rsi_period', 14)}周期, 超卖<{p.get('rsi_oversold', 30)}, 超买>{p.get('rsi_overbought', 70)}\n"
+            f"  BB: {p.get('bb_period', 20)}周期, {p.get('bb_std', 2.0)}标准差\n"
+            f"  MACD: {p.get('macd_fast', 12)}/{p.get('macd_slow', 26)}/{p.get('macd_signal', 9)}\n"
+            f"  EMA: {p.get('ema_period', 200)}\n"
+            f"  单次金额: {p.get('maxSpend', 100)} USDT\n"
+            f"  止盈: {p.get('take_profit_pct', 0.03)*100:.2f}% | 止损: {p.get('stop_loss_pct', 0.05)*100:.2f}%\n"
+            f"  移动止盈: {'开' if p.get('use_trailing', True) else '关'} {p.get('trailing_pct', 0.02)*100:.2f}%"
+        )
+    await msg.answer("\n".join(lines))
+
+
 # ==================== 菜单按钮 ====================
 async def setup_menu():
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -342,6 +465,7 @@ async def setup_menu():
         BotCommand(command="balance", description="查询余额"),
         BotCommand(command="profit", description="盈亏统计"),
         BotCommand(command="risk", description="风控状态"),
+        BotCommand(command="signal_params", description="信号参数"),
         BotCommand(command="add", description="添加币种"),
         BotCommand(command="remove", description="删除币种"),
     ])
@@ -412,6 +536,7 @@ async def main():
     bus.subscribe(MarketEvent, on_market_event)
     bus.subscribe(RiskEvent, on_risk_event)
 
+    # ================= 关键：先注册 Dialog，再启动 =================
     for dialog in get_dialogs():
         dp.include_router(dialog)
     setup_dialogs(dp)
