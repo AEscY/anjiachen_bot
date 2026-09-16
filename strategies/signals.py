@@ -311,7 +311,7 @@ class AdaptiveEngine:
         self.trailing_pct = 0.02
         self.buy_threshold = 60.0
         self.sell_threshold = 70.0
-        self.regime = "unknown"  # trending / ranging / transitional
+        self.regime = "unknown"
 
     def update(self, closes, highs, lows):
         n = len(closes)
@@ -339,7 +339,6 @@ class AdaptiveEngine:
             if ema[-15] > 0:
                 self.trend_strength = (ema[-1] - ema[-15]) / ema[-15]
 
-        # ADX 市场体制
         if n >= 30:
             adx_series = _adx_series(h, l, c, 14)
             if not np.isnan(adx_series[-1]):
@@ -351,29 +350,28 @@ class AdaptiveEngine:
                 else:
                     self.regime = "transitional"
 
-        # ATR 动态止损止盈
         self.stop_loss_pct = max(0.02, min(0.15, atr * 2.0 / price))
         self.take_profit_pct = max(0.02, min(0.12, atr * 3.0 / price))
         self.trailing_pct = max(0.01, min(0.08, atr * 1.5 / price))
 
-        # 自适应 RSI 阈值
         self.rsi_oversold = max(20.0, min(40.0, 30.0 + (0.02 - vol) * 500.0))
         self.rsi_overbought = max(60.0, min(80.0, 70.0 - (0.02 - vol) * 500.0))
 
-        # 布林带标准差
         self.bb_std = max(1.5, min(3.0, 2.0 + (vol - 0.02) * 50.0))
 
-        # 买入分数阈值：趋势强时提高门槛，震荡市降低门槛
+        # ================= 核心优化：动态调整买入阈值 =================
         abs_trend = abs(self.trend_strength)
         if self.regime == "trending":
+            # 趋势市，要求高评分，避免逆势接飞刀
             self.buy_threshold = 75.0
         elif self.regime == "transitional":
+            # 过渡期，保持中等要求
             self.buy_threshold = 65.0
         else:
-            self.buy_threshold = 55.0
+            # 震荡市，大幅降低门槛，积极寻找均值回归机会
+            self.buy_threshold = 50.0
 
     def get_dynamic_sl_tp(self, entry_price, current_price=None):
-        """基于ATR动态计算止损止盈价位"""
         if self.atr <= 0:
             return None, None
         sl_price = entry_price - self.atr * 2.0
