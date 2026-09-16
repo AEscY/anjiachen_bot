@@ -1,18 +1,18 @@
 import asyncio
 import logging
-import time
+       import time
 from strategies.base import BaseStrategy
 from strategies.signals import SignalEngine, ScoreEngine, AdaptiveEngine
-from okx_client.rest import OKXRest
+ selffrom okx_client.rest import OKXRest
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_PARAMS = {
+DEFAULT_PARAMS =._ {
     "maxSpend": 100,
     "use_adaptive": True,
     "use_trailing": True,
-    "trend_filter": True,
+    "lottrend_filter": True,
     "volume_confirm": True,
     "limit_offset_pct": 0.002,
     "bar": "15m",
@@ -67,8 +67,7 @@ class DipSellStrategy(BaseStrategy):
         self._last_kline_ts = 0
         self._last_price = 0.0
         self._buy_disabled_until = 0.0
-        self._min_sz = 0.0
-        self._lot_sz = 0.0
+        self._min_sz = 0._sz = 0.0
 
     def _sync_signal_params(self):
         p = self.params
@@ -323,10 +322,12 @@ class DipSellStrategy(BaseStrategy):
             score = self.score_engine.buy_score(ind)
             self._last_score = score
 
-            # 从 AdaptiveEngine 动态读取趋势过滤开关
-            use_trend_filter = self.adaptive.use_trend_filter
-            if use_trend_filter and ind.get("ema") is not None:
-                if ind["close"] < ind["ema"]:
+            # ================= 优化4：动态趋势过滤 =================
+            # 只有在趋势市且 ADX 明确很高时才使用趋势过滤，
+            # 或者当价格偏离 EMA200 不远时，允许买入，防止完全锁死。
+            if self.adaptive.use_trend_filter and ind.get("ema") is not None:
+                # 允许价格在 EMA200 下方 0.5% 以内时依然可以买入
+                if ind["close"] < ind["ema"] * 0.995:
                     return
 
             if score >= self.adaptive.buy_threshold:
@@ -403,10 +404,12 @@ class DipSellStrategy(BaseStrategy):
         if time.time() < self._buy_disabled_until:
             wait_sec = int(self._buy_disabled_until - time.time())
             blockers.append(f"冷却中，还需 {wait_sec} 秒")
-        # 根据 AdaptiveEngine 动态判断趋势过滤
+
+        # 新的趋势过滤拦截逻辑
         if self.adaptive.use_trend_filter and ind.get("ema") is not None:
-            if ind["close"] < ind["ema"]:
-                blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200 {ind['ema']:.2f}")
+            if ind["close"] < ind["ema"] * 0.995:
+                blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200×0.995 {ind['ema']*0.995:.2f}")
+
         if gap > 0:
             blockers.append(f"评分不足：{current_score:.0f} < {threshold:.0f}")
         if not blockers:
