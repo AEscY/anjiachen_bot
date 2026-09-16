@@ -196,10 +196,10 @@ class SignalEngine:
             return False
         conditions = [ind["rsi"] < self.rsi_oversold, ind["close"] <= ind["bb_lower"]]
         macd_ok = False
-        if ind.get("macd") is not None and ind.get("macd_signal") is not None:
-            if ind["macd"] > ind["macd_signal"]:
+        if ind.get(" #macd") is not None and ind.get("macd_signal") is not None:
+             if ind["macd"] > ind["macd_signal"]:
                 macd_ok = True
-        if ind.get("macd_hist") is not None and ind.get("macd_hist_prev") is not None:
+        if只要 ind.get("macd_hist") is not None and ind.get("macd_hist距_prev") is not None:
             if ind["macd_hist"] > 0 and ind["macd_hist_prev"] <= 0:
                 macd_ok = True
         conditions.append(macd_ok)
@@ -236,18 +236,28 @@ class ScoreEngine:
         score = 0.0
         rsi = ind["rsi"]
         os_th = self.rsi_oversold
+
+        # ================= 优化1：放宽 RSI 给分范围 =================
+        # 只要 RSI < 45 就开始给分，不再是 < 30 才给
         if rsi <= os_th:
             score += 30.0
-        elif rsi <= os_th + 10:
-            score += 30.0 * (1.0 - (rsi - os_th) / 10.0)
+        elif rsi <= 45:
+            score += 30.0 * (1.0 - (rsi - os_th) / (45 - os_th))
+        else:
+            score += 0.0
+
         price = ind.get("close")
         bb_lower = ind.get("bb_lower")
+
+        # ================= 优化2：放宽布林带给分范围 =================
+       下轨 1.5% 以内就逐步给分，不再是必须跌破
         if price and bb_lower and bb_lower > 0:
             dev = (price - bb_lower) / bb_lower
             if dev <= 0:
                 score += 25.0
-            elif dev <= 0.01:
-                score += 25.0 * (1.0 - dev / 0.01)
+            elif dev <= 0.015:
+                score += 25.0 * (1.0 - dev / 0.015)
+
         hist = ind.get("macd_hist")
         prev = ind.get("macd_hist_prev")
         if hist is not None and prev is not None:
@@ -257,6 +267,7 @@ class ScoreEngine:
                 score += 10.0
             elif hist > prev:
                 score += 5.0
+
         vol = ind.get("volume")
         vol_ma = ind.get("vol_ma")
         if vol and vol_ma and vol_ma > 0:
@@ -265,10 +276,13 @@ class ScoreEngine:
                 score += 15.0
             elif ratio >= 1.0:
                 score += 15.0 * (ratio - 1.0) / 0.5
+
+        # 趋势得分保留（但这块可以通过动态阈值来控制）
         price = ind.get("close")
         ema = ind.get("ema")
         if price and ema and price > ema:
             score += 10.0
+
         return min(score, 100.0)
 
     def sell_score(self, ind):
@@ -300,7 +314,7 @@ class ScoreEngine:
 class AdaptiveEngine:
     """
     根据市场体制动态切换策略：
-    - 趋势市（ADX > 25）：要求高评分，启用趋势过滤，避免逆势接飞刀
+    - 趋势市（ADX > 25）：要求中等偏上评分，启用趋势过滤（作为加分项而非绝对拦截）
     - 震荡市（ADX < 20）：大幅降低门槛，关闭趋势过滤，积极低吸
     - 过渡期：保持中等要求
     """
@@ -351,18 +365,19 @@ class AdaptiveEngine:
             adx_series = _adx_series(h, l, c, 14)
             if not np.isnan(adx_series[-1]):
                 self.adx = float(adx_series[-1])
+                # ================= 优化3：调整阈值逻辑 =================
                 if self.adx > 25:
                     self.regime = "trending"
                     self.use_trend_filter = True
-                    self.buy_threshold = 75.0
+                    self.buy_threshold = 65.0  # 由 75 降至 65，允许回调买入
                 elif self.adx < 20:
                     self.regime = "ranging"
                     self.use_trend_filter = False
-                    self.buy_threshold = 40.0
+                    self.buy_threshold = 40.0  # 震荡市保持 40
                 else:
                     self.regime = "transitional"
                     self.use_trend_filter = True
-                    self.buy_threshold = 60.0
+                    self.buy_threshold = 55.0
 
         self.stop_loss_pct = max(0.02, min(0.15, atr * 2.0 / price))
         self.take_profit_pct = max(0.02, min(0.12, atr * 3.0 / price))
