@@ -218,8 +218,12 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
     status = "🟢 监控中" if dip.running else "⏸ 已暂停"
     try:
         forecast = await dip.get_signal_forecast()
-        score = f"{forecast.get('current_score', 0):.0f}/{forecast.get('threshold', 0):.0f}"
-        regime = forecast.get("regime", "-")
+        if "error" in forecast:
+            score = "-"
+            regime = "-"
+        else:
+            score = f"{forecast.get('current_score', 0):.0f}/{forecast.get('threshold', 0):.0f}"
+            regime = forecast.get("regime", "-")
     except Exception:
         score = "-"
         regime = "-"
@@ -316,23 +320,46 @@ coin_panel_window = Window(
 )
 
 
-# ==================== 信号详情 ====================
+# ==================== 信号详情（修复版） ====================
 async def signal_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
+
+    # 兜底返回值，确保所有 14 个占位符都有值
+    empty = {
+        "inst_id": inst_id,
+        "bar": "-",
+        "status": "❌ 数据不足",
+        "bar_visual": "░" * 10,
+        "score": "0",
+        "threshold": "0",
+        "rsi_line": "RSI: -",
+        "bb_line": "布林带下轨: -",
+        "macd_line": "MACD: -",
+        "vol_line": "成交量: -",
+        "regime_line": "市场体制: -",
+        "batch_line": "分批止盈: -",
+        "blocker_text": "  无",
+        "est_text": "-",
+    }
+
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
-        return {"inst_id": inst_id, "error": "未初始化"}
+        empty["blocker_text"] = "  策略未初始化"
+        return empty
 
     try:
         f = await dip.get_signal_forecast()
     except Exception as e:
-        return {"inst_id": inst_id, "error": str(e)}
+        empty["blocker_text"] = f"  获取失败: {e}"
+        return empty
 
     if "error" in f:
-        return {"inst_id": inst_id, "error": f["error"]}
+        empty["blocker_text"] = f"  {f['error']}"
+        return empty
 
-    gap = f["gap"]
-    if gap == 0 and not f["blockers"]:
+    gap = f.get("gap", 0)
+    blockers = f.get("blockers", [])
+    if gap == 0 and not blockers:
         status = "✅ 等待成交"
     elif gap == 0:
         status = "🟡 已满足有拦截"
@@ -343,24 +370,33 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
     else:
         status = "⏳ 等待"
 
-    score = f["current_score"]
-    threshold = f["threshold"]
+    score = f.get("current_score", 0)
+    threshold = f.get("threshold", 0)
     pct = min(100, score / threshold * 100) if threshold > 0 else 0
     filled = int(pct / 10)
     bar = "█" * filled + "░" * (10 - filled)
 
-    rsi = f["rsi"]
-    rsi_line = f"RSI: {rsi:.1f} (阈值<{f['rsi_threshold']:.1f})" if rsi is not None else "RSI: -"
+    rsi = f.get("rsi")
+    rsi_th = f.get("rsi_threshold", 30)
+    rsi_gap = f.get("rsi_gap", 0)
+    if rsi is not None:
+        rsi_line = f"RSI: {rsi:.1f} (阈值<{rsi_th:.1f})" + (f" 差 {rsi_gap:.1f}" if rsi_gap > 0 else " ✅")
+    else:
+        rsi_line = "RSI: -"
 
-    bb_lower = f["bb_lower"]
-    bb_gap = f["bb_gap_pct"]
-    bb_line = f"布林带下轨: {bb_lower:.4f}" if bb_lower is not None else "布林带下轨: -"
-    if bb_gap is not None:
-        bb_line += f" (差{bb_gap:.2f}%)" if bb_gap > 0 else " ✅"
+    bb_lower = f.get("bb_lower")
+    bb_gap = f.get("bb_gap_pct")
+    if bb_lower is not None and bb_gap is not None:
+        bb_line = f"布林带下轨: {bb_lower:.4f}" + (f" (差{bb_gap:.2f}%)" if bb_gap > 0 else " ✅")
+    elif bb_lower is not None:
+        bb_line = f"布林带下轨: {bb_lower:.4f}"
+    else:
+        bb_line = "布林带下轨: -"
 
-    macd_line = "MACD: ✅ 金叉" if f["macd_ok"] else "MACD: ❌ 未金叉"
+    macd_line = "MACD: ✅ 金叉" if f.get("macd_ok") else "MACD: ❌ 未金叉"
 
-    vol_line = f"成交量: {f['vol_ratio']:.2f}x" if f["vol_ratio"] is not None else "成交量: -"
+    vol_ratio = f.get("vol_ratio")
+    vol_line = f"成交量: {vol_ratio:.2f}x" if vol_ratio is not None else "成交量: -"
 
     regime = f.get("regime", "unknown")
     regime_icon = {"trending": "📈 趋势市", "ranging": "📊 震荡市", "transitional": "🔄 过渡期"}.get(regime, "❓ 未知")
@@ -370,7 +406,6 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
     batch_count = f.get("batch_tp_triggered", 0)
     batch_line = f"分批止盈: 已触发 {batch_count}/3 档" if batch_count > 0 else "分批止盈: 未触发"
 
-    blockers = f.get("blockers", [])
     blocker_text = "\n".join(f"  · {b}" for b in blockers) if blockers else "  无"
 
     est = f.get("estimated_minutes")
@@ -388,7 +423,7 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
 
     return {
         "inst_id": inst_id,
-        "bar": f["bar"],
+        "bar": f.get("bar", "15m"),
         "status": status,
         "bar_visual": bar,
         "score": f"{score:.0f}",
@@ -502,7 +537,6 @@ async def params_getter(dialog_manager: DialogManager, **kwargs):
     if not dip:
         return {"inst_id": inst_id, "params": [], "mode_text": ""}
 
-    # 判断当前模式
     is_adaptive = dip.params.get("use_adaptive", True)
     if is_adaptive:
         mode_text = "🔵 当前为自适应模式\n下方参数为【备用】值，仅在关闭自适应时生效"
