@@ -298,6 +298,13 @@ class ScoreEngine:
 
 
 class AdaptiveEngine:
+    """
+    根据市场体制动态切换策略：
+    - 趋势市（ADX > 25）：要求高评分，启用趋势过滤，避免逆势接飞刀
+    - 震荡市（ADX < 20）：大幅降低门槛，关闭趋势过滤，积极低吸
+    - 过渡期：保持中等要求
+    """
+
     def __init__(self):
         self.volatility = 0.02
         self.trend_strength = 0.0
@@ -312,6 +319,7 @@ class AdaptiveEngine:
         self.buy_threshold = 60.0
         self.sell_threshold = 70.0
         self.regime = "unknown"
+        self.use_trend_filter = True
 
     def update(self, closes, highs, lows):
         n = len(closes)
@@ -345,10 +353,16 @@ class AdaptiveEngine:
                 self.adx = float(adx_series[-1])
                 if self.adx > 25:
                     self.regime = "trending"
+                    self.use_trend_filter = True
+                    self.buy_threshold = 75.0
                 elif self.adx < 20:
                     self.regime = "ranging"
+                    self.use_trend_filter = False
+                    self.buy_threshold = 40.0
                 else:
                     self.regime = "transitional"
+                    self.use_trend_filter = True
+                    self.buy_threshold = 60.0
 
         self.stop_loss_pct = max(0.02, min(0.15, atr * 2.0 / price))
         self.take_profit_pct = max(0.02, min(0.12, atr * 3.0 / price))
@@ -358,18 +372,6 @@ class AdaptiveEngine:
         self.rsi_overbought = max(60.0, min(80.0, 70.0 - (0.02 - vol) * 500.0))
 
         self.bb_std = max(1.5, min(3.0, 2.0 + (vol - 0.02) * 50.0))
-
-        # ================= 核心优化：动态调整买入阈值 =================
-        abs_trend = abs(self.trend_strength)
-        if self.regime == "trending":
-            # 趋势市，要求高评分，避免逆势接飞刀
-            self.buy_threshold = 75.0
-        elif self.regime == "transitional":
-            # 过渡期，保持中等要求
-            self.buy_threshold = 65.0
-        else:
-            # 震荡市，大幅降低门槛，积极寻找均值回归机会
-            self.buy_threshold = 50.0
 
     def get_dynamic_sl_tp(self, entry_price, current_price=None):
         if self.atr <= 0:
@@ -392,4 +394,5 @@ class AdaptiveEngine:
             "take_profit_pct": self.take_profit_pct,
             "trailing_pct": self.trailing_pct,
             "buy_threshold": self.buy_threshold,
+            "use_trend_filter": self.use_trend_filter,
         }
