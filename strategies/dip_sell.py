@@ -32,9 +32,8 @@ DEFAULT_PARAMS = {
     "trailing_pct": 0.02,
 }
 
-# 分批止盈层级（相对于均价的涨幅），最后一档为全平
 BATCH_TP_LEVELS = [0.03, 0.06, 0.10]
-BATCH_TP_RATIOS = [0.30, 0.30, 0.40]  # 每档卖出比例
+BATCH_TP_RATIOS = [0.30, 0.30, 0.40]
 
 
 class DipSellStrategy(BaseStrategy):
@@ -57,7 +56,6 @@ class DipSellStrategy(BaseStrategy):
         self._pending_sell_ord_id = None
         self._pending_buy_price = None
 
-        # 分批止盈状态
         self._batch_tp_triggered = set()
 
         self.signal_engine = SignalEngine()
@@ -252,7 +250,6 @@ class DipSellStrategy(BaseStrategy):
 
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
-        # 分批止盈：先检查是否触发新层级
         for i, (tp_level, ratio) in enumerate(zip(BATCH_TP_LEVELS, BATCH_TP_RATIOS)):
             if i in self._batch_tp_triggered:
                 continue
@@ -260,7 +257,7 @@ class DipSellStrategy(BaseStrategy):
                 self._batch_tp_triggered.add(i)
                 sell_size = self.position * ratio
                 if i == len(BATCH_TP_LEVELS) - 1:
-                    sell_size = self.position  # 最后一档全平
+                    sell_size = self.position
                 if self._min_sz > 0 and sell_size < self._min_sz:
                     continue
                 return {
@@ -269,7 +266,6 @@ class DipSellStrategy(BaseStrategy):
                     "sell_size": sell_size,
                 }
 
-        # ATR 动态止损
         if self.params.get("use_adaptive", True):
             sl_pct = self.adaptive.stop_loss_pct
             tp_pct = self.adaptive.take_profit_pct
@@ -279,21 +275,17 @@ class DipSellStrategy(BaseStrategy):
             tp_pct = self.params.get("take_profit_pct", 0.03)
             tr_pct = self.params.get("trailing_pct", 0.02)
 
-        # 移动止盈
         if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
             drawdown = (self.peak_price - price) / self.peak_price
             if profit_pct > 0.005 and drawdown >= tr_pct:
                 return {"action": "sell", "reason": f"移动止盈(回撤{drawdown*100:.2f}%)"}
 
-        # 固定止盈（仅在未触发任何分批止盈时生效）
         if not self._batch_tp_triggered and profit_pct >= tp_pct:
             return {"action": "sell", "reason": f"止盈({profit_pct*100:.2f}%)"}
 
-        # 止损
         if profit_pct <= -sl_pct:
             return {"action": "sell", "reason": f"止损({profit_pct*100:.2f}%)"}
 
-        # 信号卖出
         ind = await self._get_indicators()
         if ind:
             sell_score = self.score_engine.sell_score(ind)
@@ -330,11 +322,18 @@ class DipSellStrategy(BaseStrategy):
         if use_adaptive:
             score = self.score_engine.buy_score(ind)
             self._last_score = score
-            if self.params.get("trend_filter", True) and ind.get("ema") is not None:
+
+            # 从 AdaptiveEngine 动态读取趋势过滤开关
+            use_trend_filter = self.adaptive.use_trend_filter
+            if use_trend_filter and ind.get("ema") is not None:
                 if ind["close"] < ind["ema"]:
                     return
+
             if score >= self.adaptive.buy_threshold:
-                logger.info(f"{self.inst_id} 买入信号分数 {score:.0f} >= {self.adaptive.buy_threshold}")
+                logger.info(
+                    f"{self.inst_id} 买入信号 分数={score:.0f} 阈值={self.adaptive.buy_threshold} "
+                    f"体制={self.adaptive.regime} ADX={self.adaptive.adx:.1f}"
+                )
                 await self._do_limit_buy(price)
         else:
             if self.signal_engine.buy_signal(
@@ -404,7 +403,8 @@ class DipSellStrategy(BaseStrategy):
         if time.time() < self._buy_disabled_until:
             wait_sec = int(self._buy_disabled_until - time.time())
             blockers.append(f"冷却中，还需 {wait_sec} 秒")
-        if self.params.get("trend_filter", True) and ind.get("ema") is not None:
+        # 根据 AdaptiveEngine 动态判断趋势过滤
+        if self.adaptive.use_trend_filter and ind.get("ema") is not None:
             if ind["close"] < ind["ema"]:
                 blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200 {ind['ema']:.2f}")
         if gap > 0:
