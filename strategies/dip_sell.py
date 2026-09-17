@@ -2,7 +2,9 @@ import asyncio
 import logging
 import time
 from strategies.base import BaseStrategy
-from strategies.signals import SignalEngine, ScoreEngine, AdaptiveEngine
+from strategies.signals import (
+    SignalEngine, DynamicGridEngine, TrailingStopEngine, AdaptiveEngine
+)
 from okx_client.rest import OKXRest
 from notifier import alert
 
@@ -12,9 +14,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_PARAMS = {
     "maxSpend": 100,
     "use_adaptive": True,
-    "use_trailing": True,
-    "trend_filter": True,
-    "volume_confirm": True,
+    "use_trailing_entry": True,
+    "trailing_entry_pct": 0.002,
+    "use_trailing_stop": True,
+    "use_dynamic_grid": True,
     "bar": "15m",
     "rsi_period": 14,
     "rsi_oversold": 30,
@@ -30,6 +33,8 @@ DEFAULT_PARAMS = {
     "stop_loss_pct": 0.05,
     "take_profit_pct": 0.03,
     "trailing_pct": 0.02,
+    "trend_filter": True,
+    "volume_confirm": True,
 }
 
 BATCH_TP_LEVELS = [0.03, 0.06, 0.10]
@@ -54,10 +59,17 @@ class DipSellStrategy(BaseStrategy):
 
         self._batch_tp_triggered = set()
 
+        # 引擎
         self.signal_engine = SignalEngine()
-        self.score_engine = ScoreEngine()
+        self.dynamic_grid = DynamicGridEngine()
+        self.trailing_stop = TrailingStopEngine()
         self.adaptive = AdaptiveEngine()
         self._sync_signal_params()
+
+        # 追踪建仓状态
+        self._trailing_entry_active = False
+        self._trailing_entry_low = 0.0
+        self._last_entry_confirm = 0.0
 
         self._kline_cache = []
         self._last_kline_ts = 0
@@ -127,16 +139,19 @@ class DipSellStrategy(BaseStrategy):
                             self.avg_buy_price = self.cost / self.position
                             if prev_pos <= 0:
                                 self.peak_price = self.avg_buy_price
+                                self.trailing_stop.peak_price = self.avg_buy_price
                         else:
                             self.avg_buy_price = 0.0
                             self.peak_price = 0.0
                             self._batch_tp_triggered.clear()
+                            self.trailing_stop.trailing_active = False
                         return
             self.position = 0.0
             self.cost = 0.0
             self.avg_buy_price = 0.0
             self.peak_price = 0.0
             self._batch_tp_triggered.clear()
+            self.trailing_stop.trailing_active = False
         except Exception as e:
             logger.error(f"{self.inst_id} 同步持仓失败: {e}")
 
@@ -192,9 +207,10 @@ class DipSellStrategy(BaseStrategy):
                 self.cost += filled_sz * avg_px
                 self.avg_buy_price = self.cost / self.position if self.position > 0 else avg_px
                 self.peak_price = max(self.peak_price, avg_px)
+                self.trailing_stop.peak_price = self.peak_price
                 self._last_action = ("市价买入", avg_px)
 
-                logger.info(f"{self.inst_id} 市价买入成功 spend={spend} 数量={filled_sz:.6f} 均价={avg_px:.4f} 总持仓={self.position:.6f}")
+                logger.info(f"{self.inst_id} 买入成功 数量={filled_sz:.6f} 均价={avg_px:.4f} 总持仓={self.position:.6f}")
                 await alert(
                     f"✅ {self.inst_id} 买入成功\n"
                     f"花费: {spend} USDT\n"
@@ -202,17 +218,16 @@ class DipSellStrategy(BaseStrategy):
                     f"均价: {avg_px:.4f}\n"
                     f"当前持仓: {self.position:.6f}"
                 )
-
                 asyncio.create_task(self._record_fee())
             else:
                 err = str(r)[:200]
-                logger.error(f"{self.inst_id} 市价买入失败: {r}")
+                logger.error(f"{self.inst_id} 买入失败: {r}")
                 await alert(f"❌ {self.inst_id} 买入失败\n{err}")
         except Exception as e:
-            logger.error(f"{self.inst_id} 市价买入异常: {e}")
+            logger.error(f"{self.inst_id} 买入异常: {e}")
             await alert(f"❌ {self.inst_id} 买入异常: {e}")
 
-    async def _do_market_sell(self, price, size=None):
+    async def _do_market_sell(self, price, size=None, reason=""):
         sell_size = size if size is not None else self.position
         if sell_size <= 0:
             return
@@ -225,8 +240,8 @@ class DipSellStrategy(BaseStrategy):
         try:
             r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
             if r.get("code") == "0":
-                self._last_action = ("市价卖出", price)
-                logger.info(f"{self.inst_id} 市价卖出成功 数量={sell_size:.6f} 价格≈{price:.4f}")
+                self._last_action = (f"市价卖出({reason})", price)
+                logger.info(f"{self.inst_id} 卖出成功 数量={sell_size:.6f} 价格≈{price:.4f} 原因={reason}")
 
                 if self.avg_buy_price > 0:
                     profit = (price - self.avg_buy_price) * sell_size
@@ -241,6 +256,7 @@ class DipSellStrategy(BaseStrategy):
                     self.avg_buy_price = 0.0
                     self.peak_price = 0.0
                     self._batch_tp_triggered.clear()
+                    self.trailing_stop.trailing_active = False
                 else:
                     self.cost = self.avg_buy_price * self.position
 
@@ -248,30 +264,26 @@ class DipSellStrategy(BaseStrategy):
                     f"✅ {self.inst_id} 卖出成功\n"
                     f"数量: {sell_size:.6f}\n"
                     f"价格: ≈{price:.4f}\n"
+                    f"原因: {reason}\n"
                     f"本轮盈亏: {profit:+.4f} USDT\n"
                     f"剩余持仓: {self.position:.6f}"
                 )
-
                 asyncio.create_task(self._record_fee())
             else:
                 err = str(r)[:200]
-                logger.error(f"{self.inst_id} 市价卖出失败: {r}")
+                logger.error(f"{self.inst_id} 卖出失败: {r}")
                 await alert(f"❌ {self.inst_id} 卖出失败\n{err}")
         except Exception as e:
-            logger.error(f"{self.inst_id} 市价卖出异常: {e}")
+            logger.error(f"{self.inst_id} 卖出异常: {e}")
             await alert(f"❌ {self.inst_id} 卖出异常: {e}")
 
     async def close_position(self):
-        """一键清仓：市价卖出全部持仓，返回 (ok, message)"""
         if self.position <= 0:
             return False, "无持仓"
-
-        sell_size = self.position
-        if self._min_sz > 0 and sell_size < self._min_sz:
-            return False, f"持仓 {sell_size:.8f} < 最小 {self._min_sz}，无法卖出"
-
+        if self._min_sz > 0 and self.position < self._min_sz:
+            return False, f"持仓 {self.position:.8f} < 最小 {self._min_sz}，无法卖出"
         try:
-            r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
+            r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, self.position)
             if r.get("code") == "0":
                 data = r.get("data", [])
                 avg_px = self._last_price if self._last_price > 0 else self.avg_buy_price
@@ -282,22 +294,19 @@ class DipSellStrategy(BaseStrategy):
                             avg_px = float(px)
                     except (ValueError, TypeError):
                         pass
-
                 profit = 0.0
                 if self.avg_buy_price > 0:
-                    profit = (avg_px - self.avg_buy_price) * sell_size
+                    profit = (avg_px - self.avg_buy_price) * self.position
                     self.total_profit += profit
-
-                # 清空持仓
+                sell_size = self.position
                 self.position = 0.0
                 self.cost = 0.0
                 self.avg_buy_price = 0.0
                 self.peak_price = 0.0
                 self._batch_tp_triggered.clear()
+                self.trailing_stop.trailing_active = False
                 self._last_action = ("手动清仓", avg_px)
-
                 asyncio.create_task(self._record_fee())
-
                 logger.info(f"{self.inst_id} 清仓成功 数量={sell_size:.6f} 均价={avg_px:.4f} 盈亏={profit:+.4f}")
                 return True, f"清仓 {sell_size:.6f} @ {avg_px:.4f}，盈亏 {profit:+.4f} USDT"
             else:
@@ -316,13 +325,13 @@ class DipSellStrategy(BaseStrategy):
         highs = [float(k[2]) for k in self._kline_cache]
         lows = [float(k[3]) for k in self._kline_cache]
         volumes = [float(k[5]) for k in self._kline_cache]
+
         if self.params.get("use_adaptive", True):
             self.adaptive.update(closes, highs, lows)
-            self.signal_engine.rsi_oversold = self.adaptive.rsi_oversold
-            self.signal_engine.rsi_overbought = self.adaptive.rsi_overbought
-            self.signal_engine.bb_std = self.adaptive.bb_std
-            self.score_engine.rsi_oversold = self.adaptive.rsi_oversold
-            self.score_engine.rsi_overbought = self.adaptive.rsi_overbought
+            self.dynamic_grid.update(closes, highs, lows)
+            if self.adaptive.atr > 0:
+                self.trailing_stop.update_atr(self.adaptive.atr)
+
         return self.signal_engine.calculate(closes, highs, lows, volumes)
 
     async def _check_sell(self, price):
@@ -330,8 +339,11 @@ class DipSellStrategy(BaseStrategy):
             return None
         if price > self.peak_price:
             self.peak_price = price
+            self.trailing_stop.peak_price = price
+
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
+        # 分批止盈
         for i, (tp_level, ratio) in enumerate(zip(BATCH_TP_LEVELS, BATCH_TP_RATIOS)):
             if i in self._batch_tp_triggered:
                 continue
@@ -344,31 +356,16 @@ class DipSellStrategy(BaseStrategy):
                     continue
                 return {"action": "batch_tp", "reason": f"分批止盈{i+1}档({tp_level*100:.0f}%)", "sell_size": sell_size}
 
-        if self.params.get("use_adaptive", True):
-            sl_pct = self.adaptive.stop_loss_pct
-            tp_pct = self.adaptive.take_profit_pct
-            tr_pct = self.adaptive.trailing_pct
-        else:
-            sl_pct = self.params.get("stop_loss_pct", 0.05)
-            tp_pct = self.params.get("take_profit_pct", 0.03)
-            tr_pct = self.params.get("trailing_pct", 0.02)
+        # 追踪止损
+        if self.params.get("use_trailing_stop", True):
+            ts_reason = self.trailing_stop.check_trailing_stop(price, self.avg_buy_price)
+            if ts_reason:
+                return {"action": "sell", "reason": ts_reason}
 
-        if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
-            drawdown = (self.peak_price - price) / self.peak_price
-            if profit_pct > 0.005 and drawdown >= tr_pct:
-                return {"action": "sell", "reason": f"移动止盈(回撤{drawdown*100:.2f}%)"}
+        # ATR动态止损
+        if profit_pct <= -self.adaptive.stop_loss_pct:
+            return {"action": "sell", "reason": f"ATR止损({profit_pct*100:.2f}%)"}
 
-        if not self._batch_tp_triggered and profit_pct >= tp_pct:
-            return {"action": "sell", "reason": f"止盈({profit_pct*100:.2f}%)"}
-
-        if profit_pct <= -sl_pct:
-            return {"action": "sell", "reason": f"止损({profit_pct*100:.2f}%)"}
-
-        ind = await self._get_indicators()
-        if ind:
-            sell_score = self.score_engine.sell_score(ind)
-            if sell_score >= self.adaptive.sell_threshold:
-                return {"action": "sell", "reason": f"信号(分数{sell_score:.0f})"}
         return None
 
     async def on_ticker(self, price, raw):
@@ -376,15 +373,17 @@ class DipSellStrategy(BaseStrategy):
             return
         self._last_price = price
 
+        # 持仓时检查卖出
         if self.position > 0:
             result = await self._check_sell(price)
             if result:
                 if result["action"] == "batch_tp":
-                    await self._do_market_sell(price, result["sell_size"])
+                    await self._do_market_sell(price, result["sell_size"], reason=result["reason"])
                 else:
-                    await self._do_market_sell(price)
+                    await self._do_market_sell(price, reason=result["reason"])
             return
 
+        # 冷却期
         if time.time() < self._buy_disabled_until:
             return
 
@@ -394,21 +393,52 @@ class DipSellStrategy(BaseStrategy):
 
         use_adaptive = self.params.get("use_adaptive", True)
         if use_adaptive:
-            score = self.score_engine.buy_score(ind)
-            self._last_score = score
+            # 用动态网格间距来判断是否处于"低吸"区域
+            price = ind.get("close", 0)
+            bb_lower = ind.get("bb_lower", 0)
+            rsi = ind.get("rsi")
 
-            if self.adaptive.use_trend_filter and ind.get("ema") is not None:
-                if ind["close"] < ind["ema"] * 0.995:
-                    return
+            if self.dynamic_grid.atr <= 0:
+                return
 
-            if score >= self.adaptive.buy_threshold:
-                logger.info(
-                    f"{self.inst_id} 买入信号 分数={score:.0f} 阈值={self.adaptive.buy_threshold} "
-                    f"体制={self.adaptive.regime} ADX={self.adaptive.adx:.1f}"
-                )
-                self._buy_disabled_until = time.time() + 300
-                await self._do_market_buy(price)
+            # 动态网格的下轨附近 = 买入区域
+            grid_lower = self.dynamic_grid.lower
+            in_buy_zone = price <= grid_lower
+
+            # 趋势过滤：趋势市时要求价格更接近下轨
+            if self.adaptive.use_trend_filter and ind.get("ema"):
+                if price < ind["ema"] * 0.98:
+                    in_buy_zone = False
+
+            # RSI 辅助
+            if rsi is not None and rsi < 40:
+                in_buy_zone = True
+
+            # 布林带下轨辅助
+            if bb_lower > 0 and price <= bb_lower * 1.005:
+                in_buy_zone = True
+
+            if in_buy_zone:
+                # 追踪建仓
+                if self.params.get("use_trailing_entry", True):
+                    if not self._trailing_entry_active:
+                        self._trailing_entry_active = True
+                        self._trailing_entry_low = price
+                        logger.info(f"{self.inst_id} 进入买入区域，追踪建仓中...")
+                    else:
+                        if price < self._trailing_entry_low:
+                            self._trailing_entry_low = price
+                        elif price > self._trailing_entry_low * (1 + self.params.get("trailing_entry_pct", 0.002)):
+                            # 价格企稳反弹，确认建仓
+                            self._trailing_entry_active = False
+                            self._buy_disabled_until = time.time() + 300
+                            logger.info(f"{self.inst_id} 追踪建仓确认，执行买入")
+                            await self._do_market_buy(price)
+                else:
+                    self._buy_disabled_until = time.time() + 300
+                    await self._do_market_buy(price)
         else:
+            # 固定模式回退
             if self.signal_engine.buy_signal(
                 ind,
                 use_trend_filter=self.params.get("trend_filter", True),
@@ -421,109 +451,76 @@ class DipSellStrategy(BaseStrategy):
         self.running = True
         await self._load_instrument_rules()
         await self._sync_position_from_okx()
-        mode = "自适应模式" if self.params.get("use_adaptive", True) else "固定参数模式"
-        logger.info(f"{self.inst_id} 低吸高卖已启动（{mode}，市价单），周期 {self.params.get('bar')}")
+        logger.info(f"{self.inst_id} 策略已启动（动态网格+追踪建仓+追踪止损）")
 
     async def stop(self):
         self.running = False
+        self._trailing_entry_active = False
 
     async def get_signal_forecast(self):
         ind = await self._get_indicators()
         if not ind:
             return {"inst_id": self.inst_id, "error": "K线数据不足"}
 
-        use_adaptive = self.params.get("use_adaptive", True)
-        if not use_adaptive:
-            return {"inst_id": self.inst_id, "error": "当前为固定参数模式，无评分预测"}
+        price = ind.get("close", 0)
+        grid_lower = self.dynamic_grid.lower
+        grid_upper = self.dynamic_grid.upper
+        spacing = self.dynamic_grid.spacing
+        atr = self.dynamic_grid.atr
+        regime = self.dynamic_grid.regime
 
-        current_score = self.score_engine.buy_score(ind)
-        threshold = self.adaptive.buy_threshold
-        gap = max(0, threshold - current_score)
-
-        rsi = ind.get("rsi")
-        rsi_th = self.adaptive.rsi_oversold
-        rsi_gap = max(0, rsi - rsi_th) if rsi is not None else None
-
-        price = ind.get("close")
-        bb_lower = ind.get("bb_lower")
-        if price and bb_lower and bb_lower > 0:
-            bb_gap_pct = max(0, (price - bb_lower) / bb_lower * 100)
+        # 计算距离买入区的百分比
+        if grid_lower > 0 and price > 0:
+            distance_to_buy = (price - grid_lower) / grid_lower * 100
         else:
-            bb_gap_pct = None
+            distance_to_buy = 0
 
-        macd_ok = (ind.get("macd_hist") or 0) > 0 or (
-            ind.get("macd") is not None and ind.get("macd_signal") is not None and ind["macd"] > ind["macd_signal"]
-        )
+        in_buy_zone = price <= grid_lower
+        rsi = ind.get("rsi", 50)
 
-        vol = ind.get("volume")
-        vol_ma = ind.get("vol_ma")
-        vol_ratio = (vol / vol_ma) if (vol and vol_ma and vol_ma > 0) else None
-
+        # 拦截原因
         blockers = []
         if not self.running:
             blockers.append("策略未启动")
+        if self._trailing_entry_active:
+            blockers.append(f"追踪建仓中（低点 {self._trailing_entry_low:.4f}，等待反弹确认）")
         if time.time() < self._buy_disabled_until:
-            wait_sec = int(self._buy_disabled_until - time.time())
-            blockers.append(f"冷却中，还需 {wait_sec} 秒")
-        if self.adaptive.use_trend_filter and ind.get("ema") is not None:
-            if ind["close"] < ind["ema"] * 0.995:
-                blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200×0.995 {ind['ema']*0.995:.2f}")
-        if gap > 0:
-            blockers.append(f"评分不足：{current_score:.0f} < {threshold:.0f}")
+            wait = int(self._buy_disabled_until - time.time())
+            blockers.append(f"冷却中，还需 {wait} 秒")
+        if not in_buy_zone:
+            blockers.append(f"价格距网格下轨还有 {distance_to_buy:.2f}%")
+        if self.adaptive.use_trend_filter and ind.get("ema") and price < ind["ema"] * 0.98:
+            blockers.append(f"趋势过滤：价格低于EMA200的98%")
 
-        bar_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-                       "1H": 60, "2H": 120, "4H": 240, "6H": 360, "12H": 720, "1D": 1440}
-        bar_min = bar_minutes.get(self.params.get("bar", "15m"), 15)
-
-        estimated_bars = None
-        estimated_minutes = None
-        if len(self._kline_cache) >= 60 and gap > 0:
-            closes = [float(k[4]) for k in self._kline_cache]
-            highs = [float(k[2]) for k in self._kline_cache]
-            lows = [float(k[3]) for k in self._kline_cache]
-            volumes = [float(k[5]) for k in self._kline_cache]
-            lookback = 20
-            scores_history = []
-            for i in range(len(closes) - lookback, len(closes)):
-                sub_closes = closes[:i+1]
-                sub_highs = highs[:i+1]
-                sub_lows = lows[:i+1]
-                sub_vols = volumes[:i+1]
-                if len(sub_closes) < 50:
-                    continue
-                sub_ind = self.signal_engine.calculate(sub_closes, sub_highs, sub_lows, sub_vols)
-                s = self.score_engine.buy_score(sub_ind)
-                scores_history.append(s)
-            if len(scores_history) >= 5:
-                recent = scores_history[-5:]
-                diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
-                avg_change = sum(diffs) / len(diffs) if diffs else 0
-                if avg_change > 0.05:
-                    estimated_bars = int(gap / avg_change)
-                    estimated_minutes = estimated_bars * bar_min
+        # 状态
+        if in_buy_zone and not blockers:
+            status = "✅ 买入区域"
+        elif in_buy_zone:
+            status = "🟡 已到区域有拦截"
+        elif distance_to_buy < 1:
+            status = "🔥 接近买入区"
+        elif distance_to_buy < 3:
+            status = "⚡ 中等距离"
+        else:
+            status = "⏳ 等待"
 
         return {
             "inst_id": self.inst_id,
             "bar": self.params.get("bar", "15m"),
             "price": price,
-            "current_score": current_score,
-            "threshold": threshold,
-            "gap": gap,
+            "status": status,
+            "grid_lower": grid_lower,
+            "grid_upper": grid_upper,
+            "spacing_pct": spacing * 100,
+            "atr": atr,
+            "regime": regime,
+            "distance_to_buy": distance_to_buy,
+            "in_buy_zone": in_buy_zone,
             "rsi": rsi,
-            "rsi_threshold": rsi_th,
-            "rsi_gap": rsi_gap,
-            "bb_lower": bb_lower,
-            "bb_gap_pct": bb_gap_pct,
-            "macd_ok": macd_ok,
-            "vol_ratio": vol_ratio,
-            "estimated_bars": estimated_bars,
-            "estimated_minutes": estimated_minutes,
-            "bar_minutes": bar_min,
             "blockers": blockers,
+            "trailing_entry_active": self._trailing_entry_active,
+            "trailing_entry_low": self._trailing_entry_low,
             "running": self.running,
-            "batch_tp_triggered": len(self._batch_tp_triggered),
-            "regime": self.adaptive.regime,
-            "adx": self.adaptive.adx,
         }
 
     def snapshot(self):
@@ -538,14 +535,10 @@ class DipSellStrategy(BaseStrategy):
             "trade_count": self.trade_count,
             "bar": self.params.get("bar", "15m"),
             "use_adaptive": self.params.get("use_adaptive", True),
-            "last_score": self._last_score,
-            "adaptive_vol": self.adaptive.volatility,
-            "adaptive_sl": self.adaptive.stop_loss_pct,
-            "adaptive_tp": self.adaptive.take_profit_pct,
-            "adaptive_rsi_os": self.adaptive.rsi_oversold,
-            "adaptive_threshold": self.adaptive.buy_threshold,
             "regime": self.adaptive.regime,
             "adx": self.adaptive.adx,
+            "atr": self.adaptive.atr,
             "batch_tp_triggered": len(self._batch_tp_triggered),
+            "trailing_entry_active": self._trailing_entry_active,
         })
         return s
