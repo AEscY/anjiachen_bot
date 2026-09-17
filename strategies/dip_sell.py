@@ -4,6 +4,7 @@ import time
 from strategies.base import BaseStrategy
 from strategies.signals import SignalEngine, ScoreEngine, AdaptiveEngine
 from okx_client.rest import OKXRest
+from notifier import alert
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +142,7 @@ class DipSellStrategy(BaseStrategy):
 
     async def _record_fee(self):
         try:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)
             fills = await asyncio.to_thread(self.rest.get_fills, "SPOT", self.inst_id, 20)
             if fills.get("code") != "0":
                 return
@@ -166,21 +167,57 @@ class DipSellStrategy(BaseStrategy):
         if self._min_sz > 0:
             min_notional = self._min_sz * price
             if spend < min_notional:
-                logger.warning(f"{self.inst_id} 买入金额 {spend} < 最小 {min_notional:.2f}")
+                msg = f"{self.inst_id} 买入金额 {spend} < 最小 {min_notional:.2f}"
+                logger.warning(msg)
+                await alert(f"⚠️ {msg}")
                 return
 
         try:
             r = await asyncio.to_thread(self.rest.market_buy, self.inst_id, spend)
             if r.get("code") == "0":
-                self._last_action = ("市价买入", price)
-                logger.info(f"{self.inst_id} 市价买入 {spend} USDT @ {price}")
-                await self._record_fee()
-                await asyncio.sleep(1.5)
+                # 立即用订单返回结果估算持仓，避免 OKX 余额同步延迟
+                data = r.get("data", [])
+                filled_sz = 0.0
+                avg_px = price
+                if data:
+                    try:
+                        filled_sz = float(data[0].get("accFillSz", 0) or 0)
+                        avg_px_raw = data[0].get("avgPx", 0) or 0
+                        if float(avg_px_raw) > 0:
+                            avg_px = float(avg_px_raw)
+                    except (ValueError, TypeError):
+                        pass
+
+                # 若接口未返回成交量，则用 spend / price 估算
+                if filled_sz <= 0:
+                    filled_sz = spend / price
+
+                self.position = filled_sz
+                self.cost = filled_sz * avg_px
+                self.avg_buy_price = avg_px
+                self.peak_price = avg_px
+                self._last_action = ("市价买入", avg_px)
+
+                logger.info(f"{self.inst_id} 市价买入成功 spend={spend} 成交量={filled_sz:.6f} 均价={avg_px:.4f}")
+                await alert(
+                    f"✅ {self.inst_id} 买入成功\n"
+                    f"花费: {spend} USDT\n"
+                    f"数量: {filled_sz:.6f}\n"
+                    f"均价: {avg_px:.4f}"
+                )
+
+                # 记录手续费（异步，不阻塞）
+                asyncio.create_task(self._record_fee())
+                # 延迟同步真实持仓，覆盖估算值
+                await asyncio.sleep(2.5)
                 await self._sync_position_from_okx()
             else:
+                err = str(r)[:200]
                 logger.error(f"{self.inst_id} 市价买入失败: {r}")
+                await alert(f"❌ {self.inst_id} 买入失败\n{err}")
         except Exception as e:
             logger.error(f"{self.inst_id} 市价买入异常: {e}")
+            await alert(f"❌ {self.inst_id} 买入异常: {e}")
 
     # ==================== 市价卖出 ====================
     async def _do_market_sell(self, price, size=None):
@@ -188,21 +225,38 @@ class DipSellStrategy(BaseStrategy):
         if sell_size <= 0:
             return
         if self._min_sz > 0 and sell_size < self._min_sz:
-            logger.warning(f"{self.inst_id} 卖出数量 {sell_size} < 最小 {self._min_sz}")
+            msg = f"{self.inst_id} 卖出数量 {sell_size} < 最小 {self._min_sz}"
+            logger.warning(msg)
+            await alert(f"⚠️ {msg}")
             return
 
         try:
             r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
             if r.get("code") == "0":
                 self._last_action = ("市价卖出", price)
-                logger.info(f"{self.inst_id} 市价卖出 {sell_size} @ {price}")
-                await self._record_fee()
-                await asyncio.sleep(1.5)
+                logger.info(f"{self.inst_id} 市价卖出成功 数量={sell_size:.6f} 价格≈{price:.4f}")
+
+                # 简化盈亏计算
+                if self.avg_buy_price > 0:
+                    profit = (price - self.avg_buy_price) * sell_size
+                    self.total_profit += profit
+
+                await alert(
+                    f"✅ {self.inst_id} 卖出成功\n"
+                    f"数量: {sell_size:.6f}\n"
+                    f"价格: ≈{price:.4f}"
+                )
+
+                asyncio.create_task(self._record_fee())
+                await asyncio.sleep(2.5)
                 await self._sync_position_from_okx()
             else:
+                err = str(r)[:200]
                 logger.error(f"{self.inst_id} 市价卖出失败: {r}")
+                await alert(f"❌ {self.inst_id} 卖出失败\n{err}")
         except Exception as e:
             logger.error(f"{self.inst_id} 市价卖出异常: {e}")
+            await alert(f"❌ {self.inst_id} 卖出异常: {e}")
 
     async def _get_indicators(self):
         now = time.time()
@@ -244,7 +298,6 @@ class DipSellStrategy(BaseStrategy):
                     continue
                 return {"action": "batch_tp", "reason": f"分批止盈{i+1}档({tp_level*100:.0f}%)", "sell_size": sell_size}
 
-        # 动态止损止盈
         if self.params.get("use_adaptive", True):
             sl_pct = self.adaptive.stop_loss_pct
             tp_pct = self.adaptive.take_profit_pct
@@ -254,21 +307,17 @@ class DipSellStrategy(BaseStrategy):
             tp_pct = self.params.get("take_profit_pct", 0.03)
             tr_pct = self.params.get("trailing_pct", 0.02)
 
-        # 移动止盈
         if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
             drawdown = (self.peak_price - price) / self.peak_price
             if profit_pct > 0.005 and drawdown >= tr_pct:
                 return {"action": "sell", "reason": f"移动止盈(回撤{drawdown*100:.2f}%)"}
 
-        # 固定止盈
         if not self._batch_tp_triggered and profit_pct >= tp_pct:
             return {"action": "sell", "reason": f"止盈({profit_pct*100:.2f}%)"}
 
-        # 止损
         if profit_pct <= -sl_pct:
             return {"action": "sell", "reason": f"止损({profit_pct*100:.2f}%)"}
 
-        # 信号卖出
         ind = await self._get_indicators()
         if ind:
             sell_score = self.score_engine.sell_score(ind)
@@ -281,7 +330,6 @@ class DipSellStrategy(BaseStrategy):
             return
         self._last_price = price
 
-        # 持仓时检查卖出
         if self.position > 0:
             result = await self._check_sell(price)
             if result:
@@ -291,7 +339,6 @@ class DipSellStrategy(BaseStrategy):
                     await self._do_market_sell(price)
             return
 
-        # 冷却期检查
         if time.time() < self._buy_disabled_until:
             return
 
@@ -313,17 +360,17 @@ class DipSellStrategy(BaseStrategy):
                     f"{self.inst_id} 买入信号 分数={score:.0f} 阈值={self.adaptive.buy_threshold} "
                     f"体制={self.adaptive.regime} ADX={self.adaptive.adx:.1f}"
                 )
-                await self._do_market_buy(price)
-                # 买入后 5 分钟冷却，避免立即重复买
+                # 立即设置冷却，防止下单期间的重复触发
                 self._buy_disabled_until = time.time() + 300
+                await self._do_market_buy(price)
         else:
             if self.signal_engine.buy_signal(
                 ind,
                 use_trend_filter=self.params.get("trend_filter", True),
                 use_volume=self.params.get("volume_confirm", True),
             ):
-                await self._do_market_buy(price)
                 self._buy_disabled_until = time.time() + 300
+                await self._do_market_buy(price)
 
     async def start(self):
         self.running = True
@@ -408,7 +455,7 @@ class DipSellStrategy(BaseStrategy):
                 avg_change = sum(diffs) / len(diffs) if diffs else 0
                 if avg_change > 0.05:
                     estimated_bars = int(gap / avg_change)
-                    estimated_minutes = estimated_bars * bar_min
+                    estimated_minutes提高 = estimated_bars * bar_min
 
         return {
             "inst_id": self.inst_id,
