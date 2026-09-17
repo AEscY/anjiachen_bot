@@ -113,6 +113,7 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 获取K线失败: {e}")
 
     async def _sync_position_from_okx(self):
+        """仅在启动时调用，用于恢复真实持仓"""
         try:
             base_ccy = self.inst_id.split("-")[0]
             bal_resp = await asyncio.to_thread(self.rest.get_balance, "USDT")
@@ -163,7 +164,6 @@ class DipSellStrategy(BaseStrategy):
     # ==================== 市价买入 ====================
     async def _do_market_buy(self, price):
         spend = self.params.get("maxSpend", 100)
-        # 最小下单金额校验
         if self._min_sz > 0:
             min_notional = self._min_sz * price
             if spend < min_notional:
@@ -175,7 +175,6 @@ class DipSellStrategy(BaseStrategy):
         try:
             r = await asyncio.to_thread(self.rest.market_buy, self.inst_id, spend)
             if r.get("code") == "0":
-                # 立即用订单返回结果估算持仓，避免 OKX 余额同步延迟
                 data = r.get("data", [])
                 filled_sz = 0.0
                 avg_px = price
@@ -188,29 +187,26 @@ class DipSellStrategy(BaseStrategy):
                     except (ValueError, TypeError):
                         pass
 
-                # 若接口未返回成交量，则用 spend / price 估算
                 if filled_sz <= 0:
                     filled_sz = spend / price
 
-                self.position = filled_sz
-                self.cost = filled_sz * avg_px
-                self.avg_buy_price = avg_px
-                self.peak_price = avg_px
+                # 本地累加持仓（关键修复：不调用余额同步覆盖）
+                self.position += filled_sz
+                self.cost += filled_sz * avg_px
+                self.avg_buy_price = self.cost / self.position if self.position > 0 else avg_px
+                self.peak_price = max(self.peak_price, avg_px)
                 self._last_action = ("市价买入", avg_px)
 
-                logger.info(f"{self.inst_id} 市价买入成功 spend={spend} 成交量={filled_sz:.6f} 均价={avg_px:.4f}")
+                logger.info(f"{self.inst_id} 市价买入成功 spend={spend} 数量={filled_sz:.6f} 均价={avg_px:.4f} 总持仓={self.position:.6f}")
                 await alert(
                     f"✅ {self.inst_id} 买入成功\n"
                     f"花费: {spend} USDT\n"
                     f"数量: {filled_sz:.6f}\n"
-                    f"均价: {avg_px:.4f}"
+                    f"均价: {avg_px:.4f}\n"
+                    f"当前持仓: {self.position:.6f}"
                 )
 
-                # 记录手续费（异步，不阻塞）
                 asyncio.create_task(self._record_fee())
-                # 延迟同步真实持仓，覆盖估算值
-                await asyncio.sleep(2.5)
-                await self._sync_position_from_okx()
             else:
                 err = str(r)[:200]
                 logger.error(f"{self.inst_id} 市价买入失败: {r}")
@@ -236,20 +232,34 @@ class DipSellStrategy(BaseStrategy):
                 self._last_action = ("市价卖出", price)
                 logger.info(f"{self.inst_id} 市价卖出成功 数量={sell_size:.6f} 价格≈{price:.4f}")
 
-                # 简化盈亏计算
+                # 计算已实现盈亏
                 if self.avg_buy_price > 0:
                     profit = (price - self.avg_buy_price) * sell_size
                     self.total_profit += profit
+                else:
+                    profit = 0.0
+
+                # 本地扣减持仓（关键修复：不调用余额同步覆盖）
+                self.position -= sell_size
+                if self.position < 1e-10:
+                    self.position = 0.0
+                    self.cost = 0.0
+                    self.avg_buy_price = 0.0
+                    self.peak_price = 0.0
+                    self._batch_tp_triggered.clear()
+                else:
+                    # 部分卖出时，成本按比例减少
+                    self.cost = self.avg_buy_price * self.position
 
                 await alert(
                     f"✅ {self.inst_id} 卖出成功\n"
                     f"数量: {sell_size:.6f}\n"
-                    f"价格: ≈{price:.4f}"
+                    f"价格: ≈{price:.4f}\n"
+                    f"本轮盈亏: {profit:+.4f} USDT\n"
+                    f"剩余持仓: {self.position:.6f}"
                 )
 
                 asyncio.create_task(self._record_fee())
-                await asyncio.sleep(2.5)
-                await self._sync_position_from_okx()
             else:
                 err = str(r)[:200]
                 logger.error(f"{self.inst_id} 市价卖出失败: {r}")
@@ -285,7 +295,6 @@ class DipSellStrategy(BaseStrategy):
             self.peak_price = price
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
-        # 分批止盈
         for i, (tp_level, ratio) in enumerate(zip(BATCH_TP_LEVELS, BATCH_TP_RATIOS)):
             if i in self._batch_tp_triggered:
                 continue
@@ -360,7 +369,6 @@ class DipSellStrategy(BaseStrategy):
                     f"{self.inst_id} 买入信号 分数={score:.0f} 阈值={self.adaptive.buy_threshold} "
                     f"体制={self.adaptive.regime} ADX={self.adaptive.adx:.1f}"
                 )
-                # 立即设置冷却，防止下单期间的重复触发
                 self._buy_disabled_until = time.time() + 300
                 await self._do_market_buy(price)
         else:
@@ -455,7 +463,7 @@ class DipSellStrategy(BaseStrategy):
                 avg_change = sum(diffs) / len(diffs) if diffs else 0
                 if avg_change > 0.05:
                     estimated_bars = int(gap / avg_change)
-                    estimated_minutes提高 = estimated_bars * bar_min
+                    estimated_minutes = estimated_bars * bar_min
 
         return {
             "inst_id": self.inst_id,
