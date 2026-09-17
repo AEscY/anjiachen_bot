@@ -28,42 +28,31 @@ class OKXRest:
             kwargs["instId"] = inst_id
         return self.public.get_instruments(**kwargs)
 
-    # ==================== 现货交易 ====================
-    def limit_buy(self, inst_id, price, size):
+    # ==================== 市价交易 ====================
+    def market_buy(self, inst_id, quote_sz):
+        """按 USDT 金额市价买入"""
         return self.trade.place_order(
-            instId=inst_id, tdMode="cash", side="buy",
-            ordType="limit", px=str(price), sz=str(size),
+            instId=inst_id,
+            tdMode="cash",
+            side="buy",
+            ordType="market",
+            tgtCcy="quote_ccy",
+            sz=str(quote_sz),
         )
 
-    def limit_sell(self, inst_id, price, size):
+    def market_sell(self, inst_id, base_sz):
+        """按币种数量市价卖出"""
         return self.trade.place_order(
-            instId=inst_id, tdMode="cash", side="sell",
-            ordType="limit", px=str(price), sz=str(size),
+            instId=inst_id,
+            tdMode="cash",
+            side="sell",
+            ordType="market",
+            sz=str(base_sz),
         )
-
-    def cancel_order(self, inst_id, ord_id):
-        return self.trade.cancel_order(instId=inst_id, ordId=ord_id)
-
-    def get_pending_orders(self, inst_id=None, ord_type=None):
-        kwargs = {}
-        if inst_id:
-            kwargs["instId"] = inst_id
-        if ord_type:
-            kwargs["ordType"] = ord_type
-        return self.trade.get_orders_pending(**kwargs)
-
-    def get_order_detail(self, inst_id, ord_id):
-        return self.trade.get_order(instId=inst_id, ordId=ord_id)
 
     # ==================== 账户 ====================
     def get_balance(self, ccy="USDT"):
         return self.account.get_account_balance(ccy=ccy)
-
-    def get_positions(self, inst_id=None):
-        kwargs = {"instType": "SPOT"}
-        if inst_id:
-            kwargs["instId"] = inst_id
-        return self.account.get_positions(**kwargs)
 
     # ==================== 成交明细 ====================
     def get_fills(self, inst_type="SPOT", inst_id=None, limit=100):
@@ -71,12 +60,3 @@ class OKXRest:
         if inst_id:
             kwargs["instId"] = inst_id
         return self.trade.get_fills(**kwargs)
-
-    def get_fills_history(self, inst_type="SPOT", inst_id=None, limit=100):
-        kwargs = {"instType": inst_type, "limit": str(limit)}
-        if inst_id:
-            kwargs["instId"] = inst_id
-        return self.trade.get_fills_history(**kwargs)
-
-    def get_bills(self, inst_type="SPOT", limit=100):
-        return self.account.get_bills(instType=inst_type, limit=str(limit))
