@@ -190,8 +190,6 @@ async def cmd_signals(msg: Message):
         regime = f.get("regime", "unknown")
         atr = f.get("atr", 0)
         blockers = f.get("blockers", [])
-        trailing_active = f.get("trailing_entry_active", False)
-        trailing_low = f.get("trailing_entry_low", 0)
 
         regime_icon = {"trending": "📈趋势", "ranging": "📊震荡", "transitional": "🔄过渡"}.get(regime, "❓")
 
@@ -206,8 +204,6 @@ async def cmd_signals(msg: Message):
             lines.append(f"  RSI: {rsi:.1f}")
         lines.append(f"  ATR: {atr:.4f}")
 
-        if trailing_active:
-            lines.append(f"  ⚠️ 追踪建仓中（低点 {trailing_low:.4f}，等待反弹确认）")
         for b in blockers:
             lines.append(f"  ⚠️ {b}")
 
