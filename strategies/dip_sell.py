@@ -14,7 +14,6 @@ DEFAULT_PARAMS = {
     "use_trailing": True,
     "trend_filter": True,
     "volume_confirm": True,
-    "limit_offset_pct": 0.002,
     "bar": "15m",
     "rsi_period": 14,
     "rsi_oversold": 30,
@@ -51,10 +50,6 @@ class DipSellStrategy(BaseStrategy):
         self.trade_count = 0
         self._last_action = None
         self._last_score = 0.0
-
-        self._pending_buy_ord_id = None
-        self._pending_sell_ord_id = None
-        self._pending_buy_price = None
 
         self._batch_tp_triggered = set()
 
@@ -106,26 +101,6 @@ class DipSellStrategy(BaseStrategy):
                 logger.info(f"{self.inst_id} 规格: minSz={self._min_sz}, lotSz={self._lot_sz}")
         except Exception as e:
             logger.error(f"{self.inst_id} 加载规格失败: {e}")
-
-    async def _restore_pending_orders(self):
-        try:
-            resp = await asyncio.to_thread(self.rest.get_pending_orders, self.inst_id)
-            if resp.get("code") != "0":
-                return
-            for order in resp.get("data", []):
-                side = order.get("side")
-                ord_id = order.get("ordId")
-                px = float(order.get("px", 0))
-                sz = float(order.get("sz", 0))
-                if side == "buy":
-                    self._pending_buy_ord_id = ord_id
-                    self._pending_buy_price = px
-                    logger.info(f"{self.inst_id} 恢复挂单买入 {ord_id} @ {px} x {sz}")
-                elif side == "sell":
-                    self._pending_sell_ord_id = ord_id
-                    logger.info(f"{self.inst_id} 恢复挂单卖出 {ord_id} @ {px} x {sz}")
-        except Exception as e:
-            logger.error(f"{self.inst_id} 恢复挂单失败: {e}")
 
     async def _fetch_klines(self):
         bar = self.params.get("bar", "15m")
@@ -184,43 +159,50 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
-    async def _do_limit_buy(self, price):
-        offset = self.params.get("limit_offset_pct", 0.002)
-        buy_price = round(price * (1 - offset), 6)
+    # ==================== 市价买入 ====================
+    async def _do_market_buy(self, price):
         spend = self.params.get("maxSpend", 100)
-        size = spend / buy_price
-        if self._lot_sz > 0:
-            size = round(size / self._lot_sz) * self._lot_sz
-        if self._min_sz > 0 and size < self._min_sz:
-            logger.warning(f"{self.inst_id} 买入数量 {size} < 最小 {self._min_sz}")
-            return
-        try:
-            r = await asyncio.to_thread(self.rest.limit_buy, self.inst_id, buy_price, size)
-            if r.get("code") == "0":
-                self._pending_buy_ord_id = r["data"][0]["ordId"]
-                self._pending_buy_price = buy_price
-                self._last_action = ("限价买入挂单", buy_price)
-                logger.info(f"{self.inst_id} 限价买入挂单 @ {buy_price}, size={size}")
-        except Exception as e:
-            logger.error(f"{self.inst_id} 限价买入失败: {e}")
+        # 最小下单金额校验
+        if self._min_sz > 0:
+            min_notional = self._min_sz * price
+            if spend < min_notional:
+                logger.warning(f"{self.inst_id} 买入金额 {spend} < 最小 {min_notional:.2f}")
+                return
 
-    async def _do_limit_sell(self, price, size=None):
+        try:
+            r = await asyncio.to_thread(self.rest.market_buy, self.inst_id, spend)
+            if r.get("code") == "0":
+                self._last_action = ("市价买入", price)
+                logger.info(f"{self.inst_id} 市价买入 {spend} USDT @ {price}")
+                await self._record_fee()
+                await asyncio.sleep(1.5)
+                await self._sync_position_from_okx()
+            else:
+                logger.error(f"{self.inst_id} 市价买入失败: {r}")
+        except Exception as e:
+            logger.error(f"{self.inst_id} 市价买入异常: {e}")
+
+    # ==================== 市价卖出 ====================
+    async def _do_market_sell(self, price, size=None):
         sell_size = size if size is not None else self.position
         if sell_size <= 0:
             return
         if self._min_sz > 0 and sell_size < self._min_sz:
             logger.warning(f"{self.inst_id} 卖出数量 {sell_size} < 最小 {self._min_sz}")
             return
-        offset = self.params.get("limit_offset_pct", 0.002)
-        sell_price = round(price * (1 + offset), 6)
+
         try:
-            r = await asyncio.to_thread(self.rest.limit_sell, self.inst_id, sell_price, sell_size)
+            r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
             if r.get("code") == "0":
-                self._pending_sell_ord_id = r["data"][0]["ordId"]
-                self._last_action = ("限价卖出挂单", sell_price)
-                logger.info(f"{self.inst_id} 限价卖出挂单 @ {sell_price}, size={sell_size}")
+                self._last_action = ("市价卖出", price)
+                logger.info(f"{self.inst_id} 市价卖出 {sell_size} @ {price}")
+                await self._record_fee()
+                await asyncio.sleep(1.5)
+                await self._sync_position_from_okx()
+            else:
+                logger.error(f"{self.inst_id} 市价卖出失败: {r}")
         except Exception as e:
-            logger.error(f"{self.inst_id} 限价卖出失败: {e}")
+            logger.error(f"{self.inst_id} 市价卖出异常: {e}")
 
     async def _get_indicators(self):
         now = time.time()
@@ -249,6 +231,7 @@ class DipSellStrategy(BaseStrategy):
             self.peak_price = price
         profit_pct = (price - self.avg_buy_price) / self.avg_buy_price
 
+        # 分批止盈
         for i, (tp_level, ratio) in enumerate(zip(BATCH_TP_LEVELS, BATCH_TP_RATIOS)):
             if i in self._batch_tp_triggered:
                 continue
@@ -261,6 +244,7 @@ class DipSellStrategy(BaseStrategy):
                     continue
                 return {"action": "batch_tp", "reason": f"分批止盈{i+1}档({tp_level*100:.0f}%)", "sell_size": sell_size}
 
+        # 动态止损止盈
         if self.params.get("use_adaptive", True):
             sl_pct = self.adaptive.stop_loss_pct
             tp_pct = self.adaptive.take_profit_pct
@@ -270,17 +254,21 @@ class DipSellStrategy(BaseStrategy):
             tp_pct = self.params.get("take_profit_pct", 0.03)
             tr_pct = self.params.get("trailing_pct", 0.02)
 
+        # 移动止盈
         if self.params.get("use_trailing", True) and self.peak_price > self.avg_buy_price:
             drawdown = (self.peak_price - price) / self.peak_price
             if profit_pct > 0.005 and drawdown >= tr_pct:
                 return {"action": "sell", "reason": f"移动止盈(回撤{drawdown*100:.2f}%)"}
 
+        # 固定止盈
         if not self._batch_tp_triggered and profit_pct >= tp_pct:
             return {"action": "sell", "reason": f"止盈({profit_pct*100:.2f}%)"}
 
+        # 止损
         if profit_pct <= -sl_pct:
             return {"action": "sell", "reason": f"止损({profit_pct*100:.2f}%)"}
 
+        # 信号卖出
         ind = await self._get_indicators()
         if ind:
             sell_score = self.score_engine.sell_score(ind)
@@ -293,19 +281,17 @@ class DipSellStrategy(BaseStrategy):
             return
         self._last_price = price
 
+        # 持仓时检查卖出
         if self.position > 0:
-            if self._pending_sell_ord_id:
-                return
             result = await self._check_sell(price)
             if result:
                 if result["action"] == "batch_tp":
-                    await self._do_limit_sell(price, result["sell_size"])
+                    await self._do_market_sell(price, result["sell_size"])
                 else:
-                    await self._do_limit_sell(price)
+                    await self._do_market_sell(price)
             return
 
-        if self._pending_buy_ord_id:
-            return
+        # 冷却期检查
         if time.time() < self._buy_disabled_until:
             return
 
@@ -317,42 +303,37 @@ class DipSellStrategy(BaseStrategy):
         if use_adaptive:
             score = self.score_engine.buy_score(ind)
             self._last_score = score
+
             if self.adaptive.use_trend_filter and ind.get("ema") is not None:
                 if ind["close"] < ind["ema"] * 0.995:
                     return
+
             if score >= self.adaptive.buy_threshold:
                 logger.info(
                     f"{self.inst_id} 买入信号 分数={score:.0f} 阈值={self.adaptive.buy_threshold} "
                     f"体制={self.adaptive.regime} ADX={self.adaptive.adx:.1f}"
                 )
-                await self._do_limit_buy(price)
+                await self._do_market_buy(price)
+                # 买入后 5 分钟冷却，避免立即重复买
+                self._buy_disabled_until = time.time() + 300
         else:
             if self.signal_engine.buy_signal(
                 ind,
                 use_trend_filter=self.params.get("trend_filter", True),
                 use_volume=self.params.get("volume_confirm", True),
             ):
-                await self._do_limit_buy(price)
+                await self._do_market_buy(price)
+                self._buy_disabled_until = time.time() + 300
 
     async def start(self):
         self.running = True
         await self._load_instrument_rules()
-        await self._restore_pending_orders()
         await self._sync_position_from_okx()
         mode = "自适应模式" if self.params.get("use_adaptive", True) else "固定参数模式"
-        logger.info(f"{self.inst_id} 低吸高卖已启动（{mode}），周期 {self.params.get('bar')}")
+        logger.info(f"{self.inst_id} 低吸高卖已启动（{mode}，市价单），周期 {self.params.get('bar')}")
 
     async def stop(self):
         self.running = False
-        for ord_id in [self._pending_buy_ord_id, self._pending_sell_ord_id]:
-            if ord_id:
-                try:
-                    await asyncio.to_thread(self.rest.cancel_order, self.inst_id, ord_id)
-                except Exception as e:
-                    logger.error(f"撤单失败: {e}")
-        self._pending_buy_ord_id = None
-        self._pending_sell_ord_id = None
-        self._pending_buy_price = None
 
     async def get_signal_forecast(self):
         ind = await self._get_indicators()
@@ -389,21 +370,14 @@ class DipSellStrategy(BaseStrategy):
         blockers = []
         if not self.running:
             blockers.append("策略未启动")
-        if self._pending_buy_ord_id:
-            blockers.append(f"已挂买单 @ {self._pending_buy_price}，等成交")
         if time.time() < self._buy_disabled_until:
             wait_sec = int(self._buy_disabled_until - time.time())
             blockers.append(f"冷却中，还需 {wait_sec} 秒")
-
         if self.adaptive.use_trend_filter and ind.get("ema") is not None:
             if ind["close"] < ind["ema"] * 0.995:
                 blockers.append(f"趋势过滤拦截：价格 {ind['close']:.2f} < EMA200×0.995 {ind['ema']*0.995:.2f}")
-
         if gap > 0:
             blockers.append(f"评分不足：{current_score:.0f} < {threshold:.0f}")
-        if not blockers:
-            buy_target = round(price * (1 - self.params.get("limit_offset_pct", 0.002)), 6)
-            blockers.append(f"限价单目标 {buy_target}，等价格回落成交")
 
         bar_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
                        "1H": 60, "2H": 120, "4H": 240, "6H": 360, "12H": 720, "1D": 1440}
@@ -455,8 +429,6 @@ class DipSellStrategy(BaseStrategy):
             "bar_minutes": bar_min,
             "blockers": blockers,
             "running": self.running,
-            "pending_buy": self._pending_buy_ord_id,
-            "pending_buy_price": self._pending_buy_price,
             "batch_tp_triggered": len(self._batch_tp_triggered),
             "regime": self.adaptive.regime,
             "adx": self.adaptive.adx,
@@ -472,8 +444,6 @@ class DipSellStrategy(BaseStrategy):
             "total_profit": self.total_profit,
             "total_fee": self.total_fee,
             "trade_count": self.trade_count,
-            "pending_buy": self._pending_buy_ord_id,
-            "pending_sell": self._pending_sell_ord_id,
             "bar": self.params.get("bar", "15m"),
             "use_adaptive": self.params.get("use_adaptive", True),
             "last_score": self._last_score,
