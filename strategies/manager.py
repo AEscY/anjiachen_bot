@@ -52,7 +52,6 @@ class StrategyManager:
         self.dips[inst_id] = DipSellStrategy(inst_id)
         self._inst_ids.append(inst_id)
 
-        # 从 Neon 恢复状态（只恢复持仓相关，市价单无挂单）
         saved = await self.state_store.load_strategy(inst_id)
         if saved:
             dip = self.dips[inst_id]
@@ -140,3 +139,48 @@ class StrategyManager:
                 logger.error(f"停止后保存失败: {e}")
             return True, "已停止低吸高卖"
         return True, "低吸高卖未运行"
+
+    # ==================== 清仓 ====================
+    async def close_position(self, inst_id):
+        """清空指定币种的持仓。会先停止策略，避免清仓后立即又买入。"""
+        inst_id = inst_id.upper().strip()
+        dip = self.dips.get(inst_id)
+        if not dip:
+            return False, "未初始化"
+
+        was_running = dip.running
+        if was_running:
+            await dip.stop()
+
+        ok, msg = await dip.close_position()
+
+        # 清仓后保持暂停状态，用户需要手动重启
+        try:
+            await self.state_store.save_all(self)
+        except Exception as e:
+            logger.error(f"清仓后保存失败: {e}")
+
+        return ok, msg
+
+    async def close_all_positions(self):
+        """清空所有币种的持仓。返回每个币种的结果列表。"""
+        results = []
+        for iid in self.all_inst_ids():
+            dip = self.dips.get(iid)
+            if not dip:
+                results.append(f"{iid}: 未初始化")
+                continue
+            if dip.position <= 0:
+                results.append(f"{iid}: 无持仓")
+                continue
+
+            ok, msg = await self.close_position(iid)
+            results.append(f"{iid}: {msg}")
+
+        # 清仓完毕后统一保存一次
+        try:
+            await self.state_store.save_all(self)
+        except Exception as e:
+            logger.error(f"清仓后保存失败: {e}")
+
+        return results
