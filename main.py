@@ -218,11 +218,8 @@ async def cmd_positions(msg: Message):
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
-
-    rest = OKXRest()
     lines = ["💰 持仓总览"]
     has_any = False
-
     for iid in dlg.MANAGER.all_inst_ids():
         dip = dlg.MANAGER.dips.get(iid)
         if not dip:
@@ -232,21 +229,11 @@ async def cmd_positions(msg: Message):
         if pos <= 0:
             continue
         has_any = True
-
-        # ===== 强制从OKX API拉取实时价格 =====
-        real_price = _last_price.get(iid, 0)
-        try:
-            ticker_resp = await asyncio.to_thread(rest.get_ticker, iid)
-            if ticker_resp.get("code") == "0" and ticker_resp.get("data"):
-                real_price = float(ticker_resp["data"][0]["last"])
-        except Exception:
-            pass
-
         avg = s.get("avg_buy_price", 0)
-        profit_pct = (real_price - avg) / avg * 100 if avg > 0 and real_price else 0
-
+        price = _last_price.get(iid, 0)
+        profit_pct = (price - avg) / avg * 100 if avg > 0 and price else 0
         lines.append(f"\n{iid}")
-        lines.append(f"  当前价: {real_price}")
+        lines.append(f"  当前价: {price}")
         lines.append(f"  持仓: {pos:.6f}")
         if avg > 0:
             lines.append(f"  均价: {avg:.6f}")
@@ -255,7 +242,6 @@ async def cmd_positions(msg: Message):
         batch = s.get("batch_tp_triggered", 0)
         if batch > 0:
             lines.append(f"  分批止盈: 已触发 {batch}/3 档")
-
     if not has_any:
         lines.append("\n暂无持仓。")
     await msg.answer("\n".join(lines))
@@ -270,15 +256,15 @@ async def cmd_balance(msg: Message):
         rest = OKXRest()
         resp = await asyncio.to_thread(rest.get_balance, "USDT")
         if resp.get("code") != "0" or not resp.get("data"):
-            await msg.answer("查询失败")
+            await msg.answer("av查询失败")
             return
         details = resp["data"][0].get("details", [])
-        lines = ["💵 账户余额"]
+ail        lines = ["💵 账户余额"]
         for d in details:
-            ccy = d.get("ccy", "")
+            ccy =Bal d.get("ccy", "")
             try:
-                eq = float(d.get("eq", 0))
-                avail = float(d.get("availBal", 0))
+                eq = float(d",.get("eq", 0))
+                avail = float(d.get(" 0))
             except (ValueError, TypeError):
                 continue
             if eq > 0:
@@ -522,6 +508,24 @@ async def health(request):
     return web.Response(text="OK")
 
 
+# ==================== 看门狗：强制REST刷新价格 ====================
+async def refresh_prices_task(manager):
+    """独立看门狗：每15秒从REST拉取真实价格，防止WebSocket卡死"""
+    while True:
+        await asyncio.sleep(15)
+        for iid in manager.all_inst_ids():
+            try:
+                resp = await asyncio.to_thread(manager.rest.get_ticker, iid)
+                if resp.get("code") == "0" and resp.get("data"):
+                    real_price = float(resp["data"][0]["last"])
+                    _last_price[iid] = real_price
+                    # 顺便驱动一次策略逻辑（如果价格变动较大）
+                    if dlg.MANAGER:
+                        await dlg.MANAGER.on_ticker(iid, real_price, resp["data"][0])
+            except Exception as e:
+                logger.error(f"看门狗刷新 {iid} 价格失败: {e}")
+
+
 # ==================== 后台初始化 ====================
 async def background_init(manager, dashboard):
     for iid in WATCHLIST:
@@ -540,6 +544,10 @@ async def background_init(manager, dashboard):
     asyncio.create_task(pub_ws.connect(manager.all_inst_ids()))
     asyncio.create_task(priv_ws.connect())
     dlg.PUB_WS = pub_ws
+
+    # 启动看门狗
+    asyncio.create_task(refresh_prices_task(manager))
+    logger.info("价格看门狗已启动（每15秒通过REST强制刷新）")
 
     dashboard.set_manager(manager, manager.risk_manager)
 
