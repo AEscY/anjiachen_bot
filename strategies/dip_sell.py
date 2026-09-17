@@ -113,7 +113,6 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 获取K线失败: {e}")
 
     async def _sync_position_from_okx(self):
-        """仅在启动时调用，用于恢复真实持仓"""
         try:
             base_ccy = self.inst_id.split("-")[0]
             bal_resp = await asyncio.to_thread(self.rest.get_balance, "USDT")
@@ -161,7 +160,6 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 记录手续费失败: {e}")
 
-    # ==================== 市价买入 ====================
     async def _do_market_buy(self, price):
         spend = self.params.get("maxSpend", 100)
         if self._min_sz > 0:
@@ -190,7 +188,6 @@ class DipSellStrategy(BaseStrategy):
                 if filled_sz <= 0:
                     filled_sz = spend / price
 
-                # 本地累加持仓（关键修复：不调用余额同步覆盖）
                 self.position += filled_sz
                 self.cost += filled_sz * avg_px
                 self.avg_buy_price = self.cost / self.position if self.position > 0 else avg_px
@@ -215,7 +212,6 @@ class DipSellStrategy(BaseStrategy):
             logger.error(f"{self.inst_id} 市价买入异常: {e}")
             await alert(f"❌ {self.inst_id} 买入异常: {e}")
 
-    # ==================== 市价卖出 ====================
     async def _do_market_sell(self, price, size=None):
         sell_size = size if size is not None else self.position
         if sell_size <= 0:
@@ -232,14 +228,12 @@ class DipSellStrategy(BaseStrategy):
                 self._last_action = ("市价卖出", price)
                 logger.info(f"{self.inst_id} 市价卖出成功 数量={sell_size:.6f} 价格≈{price:.4f}")
 
-                # 计算已实现盈亏
                 if self.avg_buy_price > 0:
                     profit = (price - self.avg_buy_price) * sell_size
                     self.total_profit += profit
                 else:
                     profit = 0.0
 
-                # 本地扣减持仓（关键修复：不调用余额同步覆盖）
                 self.position -= sell_size
                 if self.position < 1e-10:
                     self.position = 0.0
@@ -248,7 +242,6 @@ class DipSellStrategy(BaseStrategy):
                     self.peak_price = 0.0
                     self._batch_tp_triggered.clear()
                 else:
-                    # 部分卖出时，成本按比例减少
                     self.cost = self.avg_buy_price * self.position
 
                 await alert(
@@ -267,6 +260,50 @@ class DipSellStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"{self.inst_id} 市价卖出异常: {e}")
             await alert(f"❌ {self.inst_id} 卖出异常: {e}")
+
+    async def close_position(self):
+        """一键清仓：市价卖出全部持仓，返回 (ok, message)"""
+        if self.position <= 0:
+            return False, "无持仓"
+
+        sell_size = self.position
+        if self._min_sz > 0 and sell_size < self._min_sz:
+            return False, f"持仓 {sell_size:.8f} < 最小 {self._min_sz}，无法卖出"
+
+        try:
+            r = await asyncio.to_thread(self.rest.market_sell, self.inst_id, sell_size)
+            if r.get("code") == "0":
+                data = r.get("data", [])
+                avg_px = self._last_price if self._last_price > 0 else self.avg_buy_price
+                if data:
+                    try:
+                        px = data[0].get("avgPx", 0) or 0
+                        if float(px) > 0:
+                            avg_px = float(px)
+                    except (ValueError, TypeError):
+                        pass
+
+                profit = 0.0
+                if self.avg_buy_price > 0:
+                    profit = (avg_px - self.avg_buy_price) * sell_size
+                    self.total_profit += profit
+
+                # 清空持仓
+                self.position = 0.0
+                self.cost = 0.0
+                self.avg_buy_price = 0.0
+                self.peak_price = 0.0
+                self._batch_tp_triggered.clear()
+                self._last_action = ("手动清仓", avg_px)
+
+                asyncio.create_task(self._record_fee())
+
+                logger.info(f"{self.inst_id} 清仓成功 数量={sell_size:.6f} 均价={avg_px:.4f} 盈亏={profit:+.4f}")
+                return True, f"清仓 {sell_size:.6f} @ {avg_px:.4f}，盈亏 {profit:+.4f} USDT"
+            else:
+                return False, f"清仓失败: {str(r)[:150]}"
+        except Exception as e:
+            return False, f"清仓异常: {e}"
 
     async def _get_indicators(self):
         now = time.time()
