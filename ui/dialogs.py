@@ -24,36 +24,39 @@ PARAM_GROUPS = {
     "signal": {
         "title": "信号参数",
         "params": {
-            "bar":             {"type": "bar",   "range": None,         "desc": "K线周期"},
-            "rsi_period":      {"type": "int",   "range": (2, 100),     "desc": "RSI周期"},
-            "rsi_oversold":    {"type": "float", "range": (5, 50),      "desc": "RSI超卖阈值"},
-            "rsi_overbought":  {"type": "float", "range": (50, 95),     "desc": "RSI超买阈值"},
-            "bb_period":       {"type": "int",   "range": (5, 100),     "desc": "布林带周期"},
-            "bb_std":          {"type": "float", "range": (0.5, 5),     "desc": "布林带标准差"},
-            "macd_fast":       {"type": "int",   "range": (2, 50),      "desc": "MACD快线"},
-            "macd_slow":       {"type": "int",   "range": (5, 100),     "desc": "MACD慢线"},
-            "macd_signal":     {"type": "int",   "range": (2, 50),      "desc": "MACD信号线"},
-            "ema_period":      {"type": "int",   "range": (20, 500),    "desc": "EMA趋势周期"},
-            "vol_ma_period":   {"type": "int",   "range": (5, 100),     "desc": "成交量均线周期"},
-            "vol_multiplier":  {"type": "float", "range": (1.0, 5.0),   "desc": "成交量倍数"},
-            "use_adaptive":    {"type": "bool",  "range": None,         "desc": "自适应模式"},
-            "trend_filter":    {"type": "bool",  "range": None,         "desc": "趋势过滤"},
-            "volume_confirm":  {"type": "bool",  "range": None,         "desc": "成交量确认"},
+            "bar":                  {"type": "bar",   "range": None,         "desc": "K线周期"},
+            "use_adaptive":         {"type": "bool",  "range": None,         "desc": "自适应模式"},
+            "use_dynamic_grid":     {"type": "bool",  "range": None,         "desc": "动态网格"},
+            "use_trailing_entry":   {"type": "bool",  "range": None,         "desc": "追踪建仓"},
+            "trailing_entry_pct":   {"type": "pct",   "range": (0.001, 0.05), "desc": "追踪确认%"},
+            "use_trailing_stop":    {"type": "bool",  "range": None,         "desc": "追踪止损"},
+            "trend_filter":         {"type": "bool",  "range": None,         "desc": "趋势过滤"},
+            "volume_confirm":       {"type": "bool",  "range": None,         "desc": "成交量确认"},
+            "rsi_period":           {"type": "int",   "range": (2, 100),     "desc": "RSI周期"},
+            "rsi_oversold":         {"type": "float", "range": (5, 50),      "desc": "RSI超卖"},
+            "rsi_overbought":       {"type": "float", "range": (50, 95),     "desc": "RSI超买"},
+            "bb_period":            {"type": "int",   "range": (5, 100),     "desc": "布林带周期"},
+            "bb_std":               {"type": "float", "range": (0.5, 5),     "desc": "布林带标准差"},
+            "macd_fast":            {"type": "int",   "range": (2, 50),      "desc": "MACD快线"},
+            "macd_slow":            {"type": "int",   "range": (5, 100),     "desc": "MACD慢线"},
+            "macd_signal":          {"type": "int",   "range": (2, 50),      "desc": "MACD信号线"},
+            "ema_period":           {"type": "int",   "range": (20, 500),    "desc": "EMA趋势周期"},
+            "vol_ma_period":        {"type": "int",   "range": (5, 100),     "desc": "成交量均线"},
+            "vol_multiplier":       {"type": "float", "range": (1.0, 5.0),   "desc": "成交量倍数"},
         },
     },
     "risk": {
         "title": "风控参数",
         "params": {
-            "take_profit_pct": {"type": "pct",   "range": (0.001, 0.5), "desc": "止盈%"},
-            "stop_loss_pct":   {"type": "pct",   "range": (0.001, 0.5), "desc": "止损%"},
-            "trailing_pct":    {"type": "pct",   "range": (0.001, 0.5), "desc": "移动止盈回撤%"},
-            "use_trailing":    {"type": "bool",  "range": None,         "desc": "移动止盈开关"},
+            "take_profit_pct": {"type": "pct",   "range": (0.001, 0.5), "desc": "固定止盈%"},
+            "stop_loss_pct":   {"type": "pct",   "range": (0.001, 0.5), "desc": "固定止损%"},
+            "trailing_pct":    {"type": "pct",   "range": (0.001, 0.5), "desc": "固定回撤%"},
         },
     },
     "trade": {
         "title": "交易参数",
         "params": {
-            "maxSpend":        {"type": "float", "range": (1, 100000),  "desc": "单次金额USDT"},
+            "maxSpend": {"type": "float", "range": (1, 100000), "desc": "单次金额USDT"},
         },
     },
 }
@@ -211,19 +214,19 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
         return {"inst_id": inst_id, "status": "未初始化", "price": "-",
-                "score": "0/0", "pos": "0", "pnl": "0.0000", "regime": "-"}
+                "zone": "-", "pos": "0", "pnl": "0.0000", "regime": "-"}
 
     status = "🟢 监控中" if dip.running else "⏸ 已暂停"
     try:
-        forecast = await dip.get_signal_forecast()
-        if "error" in forecast:
-            score = "-"
+        f = await dip.get_signal_forecast()
+        if "error" in f:
+            zone = "-"
             regime = "-"
         else:
-            score = f"{forecast.get('current_score', 0):.0f}/{forecast.get('threshold', 0):.0f}"
-            regime = forecast.get("regime", "-")
+            zone = f.get("status", "-")
+            regime = f.get("regime", "-")
     except Exception:
-        score = "-"
+        zone = "-"
         regime = "-"
 
     regime_icon = {"trending": "📈 趋势", "ranging": "📊 震荡", "transitional": "🔄 过渡"}.get(regime, "-")
@@ -232,7 +235,7 @@ async def coin_getter(dialog_manager: DialogManager, **kwargs):
         "inst_id": inst_id,
         "status": status,
         "price": _last_price.get(inst_id, "-"),
-        "score": score,
+        "zone": zone,
         "pos": f"{dip.position:.6f}",
         "pnl": f"{dip.total_profit:+.4f}",
         "regime": regime_icon,
@@ -301,14 +304,14 @@ coin_panel_window = Window(
         "状态: {status}\n"
         "市场体制: {regime}\n"
         "当前价: {price}\n"
-        "信号评分: {score}\n"
+        "买入区域: {zone}\n"
         "持仓: {pos}\n"
         "已实现盈亏: {pnl} USDT"
     ),
     Column(
         Button(Const("▶️/⏸ 启停监控"), id="toggle", on_click=on_toggle_dip),
         Button(Const("📈 信号详情"), id="sig", on_click=on_signal_detail),
-        Button(Const("💰 持仓与挂单"), id="pos", on_click=on_position_detail),
+        Button(Const("💰 持仓"), id="pos", on_click=on_position_detail),
         Button(Const("⚙️ 参数设置"), id="params", on_click=on_params),
         Button(Const("🗑 删除此币种"), id="del", on_click=on_delete),
         Button(Const("🔙 返回主菜单"), id="back", on_click=lambda c, b, m: m.start(AppSG.menu)),
@@ -326,17 +329,12 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
         "inst_id": inst_id,
         "bar": "-",
         "status": "❌ 数据不足",
-        "bar_visual": "░" * 10,
-        "score": "0",
-        "threshold": "0",
+        "grid_line": "网格: -",
+        "distance_line": "距买入区: -",
         "rsi_line": "RSI: -",
-        "bb_line": "布林带下轨: -",
-        "macd_line": "MACD: -",
-        "vol_line": "成交量: -",
         "regime_line": "市场体制: -",
-        "batch_line": "分批止盈: -",
+        "trailing_line": "追踪建仓: 未激活",
         "blocker_text": "  无",
-        "est_text": "-",
     }
 
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
@@ -354,85 +352,43 @@ async def signal_getter(dialog_manager: DialogManager, **kwargs):
         empty["blocker_text"] = f"  {f['error']}"
         return empty
 
-    gap = f.get("gap", 0)
-    blockers = f.get("blockers", [])
-    if gap == 0 and not blockers:
-        status = "✅ 等待成交"
-    elif gap == 0:
-        status = "🟡 已满足有拦截"
-    elif gap <= 10:
-        status = "🔥 接近"
-    elif gap <= 25:
-        status = "⚡ 中等"
-    else:
-        status = "⏳ 等待"
-
-    score = f.get("current_score", 0)
-    threshold = f.get("threshold", 0)
-    pct = min(100, score / threshold * 100) if threshold > 0 else 0
-    filled = int(pct / 10)
-    bar = "█" * filled + "░" * (10 - filled)
-
+    status = f.get("status", "-")
+    price = f.get("price", 0)
+    grid_lower = f.get("grid_lower", 0)
+    grid_upper = f.get("grid_upper", 0)
+    spacing = f.get("spacing_pct", 0)
+    distance = f.get("distance_to_buy", 0)
     rsi = f.get("rsi")
-    rsi_th = f.get("rsi_threshold", 30)
-    rsi_gap = f.get("rsi_gap", 0)
-    if rsi is not None:
-        rsi_line = f"RSI: {rsi:.1f} (阈值<{rsi_th:.1f})" + (f" 差 {rsi_gap:.1f}" if rsi_gap > 0 else " ✅")
-    else:
-        rsi_line = "RSI: -"
-
-    bb_lower = f.get("bb_lower")
-    bb_gap = f.get("bb_gap_pct")
-    if bb_lower is not None and bb_gap is not None:
-        bb_line = f"布林带下轨: {bb_lower:.4f}" + (f" (差{bb_gap:.2f}%)" if bb_gap > 0 else " ✅")
-    elif bb_lower is not None:
-        bb_line = f"布林带下轨: {bb_lower:.4f}"
-    else:
-        bb_line = "布林带下轨: -"
-
-    macd_line = "MACD: ✅ 金叉" if f.get("macd_ok") else "MACD: ❌ 未金叉"
-
-    vol_ratio = f.get("vol_ratio")
-    vol_line = f"成交量: {vol_ratio:.2f}x" if vol_ratio is not None else "成交量: -"
-
     regime = f.get("regime", "unknown")
-    regime_icon = {"trending": "📈 趋势市", "ranging": "📊 震荡市", "transitional": "🔄 过渡期"}.get(regime, "❓ 未知")
-    adx_val = f.get("adx", 0)
-    regime_line = f"市场体制: {regime_icon} (ADX: {adx_val:.1f})" if adx_val else f"市场体制: {regime_icon}"
+    atr = f.get("atr", 0)
+    blockers = f.get("blockers", [])
+    trailing_active = f.get("trailing_entry_active", False)
+    trailing_low = f.get("trailing_entry_low", 0)
 
-    batch_count = f.get("batch_tp_triggered", 0)
-    batch_line = f"分批止盈: 已触发 {batch_count}/3 档" if batch_count > 0 else "分批止盈: 未触发"
+    grid_line = f"网格: {grid_lower:.4f} — {grid_upper:.4f} (间距{spacing:.2f}%)"
+    distance_line = f"距买入区: {distance:+.2f}%" if distance > 0 else "距买入区: ✅ 已在区域内"
+    rsi_line = f"RSI: {rsi:.1f}" if rsi is not None else "RSI: -"
+
+    regime_icon = {"trending": "📈 趋势", "ranging": "📊 震荡", "transitional": "🔄 过渡"}.get(regime, "❓")
+    regime_line = f"市场体制: {regime_icon} | ATR: {atr:.4f}"
+
+    if trailing_active:
+        trailing_line = f"追踪建仓: 🟡 跟踪低点 {trailing_low:.4f}，等反弹确认"
+    else:
+        trailing_line = "追踪建仓: 未激活"
 
     blocker_text = "\n".join(f"  · {b}" for b in blockers) if blockers else "  无"
-
-    est = f.get("estimated_minutes")
-    if est is not None and est > 0:
-        if est < 60:
-            est_text = f"约 {est} 分钟"
-        elif est < 1440:
-            est_text = f"约 {est/60:.1f} 小时"
-        else:
-            est_text = f"约 {est/1440:.1f} 天"
-    elif gap == 0:
-        est_text = "评分已达标"
-    else:
-        est_text = "暂无趋势"
 
     return {
         "inst_id": inst_id,
         "bar": f.get("bar", "15m"),
         "status": status,
-        "bar_visual": bar,
-        "score": f"{score:.0f}",
-        "threshold": f"{threshold:.0f}",
+        "grid_line": grid_line,
+        "distance_line": distance_line,
         "rsi_line": rsi_line,
-        "bb_line": bb_line,
-        "macd_line": macd_line,
-        "vol_line": vol_line,
         "regime_line": regime_line,
-        "batch_line": batch_line,
+        "trailing_line": trailing_line,
         "blocker_text": blocker_text,
-        "est_text": est_text,
     }
 
 
@@ -441,17 +397,14 @@ signal_window = Window(
         "📈 <b>{inst_id} 信号详情</b> [{bar}]\n"
         "━━━━━━━━━━━━━━━\n"
         "状态: {status}\n"
-        "评分: [{bar_visual}] {score}/{threshold}\n"
         "━━━━━━━━━━━━━━━\n"
-        "{regime_line}\n"
+        "{grid_line}\n"
+        "{distance_line}\n"
         "{rsi_line}\n"
-        "{bb_line}\n"
-        "{macd_line}\n"
-        "{vol_line}\n"
-        "{batch_line}\n"
+        "{regime_line}\n"
+        "{trailing_line}\n"
         "━━━━━━━━━━━━━━━\n"
-        "⚠️ 拦截原因:\n{blocker_text}\n"
-        "⏱ 预估: {est_text}"
+        "⚠️ 拦截原因:\n{blocker_text}"
     ),
     Column(
         Back(Const("🔙 返回币种面板")),
@@ -462,15 +415,15 @@ signal_window = Window(
 )
 
 
-# ==================== 持仓详情（市价单版本） ====================
+# ==================== 持仓详情 ====================
 async def position_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
         return {
             "inst_id": inst_id, "pos": "0", "avg": "-", "peak": "-", "price": "-",
-            "pending_buy": "市价单", "pending_sell": "市价单", "realized": "0",
-            "fee": "0", "pnl_line": "浮动盈亏: -", "batch_line": "分批止盈: 未触发",
+            "realized": "0", "fee": "0", "pnl_line": "浮动盈亏: -",
+            "batch_line": "分批止盈: 未触发", "trailing_line": "追踪止损: 未激活",
         }
 
     s = dip.snapshot()
@@ -488,18 +441,23 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
     batch_count = s.get("batch_tp_triggered", 0)
     batch_line = f"分批止盈已触发: {batch_count}/3 档" if batch_count > 0 else "分批止盈: 未触发"
 
+    # 追踪止损状态
+    if hasattr(dip, "trailing_stop") and dip.trailing_stop.trailing_active:
+        trailing_line = "追踪止损: 🟢 已激活"
+    else:
+        trailing_line = "追踪止损: 未激活"
+
     return {
         "inst_id": inst_id,
         "pos": f"{pos:.6f}",
         "avg": f"{avg:.6f}" if avg > 0 else "-",
         "peak": f"{peak:.6f}" if peak > 0 else "-",
         "price": price,
-        "pending_buy": "市价单（即时成交）",
-        "pending_sell": "市价单（即时成交）",
         "realized": f"{s.get('total_profit', 0):+.4f}",
         "fee": f"{s.get('total_fee', 0):.4f}",
         "pnl_line": pnl_line,
         "batch_line": batch_line,
+        "trailing_line": trailing_line,
     }
 
 
@@ -513,9 +471,7 @@ position_window = Window(
         "最高价: {peak}\n"
         "{pnl_line}\n"
         "{batch_line}\n"
-        "━━━━━━━━━━━━━━━\n"
-        "买入方式: {pending_buy}\n"
-        "卖出方式: {pending_sell}\n"
+        "{trailing_line}\n"
         "━━━━━━━━━━━━━━━\n"
         "已实现盈亏: {realized} USDT\n"
         "累计手续费: {fee} USDT"
@@ -538,9 +494,9 @@ async def params_getter(dialog_manager: DialogManager, **kwargs):
 
     is_adaptive = dip.params.get("use_adaptive", True)
     if is_adaptive:
-        mode_text = "🔵 当前为自适应模式\n下方参数为【备用】值，仅在关闭自适应时生效"
+        mode_text = "🔵 自适应模式\n动态网格 + 追踪建仓 + 追踪止损"
     else:
-        mode_text = "🟠 当前为固定参数模式\n下方参数直接生效"
+        mode_text = "🟠 固定参数模式"
 
     items = []
     for group_key, group in PARAM_GROUPS.items():
