@@ -56,7 +56,6 @@ async def on_risk_event(event: RiskEvent):
             await dlg.MANAGER.stop_all_strategies(iid)
 
 
-# ==================== 鉴权 ====================
 def _allowed(user_id: int) -> bool:
     return (not TG_ALLOWED_IDS) or (user_id in TG_ALLOWED_IDS)
 
@@ -181,37 +180,34 @@ async def cmd_signals(msg: Message):
             lines.append(f"\n{iid}: {f['error']}")
             continue
 
-        gap = f.get("gap", 0)
-        blockers = f.get("blockers", [])
-        if gap == 0 and not blockers:
-            icon = "✅"
-        elif gap == 0:
-            icon = "🟡"
-        elif gap <= 10:
-            icon = "🔥"
-        elif gap <= 25:
-            icon = "⚡"
-        else:
-            icon = "⏳"
-
-        score = f.get("current_score", 0)
-        threshold = f.get("threshold", 0)
-        pct = min(100, score / threshold * 100) if threshold > 0 else 0
-        filled = int(pct / 10)
-        bar = "█" * filled + "░" * (10 - filled)
-
+        status = f.get("status", "-")
+        price = f.get("price", 0)
+        grid_lower = f.get("grid_lower", 0)
+        grid_upper = f.get("grid_upper", 0)
+        spacing = f.get("spacing_pct", 0)
+        distance = f.get("distance_to_buy", 0)
+        rsi = f.get("rsi")
         regime = f.get("regime", "unknown")
-        regime_icon = {"trending": "📈", "ranging": "📊", "transitional": "🔄"}.get(regime, "❓")
+        atr = f.get("atr", 0)
+        blockers = f.get("blockers", [])
+        trailing_active = f.get("trailing_entry_active", False)
+        trailing_low = f.get("trailing_entry_low", 0)
 
-        lines.append(f"\n{icon} {iid} [{f.get('bar', '15m')}] {regime_icon}")
-        lines.append(f"  评分: [{bar}] {score:.0f}/{threshold:.0f}")
-        if f.get("rsi") is not None:
-            lines.append(f"  RSI: {f['rsi']:.1f}")
-        if f.get("bb_gap_pct") is not None:
-            lines.append(f"  距BB下轨: {f['bb_gap_pct']:.2f}%")
-        lines.append(f"  MACD: {'✅' if f.get('macd_ok') else '❌'}")
-        if f.get("batch_tp_triggered", 0) > 0:
-            lines.append(f"  分批止盈已触发: {f['batch_tp_triggered']}/3")
+        regime_icon = {"trending": "📈趋势", "ranging": "📊震荡", "transitional": "🔄过渡"}.get(regime, "❓")
+
+        lines.append(f"\n{status} {iid} [{f.get('bar', '15m')}] {regime_icon}")
+        lines.append(f"  价格: {price}")
+        lines.append(f"  网格: {grid_lower:.2f} — {grid_upper:.2f} (间距{spacing:.2f}%)")
+        if distance > 0:
+            lines.append(f"  距买入区: +{distance:.2f}%")
+        else:
+            lines.append(f"  距买入区: ✅ 已在区域内")
+        if rsi is not None:
+            lines.append(f"  RSI: {rsi:.1f}")
+        lines.append(f"  ATR: {atr:.4f}")
+
+        if trailing_active:
+            lines.append(f"  ⚠️ 追踪建仓中（低点 {trailing_low:.4f}，等待反弹确认）")
         for b in blockers:
             lines.append(f"  ⚠️ {b}")
 
@@ -391,11 +387,9 @@ async def cmd_set(msg: Message):
     if len(parts) < 4:
         await msg.answer(
             "用法: /set <币种> <参数名> <值>\n"
-            "示例: /set BTC-USDT rsi_oversold 35\n"
-            "可用参数: bar, rsi_period, rsi_oversold, rsi_overbought, bb_period, bb_std, "
-            "macd_fast, macd_slow, macd_signal, ema_period, vol_ma_period, vol_multiplier, "
-            "maxSpend, take_profit_pct, stop_loss_pct, trailing_pct, "
-            "use_adaptive, trend_filter, use_trailing, volume_confirm"
+            "示例: /set BTC-USDT trailing_entry_pct 0.5\n"
+            "可用参数: bar, use_dynamic_grid, use_trailing_entry, trailing_entry_pct, "
+            "use_trailing_stop, trend_filter, volume_confirm, maxSpend 等"
         )
         return
 
@@ -408,10 +402,10 @@ async def cmd_set(msg: Message):
         await msg.answer(f"{inst_id} 不在监控中")
         return
 
-    pct_keys = {"take_profit_pct", "stop_loss_pct", "trailing_pct"}
+    pct_keys = {"take_profit_pct", "stop_loss_pct", "trailing_pct", "trailing_entry_pct"}
     int_keys = {"rsi_period", "bb_period", "macd_fast", "macd_slow", "macd_signal", "ema_period", "vol_ma_period"}
     float_keys = {"rsi_oversold", "rsi_overbought", "bb_std", "vol_multiplier", "maxSpend"}
-    bool_keys = {"use_adaptive", "trend_filter", "use_trailing", "volume_confirm"}
+    bool_keys = {"use_adaptive", "use_dynamic_grid", "use_trailing_entry", "use_trailing_stop", "trend_filter", "volume_confirm"}
 
     try:
         if key == "bar":
@@ -484,16 +478,12 @@ async def cmd_signal_params(msg: Message):
         lines.append(
             f"\n{iid}\n"
             f"  K线周期: {p.get('bar', '15m')}\n"
-            f"  自适应: {'开' if p.get('use_adaptive', True) else '关'}\n"
+            f"  动态网格: {'开' if p.get('use_dynamic_grid', True) else '关'}\n"
+            f"  追踪建仓: {'开' if p.get('use_trailing_entry', True) else '关'} ({p.get('trailing_entry_pct', 0.002)*100:.2f}%)\n"
+            f"  追踪止损: {'开' if p.get('use_trailing_stop', True) else '关'}\n"
             f"  市场体制: {s.get('regime', '-')}\n"
             f"  ADX: {s.get('adx', 0):.1f}\n"
-            f"  RSI: {p.get('rsi_period', 14)}周期, 超卖<{p.get('rsi_oversold', 30)}, 超买>{p.get('rsi_overbought', 70)}\n"
-            f"  BB: {p.get('bb_period', 20)}周期, {p.get('bb_std', 2.0)}标准差\n"
-            f"  MACD: {p.get('macd_fast', 12)}/{p.get('macd_slow', 26)}/{p.get('macd_signal', 9)}\n"
-            f"  EMA: {p.get('ema_period', 200)}\n"
-            f"  单次金额: {p.get('maxSpend', 100)} USDT\n"
-            f"  止盈: {p.get('take_profit_pct', 0.03)*100:.2f}% | 止损: {p.get('stop_loss_pct', 0.05)*100:.2f}%\n"
-            f"  移动止盈: {'开' if p.get('use_trailing', True) else '关'} {p.get('trailing_pct', 0.02)*100:.2f}%"
+            f"  单次金额: {p.get('maxSpend', 100)} USDT"
         )
     await msg.answer("\n".join(lines))
 
