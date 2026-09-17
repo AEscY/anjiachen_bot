@@ -52,7 +52,7 @@ class StrategyManager:
         self.dips[inst_id] = DipSellStrategy(inst_id)
         self._inst_ids.append(inst_id)
 
-        # 从 Neon 恢复状态
+        # 从 Neon 恢复状态（只恢复持仓相关，市价单无挂单）
         saved = await self.state_store.load_strategy(inst_id)
         if saved:
             dip = self.dips[inst_id]
@@ -63,8 +63,6 @@ class StrategyManager:
             dip.total_fee = saved.get("total_fee", 0.0)
             dip.trade_count = saved.get("trade_count", 0)
             dip._last_action = saved.get("last_action")
-            dip._pending_buy_ord_id = saved.get("pending_buy") or None
-            dip._pending_sell_ord_id = saved.get("pending_sell") or None
             if saved.get("batch_tp_triggered"):
                 dip._batch_tp_triggered = set(saved["batch_tp_triggered"])
             logger.info(f"{inst_id} 从 Neon 恢复状态: pos={dip.position}")
@@ -107,7 +105,6 @@ class StrategyManager:
                 logger.error(f"{inst_id} 持仓同步失败: {e}")
 
     async def start_periodic_save(self, interval=60):
-        """每60秒自动保存一次到 Neon"""
         async def _loop():
             while True:
                 await asyncio.sleep(interval)
