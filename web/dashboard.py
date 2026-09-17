@@ -50,14 +50,12 @@ class Dashboard:
         data = []
         for iid in self._manager.all_inst_ids():
             d = self._manager.dips.get(iid)
-            if d and (d.position > 0 or d._pending_buy_ord_id or d._pending_sell_ord_id):
+            if d and d.position > 0:
                 data.append({
                     "inst_id": iid,
                     "position": d.position,
                     "avg_buy_price": d.avg_buy_price,
                     "peak_price": d.peak_price,
-                    "pending_buy": d._pending_buy_ord_id,
-                    "pending_sell": d._pending_sell_ord_id,
                 })
         return web.json_response(data)
 
@@ -69,7 +67,7 @@ class Dashboard:
             d = self._manager.dips.get(iid)
             if d:
                 try:
-                    status = await d.get_signal_status()
+                    status = await d.get_signal_forecast()
                     data.append(status)
                 except Exception:
                     pass
