@@ -218,8 +218,11 @@ async def cmd_positions(msg: Message):
     if not dlg.MANAGER:
         await msg.answer("未初始化")
         return
+
+    rest = OKXRest()
     lines = ["💰 持仓总览"]
     has_any = False
+
     for iid in dlg.MANAGER.all_inst_ids():
         dip = dlg.MANAGER.dips.get(iid)
         if not dip:
@@ -229,11 +232,21 @@ async def cmd_positions(msg: Message):
         if pos <= 0:
             continue
         has_any = True
+
+        # ===== 强制从OKX API拉取实时价格 =====
+        real_price = _last_price.get(iid, 0)
+        try:
+            ticker_resp = await asyncio.to_thread(rest.get_ticker, iid)
+            if ticker_resp.get("code") == "0" and ticker_resp.get("data"):
+                real_price = float(ticker_resp["data"][0]["last"])
+        except Exception:
+            pass
+
         avg = s.get("avg_buy_price", 0)
-        price = _last_price.get(iid, 0)
-        profit_pct = (price - avg) / avg * 100 if avg > 0 and price else 0
+        profit_pct = (real_price - avg) / avg * 100 if avg > 0 and real_price else 0
+
         lines.append(f"\n{iid}")
-        lines.append(f"  当前价: {price}")
+        lines.append(f"  当前价: {real_price}")
         lines.append(f"  持仓: {pos:.6f}")
         if avg > 0:
             lines.append(f"  均价: {avg:.6f}")
@@ -242,6 +255,7 @@ async def cmd_positions(msg: Message):
         batch = s.get("batch_tp_triggered", 0)
         if batch > 0:
             lines.append(f"  分批止盈: 已触发 {batch}/3 档")
+
     if not has_any:
         lines.append("\n暂无持仓。")
     await msg.answer("\n".join(lines))
