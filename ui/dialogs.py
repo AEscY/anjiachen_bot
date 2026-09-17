@@ -54,7 +54,6 @@ PARAM_GROUPS = {
         "title": "交易参数",
         "params": {
             "maxSpend":        {"type": "float", "range": (1, 100000),  "desc": "单次金额USDT"},
-            "limit_offset_pct":{"type": "pct",   "range": (0.001, 0.5), "desc": "限价偏移%"},
         },
     },
 }
@@ -463,14 +462,14 @@ signal_window = Window(
 )
 
 
-# ==================== 持仓详情 ====================
+# ==================== 持仓详情（市价单版本） ====================
 async def position_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
         return {
             "inst_id": inst_id, "pos": "0", "avg": "-", "peak": "-", "price": "-",
-            "pending_buy": "无", "pending_sell": "无", "realized": "0",
+            "pending_buy": "市价单", "pending_sell": "市价单", "realized": "0",
             "fee": "0", "pnl_line": "浮动盈亏: -", "batch_line": "分批止盈: 未触发",
         }
 
@@ -478,8 +477,6 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
     pos = s.get("position", 0)
     avg = s.get("avg_buy_price", 0)
     peak = s.get("peak_price", 0)
-    pb = s.get("pending_buy") or "无"
-    ps = s.get("pending_sell") or "无"
 
     price = _last_price.get(inst_id, 0)
     if pos > 0 and avg > 0:
@@ -497,8 +494,8 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
         "avg": f"{avg:.6f}" if avg > 0 else "-",
         "peak": f"{peak:.6f}" if peak > 0 else "-",
         "price": price,
-        "pending_buy": pb,
-        "pending_sell": ps,
+        "pending_buy": "市价单（即时成交）",
+        "pending_sell": "市价单（即时成交）",
         "realized": f"{s.get('total_profit', 0):+.4f}",
         "fee": f"{s.get('total_fee', 0):.4f}",
         "pnl_line": pnl_line,
@@ -508,7 +505,7 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
 
 position_window = Window(
     Format(
-        "💰 <b>{inst_id} 持仓与挂单</b>\n"
+        "💰 <b>{inst_id} 持仓</b>\n"
         "━━━━━━━━━━━━━━━\n"
         "当前价: {price}\n"
         "持仓: {pos}\n"
@@ -517,8 +514,8 @@ position_window = Window(
         "{pnl_line}\n"
         "{batch_line}\n"
         "━━━━━━━━━━━━━━━\n"
-        "挂单买入: {pending_buy}\n"
-        "挂单卖出: {pending_sell}\n"
+        "买入方式: {pending_buy}\n"
+        "卖出方式: {pending_sell}\n"
         "━━━━━━━━━━━━━━━\n"
         "已实现盈亏: {realized} USDT\n"
         "累计手续费: {fee} USDT"
