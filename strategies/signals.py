@@ -64,12 +64,16 @@ def _atr_series(highs, lows, closes, period=14):
     n = len(closes)
     tr = np.full(n, np.nan)
     for i in range(1, n):
-        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
     atr = np.full(n, np.nan)
     if n > period:
-        atr[period] = np.mean(tr[1:period+1])
-        for i in range(period+1, n):
-            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+        atr[period] = np.mean(tr[1:period + 1])
+        for i in range(period + 1, n):
+            atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
     return atr
 
 
@@ -77,30 +81,40 @@ def _adx_series(highs, lows, closes, period=14):
     n = len(closes)
     if n < period + 1:
         return np.full(n, np.nan)
+
     tr = np.full(n, np.nan)
     plus_dm = np.full(n, np.nan)
     minus_dm = np.full(n, np.nan)
+
     for i in range(1, n):
-        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        up_move = highs[i] - highs[i-1]
-        down_move = lows[i-1] - lows[i]
+        tr[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
         plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
         minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+
     atr = np.full(n, np.nan)
     plus_di = np.full(n, np.nan)
     minus_di = np.full(n, np.nan)
+
     if n > period:
-        atr[period] = np.mean(tr[1:period+1])
-        smooth_plus = np.mean(plus_dm[1:period+1])
-        smooth_minus = np.mean(minus_dm[1:period+1])
+        atr[period] = np.mean(tr[1:period + 1])
+        smooth_plus = np.mean(plus_dm[1:period + 1])
+        smooth_minus = np.mean(minus_dm[1:period + 1])
         plus_di[period] = 100.0 * smooth_plus / atr[period] if atr[period] > 0 else 0
         minus_di[period] = 100.0 * smooth_minus / atr[period] if atr[period] > 0 else 0
-        for i in range(period+1, n):
-            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+
+        for i in range(period + 1, n):
+            atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
             smooth_plus = (smooth_plus * (period - 1) + plus_dm[i]) / period
             smooth_minus = (smooth_minus * (period - 1) + minus_dm[i]) / period
             plus_di[i] = 100.0 * smooth_plus / atr[i] if atr[i] > 0 else 0
             minus_di[i] = 100.0 * smooth_minus / atr[i] if atr[i] > 0 else 0
+
     dx = np.full(n, np.nan)
     for i in range(period, n):
         di_sum = plus_di[i] + minus_di[i]
@@ -108,11 +122,12 @@ def _adx_series(highs, lows, closes, period=14):
             dx[i] = 100.0 * abs(plus_di[i] - minus_di[i]) / di_sum
         else:
             dx[i] = 0.0
+
     adx = np.full(n, np.nan)
     if n > 2 * period:
-        adx[2*period] = np.mean(dx[period+1:2*period+1])
-        for i in range(2*period+1, n):
-            adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+        adx[2 * period] = np.mean(dx[period + 1:2 * period + 1])
+        for i in range(2 * period + 1, n):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
     return adx
 
 
@@ -139,69 +154,141 @@ class SignalEngine:
         l = np.array(lows, dtype=float)
         v = np.array(volumes, dtype=float)
         result = {}
+
         rsi = _rsi_series(c, self.rsi_period)
         result["rsi"] = float(rsi[-1]) if not np.isnan(rsi[-1]) else None
+
         upper, middle, lower = _bbands(c, self.bb_period, self.bb_std)
         result["bb_upper"] = float(upper[-1]) if not np.isnan(upper[-1]) else None
         result["bb_middle"] = float(middle[-1]) if not np.isnan(middle[-1]) else None
         result["bb_lower"] = float(lower[-1]) if not np.isnan(lower[-1]) else None
+
         macd_line, signal_line, hist = _macd(c, self.macd_fast, self.macd_slow, self.macd_signal)
         result["macd"] = float(macd_line[-1]) if not np.isnan(macd_line[-1]) else None
         result["macd_signal"] = float(signal_line[-1]) if not np.isnan(signal_line[-1]) else None
         result["macd_hist"] = float(hist[-1]) if not np.isnan(hist[-1]) else None
         result["macd_hist_prev"] = float(hist[-2]) if len(hist) >= 2 and not np.isnan(hist[-2]) else None
+
         if len(c) >= self.ema_period:
             ema = _ema_series(c, self.ema_period)
             result["ema"] = float(ema[-1])
         else:
             result["ema"] = None
+
         if len(v) >= self.vol_ma_period:
             vol_ma = np.mean(v[-self.vol_ma_period:])
             result["vol_ma"] = float(vol_ma)
         else:
             result["vol_ma"] = None
+
         atr = _atr_series(h, l, c, self.atr_period)
         result["atr"] = float(atr[-1]) if not np.isnan(atr[-1]) else None
+
         adx = _adx_series(h, l, c, self.adx_period)
         result["adx"] = float(adx[-1]) if not np.isnan(adx[-1]) else None
+
         result["volume"] = float(v[-1])
         result["close"] = float(c[-1])
         return result
 
-    def buy_signal(self, ind):
-        """放宽条件：满足任一即可触发买入"""
-        if ind.get("rsi") is None or ind.get("bb_lower") is None:
-            return False
-        # 条件1：均值回归
-        mean_reversion = (ind["rsi"] < 45) or (ind["close"] <= ind["bb_lower"])
-        # 条件2：趋势回调（价格在布林带中轨附近，且RSI有回升迹象）
-        trend_pullback = False
-        if ind.get("bb_middle") and ind.get("macd_hist_prev") is not None:
-            trend_pullback = (ind["close"] <= ind["bb_middle"] * 1.01) and (ind["macd_hist"] > ind["macd_hist_prev"])
-        # 条件3：成交量确认（放量）
-        volume_confirm = False
-        if ind.get("vol_ma") and ind.get("volume"):
-            volume_confirm = ind["volume"] > ind["vol_ma"] * 1.2
-        return mean_reversion or trend_pullback or volume_confirm
 
-    def sell_signal(self, ind):
+class ScoreEngine:
+    """多因子评分引擎（供 dip_sell 使用）"""
+
+    def __init__(self, config=None):
+        cfg = config or {}
+        self.rsi_oversold = cfg.get("rsi_oversold", 30)
+        self.rsi_overbought = cfg.get("rsi_overbought", 70)
+        self.sell_threshold = cfg.get("sell_threshold", 70)
+
+    def buy_score(self, ind):
         if ind.get("rsi") is None:
-            return False
-        return ind["rsi"] > self.rsi_overbought
+            return 0.0
+        score = 0.0
+        rsi = ind["rsi"]
+        os_th = self.rsi_oversold
+        # RSI 30 分：<超卖阈值满分，+10 内线性衰减
+        if rsi <= os_th:
+            score += 30.0
+        elif rsi <= os_th + 10:
+            score += 30.0 * (1.0 - (rsi - os_th) / 10.0)
+        # 布林带 25 分：跌破下轨满分，1.5% 内线性衰减
+        price = ind.get("close")
+        bb_lower = ind.get("bb_lower")
+        if price and bb_lower and bb_lower > 0:
+            dev = (price - bb_lower) / bb_lower
+            if dev <= 0:
+                score += 25.0
+            elif dev <= 0.015:
+                score += 25.0 * (1.0 - dev / 0.015)
+        # MACD 20 分
+        hist = ind.get("macd_hist")
+        prev = ind.get("macd_hist_prev")
+        if hist is not None and prev is not None:
+            if hist > 0 and prev <= 0:
+                score += 20.0
+            elif hist > 0:
+                score += 10.0
+            elif hist > prev:
+                score += 5.0
+        # 成交量 15 分
+        vol = ind.get("volume")
+        vol_ma = ind.get("vol_ma")
+        if vol and vol_ma and vol_ma > 0:
+            ratio = vol / vol_ma
+            if ratio >= 1.5:
+                score += 15.0
+            elif ratio >= 1.0:
+                score += 15.0 * (ratio - 1.0) / 0.5
+        # 趋势 10 分
+        price = ind.get("close")
+        ema = ind.get("ema")
+        if price and ema and price > ema:
+            score += 10.0
+        return min(score, 100.0)
+
+    def sell_score(self, ind):
+        if ind.get("rsi") is None:
+            return 0.0
+        score = 0.0
+        rsi = ind["rsi"]
+        ob_th = self.rsi_overbought
+        if rsi >= ob_th:
+            score += 35.0
+        elif rsi >= ob_th - 10:
+            score += 35.0 * (1.0 - (ob_th - rsi) / 10.0)
+        price = ind.get("close")
+        bb_upper = ind.get("bb_upper")
+        if price and bb_upper and bb_upper > 0:
+            dev = (bb_upper - price) / bb_upper
+            if dev <= 0:
+                score += 30.0
+            elif dev <= 0.01:
+                score += 30.0 * (1.0 - dev / 0.01)
+        macd = ind.get("macd")
+        macd_sig = ind.get("macd_signal")
+        if macd is not None and macd_sig is not None:
+            if macd < macd_sig:
+                score += 35.0
+        return min(score, 100.0)
 
 
 class AdaptiveEngine:
     def __init__(self):
         self.volatility = 0.02
+        self.trend_strength = 0.0
         self.atr = 0.0
         self.adx = 0.0
         self.rsi_oversold = 30.0
         self.rsi_overbought = 70.0
+        self.bb_std = 2.0
         self.stop_loss_pct = 0.05
         self.take_profit_pct = 0.03
         self.trailing_pct = 0.02
         self.buy_threshold = 60.0
+        self.sell_threshold = 70.0
         self.regime = "unknown"
+        self.use_trend_filter = True
 
     def update(self, closes, highs, lows):
         n = len(closes)
@@ -210,9 +297,10 @@ class AdaptiveEngine:
         c = np.array(closes, dtype=float)
         h = np.array(highs, dtype=float)
         l = np.array(lows, dtype=float)
+
         trs = []
         for i in range(1, n):
-            tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+            tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
             trs.append(tr)
         period = min(14, len(trs))
         atr = float(np.mean(trs[-period:]))
@@ -222,21 +310,37 @@ class AdaptiveEngine:
         self.atr = atr
         vol = atr / price
         self.volatility = vol
+
+        if n >= 60:
+            ema = _ema_series(c, 60)
+            if ema[-15] > 0:
+                self.trend_strength = (ema[-1] - ema[-15]) / ema[-15]
+
         if n >= 30:
             adx_series = _adx_series(h, l, c, 14)
             if not np.isnan(adx_series[-1]):
                 self.adx = float(adx_series[-1])
                 if self.adx > 25:
                     self.regime = "trending"
+                    self.use_trend_filter = True
+                    self.buy_threshold = 65.0
                 elif self.adx < 20:
                     self.regime = "ranging"
+                    self.use_trend_filter = False
+                    self.buy_threshold = 40.0
                 else:
                     self.regime = "transitional"
+                    self.use_trend_filter = True
+                    self.buy_threshold = 55.0
+
         self.stop_loss_pct = max(0.02, min(0.15, atr * 2.0 / price))
         self.take_profit_pct = max(0.02, min(0.12, atr * 3.0 / price))
         self.trailing_pct = max(0.01, min(0.08, atr * 1.5 / price))
+
         self.rsi_oversold = max(20.0, min(40.0, 30.0 + (0.02 - vol) * 500.0))
         self.rsi_overbought = max(60.0, min(80.0, 70.0 - (0.02 - vol) * 500.0))
+
+        self.bb_std = max(1.5, min(3.0, 2.0 + (vol - 0.02) * 50.0))
 
     def snapshot(self):
         return {
@@ -244,9 +348,13 @@ class AdaptiveEngine:
             "atr": self.atr,
             "adx": self.adx,
             "regime": self.regime,
+            "trend_strength": self.trend_strength,
+            "rsi_oversold": self.rsi_oversold,
+            "rsi_overbought": self.rsi_overbought,
+            "bb_std": self.bb_std,
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
             "trailing_pct": self.trailing_pct,
-            "rsi_oversold": self.rsi_oversold,
-            "rsi_overbought": self.rsi_overbought,
+            "buy_threshold": self.buy_threshold,
+            "use_trend_filter": self.use_trend_filter,
         }
