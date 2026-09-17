@@ -170,11 +170,6 @@ class SignalEngine:
 
 
 class DynamicGridEngine:
-    """
-    动态网格引擎：根据ATR实时计算网格间距和区间。
-    参考 grid-pilot 和 tingxifa/okx-grid-bot 的动态网格调整思路。
-    """
-
     def __init__(self):
         self.atr = 0.0
         self.atr_ma = 0.0
@@ -190,34 +185,27 @@ class DynamicGridEngine:
         c = np.array(closes, dtype=float)
         h = np.array(highs, dtype=float)
         l = np.array(lows, dtype=float)
-
         atr_series = _atr_series(h, l, c, 14)
         if np.isnan(atr_series[-1]):
             return
         self.atr = float(atr_series[-1])
-
-        # ATR均值用于平滑
         valid_atrs = atr_series[~np.isnan(atr_series)]
         if len(valid_atrs) >= 20:
             self.atr_ma = float(np.mean(valid_atrs[-20:]))
         else:
             self.atr_ma = self.atr
-
         price = float(c[-1])
         if price <= 0:
             return
-
-        # 网格间距 = 0.5 × ATR / 价格（动态，随波动率缩放）
         self.spacing = 0.5 * self.atr / price
         self.spacing = max(0.003, min(0.03, self.spacing))
 
-        # 网格区间 = 当前价 ± 2 × ATR
+        # ====== 修复点：将下限从 2% 降至 0.5%，尊重真实的波动率 ======
         atr_pct = self.atr / price
-        half_range = max(0.02, min(0.10, 2.0 * atr_pct))
+        half_range = max(0.005, min(0.10, 2.0 * atr_pct))
         self.lower = price * (1 - half_range)
         self.upper = price * (1 + half_range)
 
-        # 市场体制
         adx_series = _adx_series(h, l, c, 14)
         if not np.isnan(adx_series[-1]):
             adx = float(adx_series[-1])
@@ -230,11 +218,6 @@ class DynamicGridEngine:
 
 
 class TrailingStopEngine:
-    """
-    追踪止损引擎：ATR动态追踪止损 + 分批止盈。
-    参考 NexusQuant 的 ATR 自适应止损和 R-Multiple 分批止盈。
-    """
-
     def __init__(self):
         self.atr = 0.0
         self.trailing_distance = 0.0
@@ -250,35 +233,23 @@ class TrailingStopEngine:
         return 1.5 * self.atr / price
 
     def check_trailing_stop(self, price, avg_buy_price):
-        """返回触发原因或None"""
         if avg_buy_price <= 0:
             return None
-
         profit_pct = (price - avg_buy_price) / avg_buy_price
         if profit_pct <= 0:
             return None
-
         if price > self.peak_price:
             self.peak_price = price
-
         trailing_dist = self.calc_trailing_distance(price)
         drawdown = (self.peak_price - price) / self.peak_price
-
-        # 盈利超过0.5%后激活追踪
         if profit_pct > 0.005:
             self.trailing_active = True
-
         if self.trailing_active and drawdown >= trailing_dist:
             return f"追踪止损(回撤{drawdown*100:.2f}%)"
-
         return None
 
 
 class AdaptiveEngine:
-    """
-    自适应引擎：结合动态网格、追踪止损和市场体制。
-    """
-
     def __init__(self):
         self.volatility = 0.02
         self.atr = 0.0
@@ -296,7 +267,6 @@ class AdaptiveEngine:
         c = np.array(closes, dtype=float)
         h = np.array(highs, dtype=float)
         l = np.array(lows, dtype=float)
-
         trs = []
         for i in range(1, n):
             tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
@@ -309,7 +279,6 @@ class AdaptiveEngine:
         self.atr = atr
         vol = atr / price
         self.volatility = vol
-
         adx_series = _adx_series(h, l, c, 14)
         if not np.isnan(adx_series[-1]):
             self.adx = float(adx_series[-1])
@@ -322,8 +291,6 @@ class AdaptiveEngine:
             else:
                 self.regime = "transitional"
                 self.use_trend_filter = True
-
-        # ATR动态止损止盈
         self.stop_loss_pct = max(0.02, min(0.15, atr * 2.0 / price))
         self.take_profit_pct = max(0.02, min(0.12, atr * 3.0 / price))
         self.trailing_pct = max(0.01, min(0.08, atr * 1.5 / price))
