@@ -5,6 +5,7 @@ from aiogram_dialog import Dialog, DialogManager, Window
 from aiogram_dialog.widgets.input import MessageInput
 from aiogram_dialog.widgets.kbd import Button, Back, Column, Select, ScrollingGroup
 from aiogram_dialog.widgets.text import Const, Format
+from magic_filter import F
 
 from ui.states import AppSG
 from strategies.manager import StrategyManager
@@ -116,8 +117,6 @@ async def on_add_coin_input(msg: Message, widget, manager: DialogManager):
     if not MANAGER:
         return
     text = (msg.text or "").strip()
-    if text.startswith("/"):
-        return
     if not text:
         await msg.answer("输入不能为空")
         return
@@ -201,7 +200,7 @@ add_coin_window = Window(
         "<code>ETH-USDT</code>\n"
         "<code>SOL-USDT</code>"
     ),
-    MessageInput(on_add_coin_input),
+    MessageInput(on_add_coin_input, filter=~F.text.startswith("/")),
     Button(Const("🔙 取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.menu)),
     state=AppSG.add_coin,
 )
@@ -320,11 +319,10 @@ coin_panel_window = Window(
 )
 
 
-# ==================== 信号详情（修复版） ====================
+# ==================== 信号详情 ====================
 async def signal_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
 
-    # 兜底返回值，确保所有 14 个占位符都有值
     empty = {
         "inst_id": inst_id,
         "bar": "-",
@@ -470,7 +468,11 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
     inst_id = dialog_manager.dialog_data.get("inst_id", "-")
     dip = MANAGER.dips.get(inst_id) if MANAGER else None
     if not dip:
-        return {"inst_id": inst_id, "error": "未初始化"}
+        return {
+            "inst_id": inst_id, "pos": "0", "avg": "-", "peak": "-", "price": "-",
+            "pending_buy": "无", "pending_sell": "无", "realized": "0",
+            "fee": "0", "pnl_line": "浮动盈亏: -", "batch_line": "分批止盈: 未触发",
+        }
 
     s = dip.snapshot()
     pos = s.get("position", 0)
@@ -626,8 +628,6 @@ async def on_param_input(msg: Message, widget, manager: DialogManager):
         return
 
     raw = (msg.text or "").strip()
-    if raw.startswith("/"):
-        return
 
     ptype = meta["type"]
     try:
@@ -667,7 +667,7 @@ edit_window = Window(
         "当前值: {value}\n\n"
         "{hint}"
     ),
-    MessageInput(on_param_input),
+    MessageInput(on_param_input, filter=~F.text.startswith("/")),
     Button(Const("🔙 取消"), id="cancel", on_click=lambda c, b, m: m.switch_to(AppSG.params)),
     state=AppSG.edit_param,
     getter=edit_getter,
