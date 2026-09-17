@@ -441,8 +441,7 @@ async def position_getter(dialog_manager: DialogManager, **kwargs):
     batch_count = s.get("batch_tp_triggered", 0)
     batch_line = f"分批止盈已触发: {batch_count}/3 档" if batch_count > 0 else "分批止盈: 未触发"
 
-    # 追踪止损状态
-    if hasattr(dip, "trailing_stop") and dip.trailing_stop.trailing_active:
+    if hasattr(dip, "trailing_stop") and getattr(dip.trailing_stop, "trailing_active", False):
         trailing_line = "追踪止损: 🟢 已激活"
     else:
         trailing_line = "追踪止损: 未激活"
